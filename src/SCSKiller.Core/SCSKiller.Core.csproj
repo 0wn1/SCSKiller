@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CUE4Parse" Version="1.2.2.202609" />
+    <!-- CUE4Parse pulls 9.0.0, which has GHSA-73j8-2gch-69rq -->
+    <PackageReference Include="Microsoft.Bcl.Memory" Version="10.0.12" />
+    <!-- Ed25519 for the signed update feed (App/Updates.cs): the BCL has none; the same package the origin signs tokens with -->
+    <PackageReference Include="NSec.Cryptography" Version="26.4.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Games\known-stutter.json" LogicalName="SCSKiller.Core.Games.known-stutter.json" />
+    <EmbeddedResource Include="Planning\confirmed-engines.json" LogicalName="SCSKiller.Core.Planning.confirmed-engines.json" />
+    <EmbeddedResource Include="App\welcome.json" LogicalName="SCSKiller.Core.App.welcome.json" />
+  </ItemGroup>
+
+</Project>

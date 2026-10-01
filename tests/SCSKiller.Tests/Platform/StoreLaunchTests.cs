@@ -1,0 +1,85 @@
+using SCSKiller.Core;
+using SCSKiller.Core.Games;
+
+namespace SCSKiller.Tests.Platform;
+
+// Builds the commands only: nothing here starts a process.
+public sealed class StoreLaunchTests : IDisposable
+{
+    readonly string _dir = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), "scskiller-launch-" + Guid.NewGuid().ToString("N")[..8])).FullName;
+
+    public void Dispose() => Directory.Delete(_dir, true);
+
+    static Game G(string id, Store store, string dir = @"X:\Games\Some Game") => new(id, "Some Game", store, dir, Path.Combine(dir, "game.exe"));
+
+    string Manifests()
+    {
+        var dir = Directory.CreateDirectory(Path.Combine(_dir, "Manifests")).FullName;
+        File.WriteAllText(Path.Combine(dir, "A.item"), """{ "AppName": "Other", "CatalogNamespace": "x", "CatalogItemId": "y" }""");
+        File.WriteAllText(Path.Combine(dir, "B.item"), "{ half written");
+        File.WriteAllText(Path.Combine(dir, "C.item"), """
+            { "DisplayName": "Detroit Become Human", "AppName": "Columbine", "CatalogNamespace": "columbine",
+              "CatalogItemId": "6d2dcb9ed0bd42dea4b2f23cc43ba92f", "MainGameAppName": "" }
+            """);
+        return dir;
+    }
+
+    [Fact]
+    public void Steam_opens_its_run_uri()
+    {
+        var c = StoreLaunch.Command(G("steam:2909400", Store.Steam))!;
+        Assert.Equal(("steam://rungameid/2909400", true), (c.FileName, c.UseShellExecute));
+        Assert.True(StoreLaunch.Supported(G("steam:2909400", Store.Steam)));
+    }
+
+    [Fact]
+    public void Epic_opens_the_launcher_uri_with_the_manifests_catalog_ids()
+    {
+        var manifests = Manifests();
+        var c = StoreLaunch.Command(G("epic:Columbine", Store.Epic), epicManifests: manifests)!;
+        Assert.Equal("com.epicgames.launcher://apps/columbine%3A6d2dcb9ed0bd42dea4b2f23cc43ba92f%3AColumbine?action=launch&silent=true", c.FileName);
+        Assert.True(c.UseShellExecute);
+        Assert.Null(StoreLaunch.Command(G("epic:Gone", Store.Epic), epicManifests: manifests));   // no manifest names it
+        Assert.Null(StoreLaunch.Command(G("epic:Columbine", Store.Epic), epicManifests: Path.Combine(_dir, "missing")));
+    }
+
+    [Fact]
+    public void Xbox_opens_the_package_app_through_the_shell()
+    {
+        File.WriteAllText(Path.Combine(_dir, "appxmanifest.xml"), """
+            <?xml version="1.0" encoding="utf-8"?>
+            <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+              <Applications><Application Id="AppUEGameShipping" Executable="GameLaunchHelper.exe" EntryPoint="Windows.FullTrustApplication" /></Applications>
+            </Package>
+            """);
+        var c = StoreLaunch.Command(G("xbox:Publisher.Game_3275kfvn8vcwc", Store.Xbox, _dir))!;
+        Assert.Equal((@"shell:AppsFolder\Publisher.Game_3275kfvn8vcwc!AppUEGameShipping", true), (c.FileName, c.UseShellExecute));
+        Assert.Null(StoreLaunch.Command(G("xbox:Publisher.Game_3275kfvn8vcwc", Store.Xbox, Path.Combine(_dir, "missing"))));   // no manifest
+    }
+
+    [Fact]
+    public void Ubisoft_opens_its_launch_uri()
+    {
+        Assert.Equal("uplay://launch/635/0", StoreLaunch.Command(G("ubisoft:635", Store.Other))!.FileName);
+        Assert.True(StoreLaunch.Supported(G("ubisoft:635", Store.Other)));
+    }
+
+    [Fact]
+    public void Gog_runs_galaxys_own_shortcut_command()
+    {
+        var c = StoreLaunch.Command(G("gog:1207664643", Store.Other, @"C:\GOG Games\The Witcher 3\"), galaxyExe: @"C:\GOG Galaxy\GalaxyClient.exe")!;
+        Assert.Equal(@"C:\GOG Galaxy\GalaxyClient.exe", c.FileName);
+        Assert.Equal(@"/command=runGame /gameId=1207664643 /path=""C:\GOG Games\The Witcher 3""", c.Arguments);   // no \" at the end
+        Assert.False(c.UseShellExecute);
+    }
+
+    [Fact]
+    public void Ea_battlenet_and_unknown_stores_have_no_launch()
+    {
+        foreach (var g in new[] { G("ea:1234567", Store.EA), G("battlenet:prometheus", Store.Other), G("manual:x", Store.Other) })
+        {
+            Assert.False(StoreLaunch.Supported(g));
+            Assert.Null(StoreLaunch.Command(g, galaxyExe: @"C:\GOG Galaxy\GalaxyClient.exe"));
+        }
+    }
+}

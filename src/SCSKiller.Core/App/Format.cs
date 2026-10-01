@@ -1,0 +1,81 @@
+namespace SCSKiller.Core.App;
+
+/// <summary>Text the app and the CLI show.</summary>
+public static class Format
+{
+    public const string Dash = "—";
+
+    /// <summary>"3.2 GB" from 1 GiB up, else whole MB; a dash for null.</summary>
+    public static string Bytes(long? b) => b switch
+    {
+        null => Dash,
+        >= 1L << 30 => $"{b / (double)(1L << 30):0.#} GB",
+        _ => $"{b / (double)(1 << 20):0} MB",
+    };
+
+    /// <summary><see cref="ScsKiller.Duration"/>; a dash for null.</summary>
+    public static string Duration(TimeSpan? t) => t is { } v ? ScsKiller.Duration(v) : Dash;
+
+    /// <summary>The item is being compiled: any stage before it finishes, paused included.</summary>
+    public static bool Running(QueueItem q) => q.Stage is QueueStage.Indexing or QueueStage.Planning or QueueStage.Materializing
+        or QueueStage.Warming or QueueStage.Paused;
+
+    /// <summary>"FSR4: 80 known pipelines, compiled with the game", "DLSS: compiled by the NVIDIA driver itself",
+    /// "XeSS: detected; added after a recording sees them".</summary>
+    public static string Middleware(MiddlewareTag t) => t.Label + (t.Pipelines > 0 ? $": {t.Pipelines:N0} known pipelines, compiled with the game"
+        : t.Label == "DLSS" ? ": compiled by the NVIDIA driver itself" : ": detected; added after a recording sees them");
+
+    /// <summary>A Library row's note: a few words for the status's reason (the whole one is in the row's tooltip and on the
+    /// game's page); null when the status title says it. Read from the core's reasons (ScsKiller.Evaluate, Planner.Check,
+    /// the engine readers); an unknown one shows its first clause.</summary>
+    public static string? ShortNote(GameState s)
+    {
+        var r = s.StatusReason;
+        bool Has(string part) => r.Contains(part, StringComparison.Ordinal);
+        bool Starts(string part) => r.StartsWith(part, StringComparison.Ordinal);
+        var partly = ScsKiller.IsPartlyWarmed(s);
+        return s.Status switch
+        {
+            GameStatus.Warmed when partly => $"Driver {s.WarmedDriverVersion} · {s.Careful!.LaunchCompiled * 100:0}% still compiled",
+            GameStatus.Warmed => $"Driver {s.WarmedDriverVersion}" + (ScsKiller.IsPartial(s.Plan) ? " · partly covered" : ""),
+            GameStatus.Stale => StaleNote(r),
+            GameStatus.NeedsRecording when s.RecordingPaused => "Recording paused: limit reached",
+            GameStatus.NeedsRecording when s.RecorderInstalled => "Recorder on: play 5 minutes",
+            GameStatus.NeedsRecording when Starts(ScsKiller.RtNeedsRecording) => "For ray-traced effects" + (s.InCommunityDb == true ? " · in the community database" : ""),
+            GameStatus.NeedsRecording when s.InCommunityDb == true => "In the community database",
+            GameStatus.NeedsRecording when Starts("the recording has no draws") => "Play into the game world",
+            GameStatus.NeedsRecording => "Turn on Record and play",
+            GameStatus.Ready when Has("ray-traced effects aren't compiled") => $"Ray tracing blocked by {AntiCheatName(s.AntiCheat)}",
+            GameStatus.Ready when ScsKiller.IsPartial(s.Plan) => "Partly covered",
+            GameStatus.Ready when Has(Planning.Planner.Untested) => "Not tested on this engine version",
+            GameStatus.Ready when Has("for DirectX 12, ") => "DirectX 11; DirectX 12 needs a recording",
+            GameStatus.Ready when Has("also compiles every DirectX 11 shader") => "DirectX 11 and 12",
+            GameStatus.Ready when Starts("compiles every DirectX 11 shader") => "DirectX 11",
+            GameStatus.Ready => null,
+            _ when s.AntiCheat != AntiCheat.None && Starts("needs a recording, which") => $"Blocked by {AntiCheatName(s.AntiCheat)}",
+            _ when s.Engine?.Encrypted == true => null,   // the title: "Encrypted game files"
+            _ when s.Engine?.Unsupported is { } u => u.StartsWith("no D3D shaders", StringComparison.Ordinal) ? "No DirectX shaders" : "Engine not supported yet",
+            _ when s.Engine == null => r == "engine not supported yet" ? "Engine not supported yet" : "Couldn't read the game files",
+            _ when Starts("runs on ") => "Runs on " + FirstClause(r["runs on ".Length..]),
+            _ when Starts("not supported on this GPU") => "Not supported on this GPU yet",
+            _ => Sentence(FirstClause(r)),
+        };
+    }
+
+    static string StaleNote(string r) =>
+        r.StartsWith("driver changed:", StringComparison.Ordinal) ? $"Driver {r[(r.LastIndexOf(' ') + 1)..]} cleared its cache"
+        : r == ScsKiller.TrimmedPartReason ? "The driver trimmed its cache"
+        : r == ScsKiller.TrimmedAllReason ? "Its shader cache was removed"
+        : r.StartsWith("the compile didn't reach", StringComparison.Ordinal) ? "The compile missed the game's cache"
+        : r.StartsWith("the game runs as", StringComparison.Ordinal) ? "The exe name's case changed"
+        : r.StartsWith("game updated", StringComparison.Ordinal) ? "Game updated"
+        : r.StartsWith("game shaders changed", StringComparison.Ordinal) ? "Game shaders changed"
+        : r.StartsWith("SCSKiller can now compile", StringComparison.Ordinal) ? "SCSKiller can compile more"
+        : r.StartsWith("Maximum mode", StringComparison.Ordinal) ? "Maximum mode: more to compile"
+        : Sentence(FirstClause(r));   // "N new pipelines recorded"
+
+    static string FirstClause(string t) => t.Split([": ", "; ", " ("], 2, StringSplitOptions.None)[0];
+    static string Sentence(string t) => t.Length > 0 ? char.ToUpperInvariant(t[0]) + t[1..] : t;
+
+    static string AntiCheatName(AntiCheat a) => a switch { AntiCheat.EasyAntiCheat => "EasyAntiCheat", AntiCheat.BattlEye => "BattlEye", _ => "anti-cheat" };
+}

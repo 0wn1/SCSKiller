@@ -1,0 +1,66 @@
+cmake_minimum_required(VERSION 3.20)
+project(SCSKiller LANGUAGES CXX ASM_MASM RC)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")  # static CRT: nothing extra to ship next to the game
+
+# Version resource (version.rc) of d3d12.dll and scskiller_warm.exe; build/publish.ps1 passes the tag's version
+set(SCSK_VERSION "0.0.0-internal.0" CACHE STRING "SemVer X.Y.Z[-pre] in the native version resource")
+if(NOT SCSK_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)(-[0-9A-Za-z.-]+)?$")
+  message(FATAL_ERROR "SCSK_VERSION is not X.Y.Z[-pre]: ${SCSK_VERSION}")
+endif()
+set(SCSK_VERSION_MAJOR ${CMAKE_MATCH_1})
+set(SCSK_VERSION_MINOR ${CMAKE_MATCH_2})
+set(SCSK_VERSION_PATCH ${CMAKE_MATCH_3})
+configure_file(version.h.in version.h @ONLY)
+
+add_library(scskiller SHARED proxy.cpp warm11.cpp vtslots.cpp stubs.asm d3d12.def version.rc)
+set_target_properties(scskiller PROPERTIES OUTPUT_NAME d3d12)
+# /MAP: function RVAs for reading crash stacks. Delay-load what only the D3D11 warm uses: in a game it is never loaded.
+target_link_options(scskiller PRIVATE /MAP /DELAYLOAD:d3d11.dll /DELAYLOAD:d3dcompiler_47.dll /DELAYLOAD:dxgi.dll)
+target_link_libraries(scskiller delayimp)
+
+add_executable(selftest selftest.cpp)
+target_link_libraries(selftest d3dcompiler)
+target_include_directories(selftest PRIVATE third_party/vulkan)  # headers only; vulkan-1.dll is loaded at run time
+add_dependencies(selftest scskiller fakenext)
+
+# A mod's d3d12.dll for `selftest chain` (scskiller.ini next=); test only, never published
+add_library(fakenext SHARED fakenext.cpp)
+
+add_executable(scskiller_warm warm.cpp version.rc)
+# The same exe on the segment heap (warm.manifest), in segheap\ under the same file name: the warmer runs it on NVIDIA
+add_executable(scskiller_warm_segheap warm.cpp version.rc warm.manifest)
+set_target_properties(scskiller_warm_segheap PROPERTIES OUTPUT_NAME scskiller_warm
+  RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_BINARY_DIR}/Release/segheap RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_BINARY_DIR}/Debug/segheap)
+target_include_directories(scskiller PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+foreach(t scskiller_warm scskiller_warm_segheap)
+  target_compile_definitions(${t} PRIVATE SCSK_RC_WARM)
+  target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+  add_dependencies(${t} scskiller)
+endforeach()
+
+# AMD GPU Services (GPUOpen AGS SDK 6.3.1, MIT): scskiller_warm loads it at run time (--ags). AMD's signed release DLL,
+# pinned by hash; without it (offline) warms of AGS games fall back to a plain device.
+set(AGS_DLL ${CMAKE_CURRENT_BINARY_DIR}/amd_ags_x64.dll)
+set(AGS_SHA256 482B241EA855FDD59AAA7687C385CE4165B5340857E6A0E6D15BA27ECB65EE70)
+if(EXISTS ${AGS_DLL})
+  file(SHA256 ${AGS_DLL} AGS_HAVE)
+  string(TOUPPER "${AGS_HAVE}" AGS_HAVE)
+endif()
+if(NOT AGS_HAVE STREQUAL AGS_SHA256)
+  file(DOWNLOAD https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/AGS_SDK/v6.3.1/ags_lib/lib/amd_ags_x64.dll ${AGS_DLL}
+       EXPECTED_HASH SHA256=${AGS_SHA256} TLS_VERIFY ON STATUS AGS_STATUS)
+  list(GET AGS_STATUS 0 AGS_CODE)
+  if(NOT AGS_CODE EQUAL 0)
+    file(REMOVE ${AGS_DLL})
+    message(WARNING "amd_ags_x64.dll not downloaded: ${AGS_STATUS}")
+  endif()
+endif()
+if(EXISTS ${AGS_DLL})
+  add_custom_command(TARGET scskiller_warm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${AGS_DLL} $<TARGET_FILE_DIR:scskiller_warm>)
+endif()
+
+# D3D11 driver-cache measurement probe. Standalone: talks to system d3d11.dll directly, no SCSKiller shim involved.
+# Also the "game" of gen/test_warm11.py (compile, first).
+add_executable(probe11 probe11.cpp)
+target_link_libraries(probe11 d3dcompiler)

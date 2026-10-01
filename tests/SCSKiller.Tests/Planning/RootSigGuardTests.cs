@@ -1,0 +1,154 @@
+using SCSKiller.Core;
+using SCSKiller.Core.Games;
+using SCSKiller.Core.Planning;
+using SCSKiller.Core.Unreal;
+using Xunit.Abstractions;
+using static SCSKiller.Tests.Planning.ExactLayoutsTests;
+
+namespace SCSKiller.Tests.Planning;
+
+/// <summary>The planner's pre-emit guard (a stage set whose root signature doesn't cover a resource its shaders declare is left
+/// out, "rs_uncovered") and the DXBC SV_Position register check, synthetic and on Hogwarts Legacy's install.</summary>
+public class RootSigGuardTests(ITestOutputHelper output)
+{
+    static readonly EngineInfo Ue427 = new("Unreal", "4.27", null, "D3D12", false, null);
+    static readonly SigElement PosOut = new("SV_Position", 0, 0, 0xF, 1, 3), UvOut = new("TEXCOORD", 0, 1, 0x3, 0, 3);
+
+    /// <summary>A bindless SRV range in a space no rule knows (t0 unbounded in space 3) has no slot in the root signature:
+    /// the stage sets using it are counted, not planned, on both NVIDIA paths (whole pipelines and per stage).</summary>
+    [Fact]
+    public void StageSetsTheRootSignatureDoesNotCoverAreLeftOut()
+    {
+        var vs = Shader("vs", Stage.Vertex, [In("POSITION", 0, 0, 7)], [PosOut, UvOut]) with { Counts = new(1, 0, 0, 0), Bindings = [new("cbv", 0, 0, 1)] };
+        var ps = Shader("ps", Stage.Pixel, [PosOut, UvOut], [Target(0)]) with { Counts = new(1, 1, 0, 1), Bindings = [new("cbv", 0, 0, 1), new("srv", 0, 0, 1), new("sampler", 0, 0, 1)] };
+        var psBindless = ps with { Sha1 = Hash("psB"), Bindings = [.. ps.Bindings, new("srv", 3, 0, -1)] };
+        var cs = Shader("cs", Stage.Compute, []) with { Counts = new(0, 1, 1, 0), Bindings = [new("srv", 0, 0, 1), new("uav", 0, 0, 1), new("srv", 3, 0, -1)] };
+        var all = new[] { vs, ps, psBindless, cs };
+        var index = new ShaderIndex("synthetic", ["PCD3D_SM5"], all.ToDictionary(s => s.Sha1), [new ShaderMap("m", "Game", "PCD3D_SM5", all.Select(s => s.Sha1).ToList())]);
+        var dir = Ff7.TempDir("rs-guard");
+        foreach (var caps in new[] { Ff7.Nvidia, Ff7.Nvidia with { PerStageCache = true } })
+        {
+            var log = new List<string>();
+            var plan = new Planner().Build(Ff7.Game, Ue427, index, null, caps, Path.Combine(dir, caps.PerStageCache.ToString()), new SyncLog(log.Add), CancellationToken.None);
+            var body = PlanFile.Read(plan.FilePath).Records.ToList();
+            var planned = body.Where(r => r.Tag is 'S' or 'G' or 'C').Select(r => PsoDb.Parse(r).Stages.Values.ToHashSet()).ToList();
+            Assert.Contains(planned, s => s.SetEquals([vs.Sha1, ps.Sha1]));
+            Assert.DoesNotContain(planned, s => s.Contains(psBindless.Sha1) || s.Contains(cs.Sha1));
+            Assert.Contains(log, l => l.Contains("rs_uncovered 2")); // VS+PS(bindless), CS
+            Assert.Equal((4L, 2L, 2L), (plan.Stats.StageSets, plan.Stats.LeftOut, plan.Stats.Uncovered)); // CS, VS alone, VS+PS, VS+PS(bindless)
+            Assert.Contains(log, l => l.StartsWith("warning: 2 stage sets left out") && l.Contains("srv space 3 unbounded"));
+        }
+    }
+
+    /// <summary>DXBC links by register: a VS writing SV_RenderTargetArrayIndex in r0 and SV_POSITION in r1 can't feed a PS reading
+    /// SV_Position from r0 (the runtime's linkage error; Hogwarts: 9 PSOs), so the pair isn't planned; the same pair in DXIL
+    /// (linked by semantic) and a VS with SV_POSITION in r0 are.</summary>
+    [Fact]
+    public void DxbcSvPositionMustShareItsRegister()
+    {
+        var vs = Shader("vsL", Stage.Vertex, [], [new("SV_RenderTargetArrayIndex", 0, 0, 1, 4, 1), new("SV_POSITION", 0, 1, 0xF, 1, 3)]);
+        var vs0 = Shader("vsL0", Stage.Vertex, [], [new("SV_POSITION", 0, 0, 0xF, 1, 3)]);
+        var ps = Shader("psL", Stage.Pixel, [new("SV_Position", 0, 0, 0xF, 1, 3), new("SV_IsFrontFace", 0, 1, 1, 9, 1)], [Target(0)]);
+        var dir = Ff7.TempDir("sv-position");
+        bool Paired(ShaderInfo v, ShaderInfo p, string sm)
+        {
+            var (v2, p2) = (v with { ShaderModel = "vs" + sm }, p with { ShaderModel = "ps" + sm });
+            var index = new ShaderIndex("synthetic", ["PCD3D_SM5"], new[] { v2, p2 }.ToDictionary(s => s.Sha1), [new ShaderMap("m", "Game", "PCD3D_SM5", [v2.Sha1, p2.Sha1])]);
+            var plan = new Planner().Build(Ff7.Game, Ue427, index, null, Ff7.Nvidia, Path.Combine(dir, v.Sha1[..6] + sm), null, CancellationToken.None);
+            return PlanFile.Read(plan.FilePath).Records.Where(r => r.Tag == 'S').Any(r => PsoDb.Parse(r).Stages.ContainsValue(p2.Sha1));
+        }
+        Assert.False(Paired(vs, ps, "_5_0"));
+        Assert.True(Paired(vs, ps, "_6_0"));
+        Assert.True(Paired(vs0, ps, "_5_0"));
+    }
+
+    /// <summary>Tiny Tina's Wonderlands (4.21, no recording): its version-1 shader archives are read (they have no shader maps:
+    /// packages reference their shaders by hash), the 4.21 rule with 64-SRV tables (its shaders bind up to t57) covers every
+    /// planned PSO (the sweep's own reader). 92901 shaders, 7939 maps, 123592 PSOs, 0 uncovered, 0 failed on WARP.
+    /// Install read only.</summary>
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void WonderlandsIndexesAndItsPlanIsCovered()
+    {
+        var game = new SteamSource().Discover().FirstOrDefault(g => g.Id == "steam:1286680");
+        if (game == null || !File.Exists(game.ExePath)) return;
+        Ff7.Codecs();
+        var reader = new UnrealReader(Ff7.TempDir("wonderlands-data"));
+        var engine = reader.Detect(game)!;
+        Assert.Equal("4.21", engine.Version);
+        Assert.Equal(Readiness.Ready, new Planner().Check(game, engine, null, Ff7.Nvidia).Readiness);
+        var index = reader.Index(game, engine, null, CancellationToken.None);
+        Assert.True(index.Shaders.Count > 50_000 && index.Maps.Count > 5_000, $"{index.Shaders.Count} shaders, {index.Maps.Count} maps");
+        var log = new List<string>();
+        var plan = new Planner().Build(game, engine, index, null, Ff7.Nvidia with { PerStageCache = true }, Ff7.TempDir("wonderlands-plan"), new SyncLog(log.Add), CancellationToken.None);
+        foreach (var l in log) output.WriteLine(l);
+        Assert.Contains(log, l => l.Contains("SRV tables of 64"));
+        var body = PlanFile.Read(plan.FilePath).Records.ToList();
+        var sigs = body.Where(r => r.Tag == 'B').ToDictionary(r => PsoDb.Hex(r.Payload.AsSpan(0, 20)), r => UnrealRootSigSweep.Rts0(r.Payload[20..]));
+        var psos = body.Where(r => r.Tag is 'S' or 'G' or 'C').Select(PsoDb.Parse).ToList();
+        var bad = psos.Count(p => p.Stages.Any(s => UnrealRootSigSweep.Mismatch(index.Shaders[s.Value], (Stage)s.Key, sigs[p.Rs]) != null));
+        Assert.True(psos.Count > 100_000, $"only {psos.Count} PSOs");
+        Assert.Equal((0, 0L, false), (bad, plan.Stats.Uncovered, plan.Stats.RootSigRuleVerified));
+    }
+
+    /// <summary>Tiny Tina's Wonderlands against SCSKiller's recording of it (read, never written): the stock 4.21 rule with
+    /// 64-SRV tables rebuilds 18386 of its 18419 recorded root signatures byte for byte; the other 33 differ only in the
+    /// input-layout flag, set for a VS that reads no vertex input (247 other such PSOs have it clear): it follows the vertex
+    /// declaration bound at the draw, which the shaders don't show, so 4.21 isn't in ConfirmedEngines. Install read only;
+    /// returns early without the game or recording.</summary>
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void WonderlandsRecordingRebuildsByteExact()
+    {
+        var game = new SteamSource().Discover().FirstOrDefault(g => g.Id == "steam:1286680");
+        if (game == null || !File.Exists(game.ExePath)) return;
+        Ff7.Codecs();
+        var reader = new UnrealReader(Ff7.TempDir("wonderlands-rec-data"));
+        var engine = reader.Detect(game)!;
+        Assert.Equal((RootSig.Rule.Ue421, null), (RootSig.RuleFor(engine), engine.Fork));
+        if (Ff7.Recording(game, engine, reader, "wonderlands-rec") is not { } db) return;
+        var bc = reader.Index(game, engine, null, CancellationToken.None).Shaders;
+        var recs = PsoDb.Read(db).ToList();
+        var blobs = recs.Where(r => r.Tag == 'B').GroupBy(r => PsoDb.Hex(r.Payload.AsSpan(0, 20))).ToDictionary(g => g.Key, g => g.First().Payload[20..]);
+        var maxSrvs = RootSig.MaxSrvsFor(RootSig.Rule.Ue421, bc.Values);
+        var psos = recs.Where(r => r.Tag is 'G' or 'C' or 'S').DistinctBy(r => r.Key).Select(PsoDb.Parse)
+            .Where(p => p.Stages.Values.All(bc.ContainsKey) && blobs.ContainsKey(p.Rs)).ToList();
+        bool Rebuilds(PsoDb.Pso p, uint flag)
+        {
+            var desc = RootSig.Build(RootSig.Rule.Ue421, p.Stages.ToDictionary(s => (Stage)s.Key, s => bc[s.Value]), false, maxSrvs);
+            return RootSig.Serialize(desc with { Flags = desc.Flags | flag }, RootSig.StaticSamplers(RootSig.Rule.Ue421)).AsSpan().SequenceEqual(blobs[p.Rs]);
+        }
+        var bad = psos.Where(p => !Rebuilds(p, 0)).ToList();
+        output.WriteLine($"root signatures rebuilt byte-exact: {psos.Count - bad.Count}/{psos.Count} recorded PSOs (SRV tables of {maxSrvs}); mismatches by stages: "
+            + string.Join(", ", bad.GroupBy(p => string.Join('+', p.Stages.Keys.Select(k => (Stage)k))).Select(g => $"{g.Key} {g.Count()}")));
+        Assert.True(psos.Count > 1000, $"only {psos.Count} recorded PSOs of index shaders");
+        Assert.All(bad, p => Assert.True(Rebuilds(p, 1)));   // ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+    }
+
+    sealed class SyncLog(Action<string> a) : IProgress<string> { public void Report(string value) => a(value); }
+
+    /// <summary>Hogwarts Legacy (a 4.27 fork, no recording) planned recording-free for NVIDIA: every PSO's root signature covers
+    /// every resource its shaders declare, visible to their stage (checked by the sweep's own reader, not RootSig's). Before the
+    /// guard: 159594 of 200804 failed this (its bindless SRVs in spaces 4-7), 159602 in a real warm. Install read only.</summary>
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void HogwartsPlanRootSignaturesCoverTheirShaders()
+    {
+        var game = new SteamSource().Discover().FirstOrDefault(g => g.Id == "steam:990080");
+        if (game == null || !File.Exists(game.ExePath)) return;
+        Ff7.Codecs();
+        var reader = new UnrealReader(Ff7.TempDir("hogwarts-data"));
+        var engine = reader.Detect(game)!;
+        var index = reader.Index(game, engine, null, CancellationToken.None);
+        var plan = new Planner().Build(game, engine, index, null, Ff7.Nvidia with { PerStageCache = true }, Ff7.TempDir("hogwarts-plan"), new SyncLog(output.WriteLine), CancellationToken.None);
+        var body = PlanFile.Read(plan.FilePath).Records.ToList();
+        var sigs = body.Where(r => r.Tag == 'B').ToDictionary(r => PsoDb.Hex(r.Payload.AsSpan(0, 20)), r => UnrealRootSigSweep.Rts0(r.Payload[20..]));
+        var psos = body.Where(r => r.Tag is 'S' or 'G' or 'C').Select(PsoDb.Parse).Select(p => (p.Rs, p.Stages))
+            .Concat(body.Where(r => r.Tag == 'P').Select(r => PsoDb.ParseItem(r.Payload)).Select(i => (i.Rs, i.Stages))).ToList();
+        var bad = psos.Select(p => p.Stages.Select(s => UnrealRootSigSweep.Mismatch(index.Shaders[s.Value], (Stage)s.Key, sigs[p.Rs])).FirstOrDefault(m => m != null))
+            .OfType<string>().GroupBy(m => m).ToDictionary(g => g.Key, g => g.Count());
+        output.WriteLine($"{psos.Count} PSOs; uncovered: {string.Join(", ", bad.Select(b => $"{b.Key} x{b.Value}"))}");
+        Assert.True(psos.Count > 10000, $"only {psos.Count} PSOs");
+        Assert.Empty(bad);
+    }
+}

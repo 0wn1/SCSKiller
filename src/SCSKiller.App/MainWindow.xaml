@@ -1,0 +1,69 @@
+<Window
+    x:Class="SCSKiller.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="SCSKiller">
+    <Window.SystemBackdrop>
+        <MicaBackdrop />
+    </Window.SystemBackdrop>
+
+    <Grid x:Name="Root">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition />
+        </Grid.RowDefinitions>
+        <!-- Screenshots only: RenderTargetBitmap can't capture Mica, so paint its solid fallback. -->
+        <Border x:Name="ShotBackground" Grid.RowSpan="2" Visibility="Collapsed"
+                Background="{ThemeResource SolidBackgroundFillColorBaseBrush}" />
+
+        <TitleBar x:Name="AppTitleBar" Title="SCSKiller" Subtitle="Shader Compilation Stutter Killer"
+                  IsBackButtonVisible="False"
+                  IsPaneToggleButtonVisible="True" PaneToggleRequested="OnPaneToggle">
+            <TitleBar.IconSource>
+                <FontIconSource Glyph="&#xE945;" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+            </TitleBar.IconSource>
+            <!-- a downloaded update (Updater): quiet, never a dialog -->
+            <TitleBar.RightHeader>
+                <Button x:Name="UpdateButton" Visibility="Collapsed" Click="OnRestartToUpdate" Margin="0,0,8,0" Padding="10,3">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <FontIcon Glyph="&#xE777;" FontSize="13" />
+                        <TextBlock x:Name="UpdateText" Text="Restart to update" FontSize="13" />
+                    </StackPanel>
+                </Button>
+            </TitleBar.RightHeader>
+        </TitleBar>
+
+        <!-- the pane opens only once the pages have the room they have at the minimum window width with it compact -->
+        <NavigationView x:Name="Nav" Grid.Row="1" OpenPaneLength="248" ExpandedModeThresholdWidth="1258"
+                        IsBackButtonVisible="Collapsed" IsPaneToggleButtonVisible="False" IsSettingsVisible="False"
+                        SelectionChanged="OnNavSelection">
+            <NavigationView.MenuItems>
+                <NavigationViewItem x:Name="LibraryItem" Content="Library">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xF0E2;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem x:Name="QueueItem" Content="Compile queue">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE8FD;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem x:Name="SettingsItem" Content="Settings">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE713;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.MenuItems>
+            <NavigationView.FooterMenuItems>
+                <NavigationViewItem x:Name="AboutItem" Content="About">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE946;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.FooterMenuItems>
+            <NavigationView.PaneFooter>
+                <Border Style="{StaticResource Card}" Margin="4,0,4,4" Padding="12,8"
+                        Visibility="{x:Bind Nav.IsPaneOpen, Mode=OneWay}">
+                    <StackPanel Spacing="2">
+                        <TextBlock Text="GPU" Style="{StaticResource Caption}" />
+                        <TextBlock x:Name="GpuName" FontSize="13" FontWeight="SemiBold" TextWrapping="Wrap" />
+                        <TextBlock x:Name="GpuDriver" Style="{StaticResource Caption}" />
+                    </StackPanel>
+                </Border>
+            </NavigationView.PaneFooter>
+            <Frame x:Name="ContentFrame" Navigated="OnNavigated" />
+        </NavigationView>
+    </Grid>
+</Window>

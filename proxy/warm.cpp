@@ -1,0 +1,419 @@
+// scskiller_warm: fill a game's driver shader cache from outside the game, no injection.
+// NVIDIA keys its D3D12 cache on the exe *file name* (measured: folder, file contents and D3D12 runtime version don't
+// matter), so a copy of this exe named like the game, replaying the game's scskiller.db + scskiller_gen.db, warms it.
+// Its D3D11 cache is keyed the same way: the gen db's D3D11 items are drawn once each on a D3D11 device (warm11.cpp).
+//
+//   scskiller_warm <workdir> <game exe file name> [--threads N] [--priority below|idle] [--start N]
+//                  [--stop-event <name>] [--adapter-luid <hex>] [--rt-threads N] [--skip i,j,...]
+//                  [--memory-mb N] [--package <app user model id>] [--stage-path <install folder>\<dir>\<exe>]
+//                  [--skip-keys <sha1 hex>,...] [--isolate i,j,...]
+//                  [--ags <amd_ags_x64.dll> --ags-app <name> --ags-engine <name>] [--pass K]
+//
+// Protocol (JSON lines on stdout, exit codes): ARCHITECTURE.md. Stages <workdir>\stage\<exe name> + d3d12.dll (the
+// proxy) + the dbs and runs that copy (the child), which prints the JSON. The caller only knows this process, so it
+// beats a shared counter every 100 ms: while it is suspended (pause) the child's workers wait, if it dies the child
+// stops gracefully. --package: the child runs with that packaged app's identity (NVIDIA keys a profiled packaged game's
+// cache on it, not on the exe name); such a child inherits no handles, so it finds everything by this process's id and
+// writes through named pipes. --stage-path (ignored with --package): the child runs from <workdir>\stage\<that path>,
+// since some AMD app profiles match the tail of the launched path, not just the name; afterwards the proxy's outputs are
+// moved up to <workdir>\stage\ and the rest of that tree is removed. --ags: the child creates its device through that AGS 6
+// DLL, registering the game's app and engine names, since AMD keys the cache of such a device on the app name; if that
+// fails it says why on stderr and creates a plain device. --pass K: <workdir>\scskiller_pass.bin holds each item's pass
+// (one byte per item); only pass K's items are created, the others count as done.
+#define NOMINMAX
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <fcntl.h>
+#include <io.h>
+#include <cstdarg>
+#include <cstdio>
+#include <functional>
+#include <string>
+#include <thread>
+#include <vector>
+
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "ole32.lib")
+
+// What Invoke-CommandInDesktopPackage uses (Microsoft.Windows.Appx.PackageManager.Commands.dll).
+struct __declspec(uuid("F158268A-D5A5-45CE-99CF-00D6C3F3FC0A")) IDesktopAppXActivator : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE Activate(LPCWSTR, LPCWSTR, LPCWSTR, HANDLE*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ActivateWithOptions(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, DWORD, HANDLE*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ActivateWithOptionsAndArgs(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, DWORD, IUnknown*, HANDLE*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ActivateWithOptionsArgsWorkingDirectoryShowWindow(LPCWSTR aumid, LPCWSTR exe, LPCWSTR args,
+        DWORD options, DWORD parent_pid, IUnknown*, LPCWSTR dir, DWORD show, HANDLE* process) = 0;
+};
+static const CLSID CLSID_DesktopAppXActivator = {0x168EB462, 0x775F, 0x42AE, {0x91, 0x11, 0xD7, 0x14, 0xB2, 0x30, 0x6C, 0x2E}};
+
+static std::wstring beat_name(DWORD parent) { return L"Local\\SCSKiller.Beat." + std::to_wstring(parent); }
+static std::wstring pipe_name(DWORD parent, int fd) { return L"\\\\.\\pipe\\SCSKiller.Warm." + std::to_wstring(parent) + L"." + std::to_wstring(fd); }
+
+enum { RUN, PAUSE, STOP };  // SCSKiller_Control states (proxy.cpp)
+
+struct Opts {
+    int threads = 0;
+    bool idle = false;
+    uint64_t start = 0, luid = 0;
+    std::wstring stop_event;
+    int rt_threads = 0;          // a retry: concurrent ray tracing state object creates
+    uint32_t memory_mb = 0;      // the staged process's private memory budget (0 = none)
+    std::vector<uint64_t> skip;  // a retry: items an earlier run found faulting alone
+    std::vector<uint8_t> skip_keys;  // 20 bytes each: items that removed the device in an earlier run
+    std::vector<uint64_t> isolate;   // a retry: in flight when the device was removed, created alone first
+    std::wstring package;        // app user model id whose package identity the child runs with
+    std::wstring stage_path;
+    std::wstring ags, ags_app, ags_engine;
+    int pass = -1;
+};
+
+static bool parse(int argc, wchar_t** argv, int i, Opts& o) {
+    for (; i + 1 < argc; i += 2) {
+        std::wstring k = argv[i], v = argv[i + 1];
+        wchar_t* end = nullptr;
+        if (k == L"--threads") o.threads = (int)wcstol(v.c_str(), &end, 10);
+        else if (k == L"--start") o.start = _wcstoui64(v.c_str(), &end, 10);
+        else if (k == L"--adapter-luid") o.luid = _wcstoui64(v.c_str(), &end, 16);
+        else if (k == L"--priority" && (v == L"idle" || v == L"below")) o.idle = v == L"idle";
+        else if (k == L"--stop-event") o.stop_event = v;
+        else if (k == L"--rt-threads") o.rt_threads = (int)wcstol(v.c_str(), &end, 10);
+        else if (k == L"--memory-mb") o.memory_mb = (uint32_t)wcstoul(v.c_str(), &end, 10);
+        else if (k == L"--package") o.package = v;
+        else if (k == L"--stage-path") o.stage_path = v;
+        else if (k == L"--ags") o.ags = v;
+        else if (k == L"--ags-app") o.ags_app = v;
+        else if (k == L"--ags-engine") o.ags_engine = v;
+        else if (k == L"--pass") o.pass = (int)wcstol(v.c_str(), &end, 10);
+        else if (k == L"--skip" || k == L"--isolate") {
+            for (const wchar_t* c = v.c_str(); *c;) {
+                (k == L"--skip" ? o.skip : o.isolate).push_back(_wcstoui64(c, &end, 10));
+                if (end == c || (*end && *end != L',')) return false;
+                c = *end ? end + 1 : end;
+            }
+            end = nullptr;
+        } else if (k == L"--skip-keys") {
+            for (size_t b = 0; b < v.size(); b += 41) {
+                if (v.size() - b < 40 || (b + 40 < v.size() && v[b + 40] != L',')) return false;
+                for (size_t c = b; c < b + 40; c += 2) {
+                    if (!iswxdigit(v[c]) || !iswxdigit(v[c + 1])) return false;
+                    auto nib = [](wchar_t x) { return x <= L'9' ? x - L'0' : (x | 0x20) - L'a' + 10; };
+                    o.skip_keys.push_back((uint8_t)(nib(v[c]) << 4 | nib(v[c + 1])));
+                }
+            }
+        } else return false;
+        if (end && (*end || v.empty())) return false;
+    }
+    return i == argc;
+}
+
+static std::string json(const std::wstring& w) {  // JSON string literal
+    std::string u(WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr), '\0'), s = "\"";
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), u.data(), (int)u.size(), nullptr, nullptr);
+    for (char c : u) {
+        char esc[8];
+        if (c == '"' || c == '\\') s += '\\', s += c;
+        else if ((unsigned char)c < 0x20) sprintf_s(esc, "\\u%04x", c), s += esc;
+        else s += c;
+    }
+    return s + '"';
+}
+
+static void emit(const char* fmt, ...) {
+    va_list a;
+    va_start(a, fmt);
+    vprintf(fmt, a);
+    va_end(a);
+    putchar('\n');
+    fflush(stdout);
+}
+
+static int fail(const std::wstring& msg) { return emit("{\"event\":\"error\",\"message\":%s}", json(msg).c_str()), 1; }
+
+// AGS 6.x ABI (amd_ags.h, GPUOpen AGS SDK, MIT): only what device creation needs
+struct AgsDeviceParams { IDXGIAdapter* adapter; IID iid; D3D_FEATURE_LEVEL level; };
+struct AgsExtensionParams { const wchar_t *app, *engine; unsigned app_version, engine_version, uav_slot; };
+struct AgsReturnedParams { ID3D12Device* device; unsigned extensions; unsigned char later[60]; };  // room for newer fields
+constexpr unsigned AGS_UNSPECIFIED_VERSION = 0xFFFFAD00, AGS_APP_REGISTRATION = 1u << 3;
+
+// the device through the game's AGS registration (UE: its project name, "UnrealEngine5.6", versions unspecified);
+// on failure the reason, and *dev stays null
+static std::wstring ags_device(const Opts& o, IDXGIAdapter* adapter, ID3D12Device** dev) {
+    // by path, its own imports from System32 only: a game folder may hold mods named like system DLLs
+    HMODULE m = LoadLibraryExW(o.ags.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!m) return L"loading " + o.ags + L" failed (error " + std::to_wstring(GetLastError()) + L")";
+    auto version = (int(*)())GetProcAddress(m, "agsGetVersionNumber");
+    auto init = (int(*)(int, const void*, void**, void*))GetProcAddress(m, "agsInitialize");
+    auto create = (int(*)(void*, const AgsDeviceParams*, const AgsExtensionParams*, AgsReturnedParams*))GetProcAddress(m, "agsDriverExtensionsDX12_CreateDevice");
+    int v = version ? version() : 0;
+    if (!init || !create || v >> 22 != 6)
+        return o.ags + L" is not AGS 6 (version " + std::to_wstring(v >> 22) + L"." + std::to_wstring(v >> 12 & 0x3ff) + L")";
+    void* ctx = nullptr;  // kept until exit, like the game's
+    if (int r = init(v, nullptr, &ctx, nullptr)) return L"agsInitialize returned " + std::to_wstring(r);
+    AgsDeviceParams dp = {adapter, __uuidof(ID3D12Device), D3D_FEATURE_LEVEL_11_0};
+    AgsExtensionParams ep = {o.ags_app.c_str(), o.ags_engine.c_str(), AGS_UNSPECIFIED_VERSION, AGS_UNSPECIFIED_VERSION, 0};
+    AgsReturnedParams rp = {};
+    if (int r = create(ctx, &dp, &ep, &rp)) return L"agsDriverExtensionsDX12_CreateDevice returned " + std::to_wstring(r);
+    *dev = rp.device;
+    return rp.extensions & AGS_APP_REGISTRATION ? L"" : L"the driver doesn't support AGS app registration";
+}
+
+// runs as <game exe name>; exit 0 = done printed, 1 = error printed, 3 = retry printed (a new process goes on from there)
+static int child(DWORD parent_pid, const Opts& o) {
+    for (int fd : {1, 2}) {  // a packaged child's output goes through the parent's pipes
+        HANDLE h = CreateFileW(pipe_name(parent_pid, fd).c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        SetStdHandle(fd == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE, h);
+        _dup2(_open_osfhandle((intptr_t)h, _O_WRONLY), fd);
+    }
+    if (o.idle) SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
+    HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, parent_pid), beat_map = OpenFileMappingW(FILE_MAP_READ, FALSE, beat_name(parent_pid).c_str());
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring dir = self, exe = dir.substr(dir.find_last_of(L'\\') + 1);
+    dir.resize(dir.size() - exe.size());
+    SetEnvironmentVariableW(L"SCSKILLER_MODE", L"warm");
+    HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str());
+    auto proc = [m](const char* n) { return m ? (void*)GetProcAddress(m, n) : nullptr; };
+    auto create_device = (decltype(&D3D12CreateDevice))proc("D3D12CreateDevice");
+    auto options = (void(WINAPI*)(int, BOOL, uint64_t))proc("SCSKiller_WarmOptions");
+    auto start = (void(WINAPI*)(IUnknown*))proc("SCSKiller_StartWarm");
+    auto progress = (void(WINAPI*)(uint64_t*))proc("SCSKiller_Progress");
+    auto control = (void(WINAPI*)(int))proc("SCSKiller_Control");
+    auto warm_rt = (void(WINAPI*)(int, const uint64_t*, uint32_t))proc("SCSKiller_WarmRt");
+    auto retry = (void(WINAPI*)(uint64_t*))proc("SCSKiller_Retry");
+    auto memory = (void(WINAPI*)(uint32_t))proc("SCSKiller_WarmMemory");
+    auto warm_crash = (void(WINAPI*)(const uint8_t*, uint32_t, const uint64_t*, uint32_t))proc("SCSKiller_WarmCrash");
+    auto crashes = (BOOL(WINAPI*)(const char**, const char**))proc("SCSKiller_Crashes");
+    auto warm_pass = (void(WINAPI*)(const uint8_t*, uint64_t, uint32_t))proc("SCSKiller_WarmPass");
+    if (!create_device || !options || !start || !progress || !control || !warm_rt || !retry || !memory || !warm_crash || !crashes || (o.pass >= 0 && !warm_pass))
+        return fail(L"proxy d3d12.dll missing or too old");
+    std::vector<uint8_t> pass_of;
+    if (o.pass >= 0) {
+        HANDLE pf = CreateFileW((dir + L"scskiller_pass.bin").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        LARGE_INTEGER size{};
+        DWORD got = 0;
+        bool read = pf != INVALID_HANDLE_VALUE && GetFileSizeEx(pf, &size) && size.QuadPart < (1ll << 31);
+        if (read) pass_of.resize((size_t)size.QuadPart);
+        read = read && (pass_of.empty() || (ReadFile(pf, pass_of.data(), (DWORD)pass_of.size(), &got, nullptr) && got == pass_of.size()));
+        if (pf != INVALID_HANDLE_VALUE) CloseHandle(pf);
+        if (!read) return fail(L"--pass: scskiller_pass.bin not readable");
+    }
+
+    // The game renders on the discrete GPU: default to the adapter with the most dedicated VRAM.
+    IDXGIFactory1* f = nullptr;
+    IDXGIAdapter1 *best = nullptr, *a;
+    DXGI_ADAPTER_DESC1 bd{}, d;
+    CreateDXGIFactory1(IID_PPV_ARGS(&f));
+    for (UINT i = 0; f && f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
+        a->GetDesc1(&d);
+        uint64_t luid = (uint64_t)(uint32_t)d.AdapterLuid.HighPart << 32 | d.AdapterLuid.LowPart;
+        if (o.luid ? luid == o.luid : !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && (!best || d.DedicatedVideoMemory > bd.DedicatedVideoMemory)) best = a, bd = d;
+    }
+    ID3D12Device* dev = nullptr;
+    if (!best) return fail(o.luid ? L"no adapter with that LUID" : L"no GPU adapter");
+    options(o.threads, o.idle, o.start);
+    warm_rt(o.rt_threads, o.skip.data(), (uint32_t)o.skip.size());
+    memory(o.memory_mb);
+    warm_crash(o.skip_keys.data(), (uint32_t)(o.skip_keys.size() / 20), o.isolate.data(), (uint32_t)o.isolate.size());
+    if (!o.ags.empty()) {
+        std::wstring why = ags_device(o, best, &dev);
+        if (!why.empty()) fwprintf(stderr, L"AGS app %ls: %ls%ls\n", o.ags_app.c_str(), why.c_str(), dev ? L"" : L": a plain device (the exe name's cache)");
+    }
+    if (!dev && FAILED(create_device(best, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) return fail(L"D3D12 device creation failed on " + std::wstring(bd.Description));
+
+    uint64_t p[4];  // done, total, failed, finished
+    progress(p);
+    if (o.pass >= 0 && pass_of.size() != p[1])
+        return fail(L"scskiller_pass.bin has " + std::to_wstring(pass_of.size()) + L" items, the dbs " + std::to_wstring(p[1]));
+    if (o.pass >= 0) warm_pass(pass_of.data(), pass_of.size(), (uint32_t)o.pass);
+    const uint64_t first = p[0];
+    emit("{\"event\":\"start\",\"total\":%llu,\"adapter\":%s,\"exe\":%s}", p[1], json(bd.Description).c_str(), json(exe).c_str());
+    start(dev);
+
+    HANDLE stop = o.stop_event.empty() ? nullptr : CreateEventW(nullptr, TRUE, FALSE, o.stop_event.c_str());
+    auto beat = (volatile LONG*)MapViewOfFile(beat_map, FILE_MAP_READ, 0, 0, sizeof(LONG));
+    ULONGLONG t0 = GetTickCount64(), seen = t0, printed = t0;
+    LONG last = beat ? *beat : 0;
+    bool stopping = false;
+    for (;; Sleep(100)) {
+        progress(p);
+        if (p[3]) break;
+        ULONGLONG now = GetTickCount64();
+        if (beat && *beat != last) last = *beat, seen = now;
+        stopping = stopping || (stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) || WaitForSingleObject(parent, 0) != WAIT_TIMEOUT;
+        control(stopping ? STOP : beat && now - seen > 1000 ? PAUSE : RUN);
+        if (now - printed < 500) continue;
+        printed = now;
+        emit("{\"event\":\"progress\",\"done\":%llu,\"total\":%llu,\"failed\":%llu,\"rate\":%.1f}", p[0], p[1], p[2], (p[0] - first) * 1000.0 / (now - t0));
+    }
+    uint64_t r[5];  // needed, from, ray tracing threads, failed before from, the item that failed alone (~0: none)
+    retry(r);
+    const char *crashed, *isolate;  // JSON array bodies
+    bool removed = crashes(&crashed, &isolate);
+    HANDLE final_event = OpenEventW(EVENT_MODIFY_STATE, FALSE, (L"Local\\SCSKiller.Final." + std::to_wstring(GetCurrentProcessId())).c_str());
+    if (r[0] && !stopping) {
+        emit("{\"event\":\"retry\",\"from\":%llu,\"rtThreads\":%llu,\"failedItem\":%lld,\"done\":%llu,\"total\":%llu,\"failed\":%llu,\"seconds\":%.1f,"
+             "\"reason\":\"%s\",\"crashed\":[%s],\"isolate\":[%s]}",
+             r[1], r[2], r[4] == ~0ull ? -1ll : (long long)r[4], r[1], p[1], r[3], (GetTickCount64() - t0) / 1000.0, removed ? "removed" : "rt", crashed, isolate);
+        if (final_event) SetEvent(final_event);
+        return 3;
+    }
+    if (p[0] < p[1] && !stopping) return fail(L"replay aborted after repeated faults, see stage\\scskiller.log");
+    emit("{\"event\":\"done\",\"done\":%llu,\"total\":%llu,\"failed\":%llu,\"seconds\":%.1f,\"stopped\":%s,\"crashed\":[%s]}", p[0], p[1], p[2],
+         (GetTickCount64() - t0) / 1000.0, p[0] < p[1] ? "true" : "false", crashed);
+    if (final_event) SetEvent(final_event);
+    return 0;  // a normal exit: the driver writes its cache now
+}
+
+int wmain(int argc, wchar_t** argv) {
+    Opts o;
+    if (argc >= 3 && !wcscmp(argv[1], L"--child"))  // --child <parent process id> <options>
+        return parse(argc, argv, 3, o) ? child((DWORD)wcstoul(argv[2], nullptr, 10), o) : fail(L"bad child arguments");
+    if (argc < 3 || !parse(argc, argv, 3, o)) {
+        fputs("usage: scskiller_warm <workdir> <game exe file name> [--threads N] [--priority below|idle] [--start N]\n"
+              "                      [--stop-event <name>] [--adapter-luid <hex>] [--rt-threads N] [--skip i,j,...] [--memory-mb N]\n"
+              "                      [--package <app user model id>] [--stage-path <install folder>\\<dir>\\<exe>]\n"
+              "                      [--skip-keys <sha1 hex>,...] [--isolate i,j,...]\n"
+              "                      [--ags <amd_ags_x64.dll> --ags-app <name> --ags-engine <name>] [--pass K]\n", stderr);
+        return fail(L"bad arguments");
+    }
+    std::wstring work = argv[1], exe = argv[2];
+    if (work.back() != L'\\' && work.back() != L'/') work += L'\\';
+    const std::wstring flat = work + L"stage\\";
+    std::wstring stage = flat;
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring bin = self;
+    bin.resize(bin.find_last_of(L'\\') + 1);
+    DWORD at = GetFileAttributesW(work.c_str());
+    if (at == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY) || exe.find_first_of(L"\\/") != std::wstring::npos)
+        return fail(L"workdir not found or exe is not a file name");
+
+    CreateDirectoryW(flat.c_str(), nullptr);
+    std::vector<std::wstring> dirs;  // the --stage-path folders, outermost first
+    if (!o.stage_path.empty() && o.package.empty()) {
+        std::wstring sub;
+        for (size_t b = 0;;) {
+            size_t e = o.stage_path.find_first_of(L"\\/", b);
+            std::wstring c = o.stage_path.substr(b, e == std::wstring::npos ? e : e - b);
+            bool bad = c.empty() || c == L"." || c == L".." || c.find_first_of(L"<>:\"|?*") != std::wstring::npos;
+            for (wchar_t ch : c) bad = bad || ch < 32;
+            if (bad || (e == std::wstring::npos && c != exe)) return fail(L"bad --stage-path " + o.stage_path);
+            if (e == std::wstring::npos) break;
+            sub += c + L"\\", b = e + 1;
+        }
+        // the child's and the proxy's GetModuleFileNameW, and CreateProcessW, take at most MAX_PATH
+        size_t longest = std::max(exe.size(), wcslen(L"scskiller_warm_times.csv")), full = GetFullPathNameW((flat + sub).c_str(), 0, nullptr, nullptr);
+        if (!full || full - 1 + longest >= MAX_PATH)
+            fwprintf(stderr, L"--stage-path too long (%zu characters with the longest file name): staging in %ls\n", full - 1 + longest, flat.c_str());
+        else
+            for (size_t e = 0; (e = sub.find(L'\\', e)) != std::wstring::npos; ++e)
+                dirs.push_back(flat + sub.substr(0, e)), CreateDirectoryW(dirs.back().c_str(), nullptr), stage = dirs.back() + L"\\";
+    }
+    struct Unstage {
+        std::function<void()> f;
+        ~Unstage() { f(); }
+    } unstage{[&] {
+        if (stage == flat) return;
+        for (auto n : {L"scskiller.log", L"scskiller_creates.csv", L"scskiller_warm_times.csv"})  // the proxy's outputs
+            MoveFileExW((stage + n).c_str(), (flat + n).c_str(), MOVEFILE_REPLACE_EXISTING);
+        for (auto n : {exe, std::wstring(L"d3d12.dll"), std::wstring(L"scskiller.db"), std::wstring(L"scskiller_gen.db"), std::wstring(L"scskiller_pass.bin")})
+            DeleteFileW((stage + n).c_str());
+        for (auto d = dirs.rbegin(); d != dirs.rend(); ++d) RemoveDirectoryW(d->c_str());  // only if empty
+    }};
+    DeleteFileW((flat + L"scskiller.log").c_str());
+    DeleteFileW((stage + L"scskiller.log").c_str());
+    auto put = [&](const std::wstring& from, const std::wstring& name, bool optional) {
+        std::wstring to = stage + name;
+        DeleteFileW(to.c_str());  // no stale copy may survive, and a hard link is never written through
+        if (optional && GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
+        // the generated plan is big and only read: hard link; the recorded db is copied (the proxy may append to it)
+        return (name == L"scskiller_gen.db" && CreateHardLinkW(to.c_str(), from.c_str(), nullptr)) || CopyFileW(from.c_str(), to.c_str(), FALSE);
+    };
+    std::wstring proxy = bin + L"d3d12.dll";
+    if (GetFileAttributesW(proxy.c_str()) == INVALID_FILE_ATTRIBUTES) proxy = bin + L"..\\d3d12.dll";  // the segheap\ build uses its parent's
+    if (!put(self, exe, false) || !put(proxy, L"d3d12.dll", false) || !put(work + L"scskiller.db", L"scskiller.db", true) ||
+        !put(work + L"scskiller_gen.db", L"scskiller_gen.db", true) || !put(work + L"scskiller_pass.bin", L"scskiller_pass.bin", true))
+        return fail(L"staging into " + stage + L" failed (error " + std::to_wstring(GetLastError()) + L"; is a warm already running?)");
+
+    const DWORD me = GetCurrentProcessId();
+    HANDLE map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(LONG), beat_name(me).c_str());
+    auto beat = map ? (volatile LONG*)MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, sizeof(LONG)) : nullptr;
+    if (!beat) return fail(L"heartbeat setup failed");
+    std::wstring args = L"--child " + std::to_wstring(me);
+    for (int i = 3; i < argc; ++i) args += L" \"" + std::wstring(argv[i]) + L"\"";
+    fflush(stdout);
+    std::vector<std::thread> relays;
+    PROCESS_INFORMATION pi = {};
+    if (!o.package.empty()) {
+        for (int fd : {1, 2}) {
+            HANDLE p = CreateNamedPipeW(pipe_name(me, fd).c_str(), PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 0, 1 << 16, 0, nullptr);
+            if (p == INVALID_HANDLE_VALUE) return fail(L"output pipe setup failed (error " + std::to_wstring(GetLastError()) + L")");
+            relays.emplace_back([p, out = GetStdHandle(fd == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE)] {
+                char buf[4096];
+                DWORD n, w;
+                if (ConnectNamedPipe(p, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED)
+                    while (ReadFile(p, buf, sizeof buf, &n, nullptr) && n) WriteFile(out, buf, n, &w, nullptr);
+                CloseHandle(p);
+            });
+        }
+        IDesktopAppXActivator* act = nullptr;
+        HANDLE h = nullptr;
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        HRESULT hr = CoCreateInstance(CLSID_DesktopAppXActivator, nullptr, CLSCTX_ALL, __uuidof(IDesktopAppXActivator), (void**)&act);
+        // 0x24: DAXAO_NONPACKAGED_EXE_PROCESS_TREE | DAXAO_CENTENNIAL_PROCESS (Invoke-CommandInDesktopPackage's, minus its App Installer check)
+        if (SUCCEEDED(hr))
+            hr = act->ActivateWithOptionsArgsWorkingDirectoryShowWindow(o.package.c_str(), (stage + exe).c_str(), args.c_str(), 0x24, 0, nullptr, stage.c_str(), SW_HIDE, &h);
+        if (act) act->Release();
+        if (SUCCEEDED(hr) && h) {
+            pi.dwProcessId = GetProcessId(h);
+            CloseHandle(h);
+            pi.hProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SET_QUOTA, FALSE, pi.dwProcessId);
+            // the activator's process isn't in our caller's job: it dies with this process instead
+            HANDLE job = CreateJobObjectW(nullptr, nullptr);
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};
+            li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (pi.hProcess && (!job || !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li) || !AssignProcessToJobObject(job, pi.hProcess)))
+                TerminateProcess(pi.hProcess, 1), pi.hProcess = nullptr;
+        }
+        if (!pi.hProcess) fwprintf(stderr, L"running in the package %ls failed (0x%08X): warming under the exe name only\n", o.package.c_str(), (unsigned)hr);
+    }
+    if (!pi.hProcess) {
+        std::wstring cmd = L"\"" + stage + exe + L"\" " + args;
+        STARTUPINFOW si = {sizeof si};
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE), si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        for (HANDLE h : {si.hStdOutput, si.hStdError}) SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, o.idle ? IDLE_PRIORITY_CLASS : 0, nullptr, stage.c_str(), &si, &pi))
+            return fail(L"launching the staged exe failed (error " + std::to_wstring(GetLastError()) + L")");
+    }
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);  // a starved heartbeat would read as a pause
+    // The child sets this after its last line. A process whose driver was poisoned (a thread stuck in it) may never finish
+    // exiting: after SCSKILLER_WARM_EXIT_S (default 600 s: a big cache flush at exit takes minutes) it is terminated, and
+    // whatever it hadn't written of the driver cache is lost (ARCHITECTURE.md).
+    HANDLE final_event = CreateEventW(nullptr, TRUE, FALSE, (L"Local\\SCSKiller.Final." + std::to_wstring(pi.dwProcessId)).c_str());
+    wchar_t lim[16] = {};
+    ULONGLONG exit_ms = 1000ull * (GetEnvironmentVariableW(L"SCSKILLER_WARM_EXIT_S", lim, 16) ? _wtoi(lim) : 600), final_at = 0;
+    bool killed = false;
+    while (WaitForSingleObject(pi.hProcess, 100) == WAIT_TIMEOUT) {
+        InterlockedIncrement(beat);
+        if (final_event && !final_at && WaitForSingleObject(final_event, 0) == WAIT_OBJECT_0) final_at = GetTickCount64();
+        if (final_at && GetTickCount64() - final_at > exit_ms) {
+            fwprintf(stderr, L"the warm process did not exit %llu s after its last line: terminated (its unwritten driver cache is lost)\n", exit_ms / 1000);
+            TerminateProcess(pi.hProcess, 3), killed = true;
+            WaitForSingleObject(pi.hProcess, 5000);
+            break;
+        }
+    }
+    for (auto& t : relays) {  // a child that never connected leaves its relay in ConnectNamedPipe
+        if (WaitForSingleObject(t.native_handle(), 1000) == WAIT_TIMEOUT) CancelSynchronousIo(t.native_handle());
+        t.join();
+    }
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    if (killed) return 3;  // its last line (done / retry) was printed; the caller goes by it
+    wchar_t hex[16];
+    swprintf_s(hex, L"0x%08X", code);
+    if (code > 1 && code != 3) return fail(L"the warm process died (exit code " + std::wstring(hex) + L")");  // it printed no error line
+    return (int)code;
+}

@@ -1,0 +1,136 @@
+# Build, test and package on a clean Windows runner (docs/release-process.md §3, §8, §10).
+# One file serves both repos. Private repo: never on a push to a branch; on PRs, workflow_dispatch, the nightly schedule
+# (skipped when main didn't change) and release tags (release.yml), every job on the runner the repository variable
+# SCSK_RUNNER names (the team's self-hosted Windows runner). Public repo (free, GitHub-hosted): also every push to main.
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  schedule:
+    - cron: '17 3 * * *'   # nightly, 03:17 UTC
+  workflow_dispatch:
+  workflow_call:   # release.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Nightly only: did main get a commit in the last 25 h? (Linux, 1x minutes, a few seconds.) Not a numeric output:
+  # expressions coerce a skipped job's null and '0' both to 0.
+  changed:
+    if: github.event_name == 'schedule'
+    runs-on: ${{ vars.SCSK_RUNNER && fromJSON(vars.SCSK_RUNNER) || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      unchanged: ${{ steps.c.outputs.unchanged }}
+    steps:
+      - id: c
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          at=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.commit.committer.date | fromdate')
+          if (( $(date +%s) - at > 90000 )); then echo "unchanged=yes" >> "$GITHUB_OUTPUT"; fi
+
+  # The server (server/, scsk-origin) runs on Linux in production: on the public repo its tests run there; the private
+  # repo runs them on the self-hosted Windows runner.
+  # The public repo has no server/ (build/public-allowlist.txt): the steps skip themselves there (hashFiles needs the
+  # checkout, so the condition is per step, not on the job).
+  server:
+    needs: changed
+    if: >-
+      !cancelled() && needs.changed.outputs.unchanged != 'yes' &&
+      (!github.event.repository.private || github.event_name != 'push' || github.ref_type == 'tag')
+    runs-on: ${{ vars.SCSK_RUNNER && fromJSON(vars.SCSK_RUNNER) || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      DOTNET_NOLOGO: 'true'
+      DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68   # v6.0.0
+        if: hashFiles('server/**') != ''
+        with:
+          dotnet-version: 10.0.x
+      - name: Test
+        if: hashFiles('server/**') != ''
+        run: dotnet test tests/SCSKiller.Server.Tests -c Release
+      - name: Test tools/measure.py
+        if: hashFiles('tools/test_measure.py') != ''
+        shell: bash
+        run: $(command -v python3 || command -v python) tools/test_measure.py
+
+  build:
+    needs: changed
+    if: >-
+      !cancelled() && needs.changed.outputs.unchanged != 'yes' &&
+      (!github.event.repository.private || github.event_name != 'push' || github.ref_type == 'tag')
+    # VS 2022 (MSVC x64, MASM, Windows SDK) and CMake: preinstalled on windows-2025, installed on the self-hosted runner
+    runs-on: ${{ vars.SCSK_RUNNER && fromJSON(vars.SCSK_RUNNER) || 'windows-2025' }}
+    timeout-minutes: 30     # a hung test or publish would otherwise bill up to 6 h x 2
+    env:
+      DOTNET_NOLOGO: 'true'
+      DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      # the newest .NET 10 SDK: builds work with any SDK of global.json's floor or newer (publish.ps1 reads the shipped
+      # runtime and package versions from the published output)
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68   # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        if: github.ref_type != 'tag'   # release builds restore from nuget.org only
+        with:
+          path: ~\.nuget\packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Proxy (CMake, MSVC, Release x64)
+        shell: cmd   # the self-hosted runner's default is Windows PowerShell 5.1, which has no &&
+        run: cmake -S proxy -B proxy/build -A x64 && cmake --build proxy/build --config Release -- /m
+
+      - name: Build
+        run: dotnet build SCSKiller.slnx -c Release
+
+      # Tests that need installed games/recordings or a real GPU carry [Trait("Needs", "Game"|"Gpu")]; the rest must
+      # pass on a machine with neither. The proxy is built, so the WARP selftest (RuntimeLayoutRules) runs.
+      - name: Test
+        run: dotnet test tests/SCSKiller.Tests -c Release --no-build --filter "Needs!=Gpu&Needs!=Game"
+
+      # No Oodle DLL in anything that leaves the build (THIRD-PARTY-NOTICES.md); the app downloads it on first use.
+      # Nothing is signed here: build/release.ps1 signs these exact bytes after checking them against the sums.
+      # A tag build is stamped with the tag's version (publish.ps1 drops the v; a bad tag fails it). Otherwise the dev default.
+      - name: Publish
+        shell: powershell
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          if ($env:TAG) { ./build/publish.ps1 -NoOodle -Version $env:TAG } else { ./build/publish.ps1 -NoOodle }
+          $dist = (Resolve-Path dist).Path
+          $sums = Get-ChildItem dist -Recurse -File -Exclude SHA256SUMS-unsigned.txt | Sort-Object FullName | ForEach-Object {
+              "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.FullName.Substring($dist.Length + 1).Replace('\', '/')
+          }
+          [IO.File]::WriteAllText("$dist\SHA256SUMS-unsigned.txt", ($sums -join "`n") + "`n")   # sha256sum -c format (LF), paths relative to dist/
+
+      # Archived (not archive: false): `gh run download`, which release.ps1 uses, can't read unarchived artifacts.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        if: ${{ !github.event.repository.private || github.ref_type == 'tag' }}   # private: storage is billed, only release tags need it
+        with:
+          name: SCSKiller-unsigned
+          path: |
+            dist/SCSKiller.zip
+            dist/SHA256SUMS-unsigned.txt
+          compression-level: 0    # the zip is already compressed
+          retention-days: 7       # artifact storage is billed on private repos
+          if-no-files-found: error

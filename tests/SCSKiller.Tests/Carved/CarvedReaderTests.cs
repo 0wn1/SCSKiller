@@ -1,0 +1,190 @@
+using System.Security.Cryptography;
+using SCSKiller.Core;
+using SCSKiller.Core.Carved;
+using SCSKiller.Core.Planning;
+using SCSKiller.Tests.Planning;
+
+namespace SCSKiller.Tests.Carved;
+
+/// <summary>The carver on a synthetic install built from real compiled shaders (<see cref="Hlsl"/>): a shader pack with
+/// RTS0-only containers, a PSO-record file, a file of junk with fake "DXBC" hits.</summary>
+public class CarvedReaderTests
+{
+    const int Pairs = 140; // > CarvedReader.MinGraphics graphics shaders in total
+
+    sealed class Fixture
+    {
+        public readonly string Dir = Ff7.TempDir("carved-synthetic");
+        public readonly List<(byte[] Vs, byte[] Ps, int Rs)> Shaders = [];
+        public readonly byte[] Rs1 = Hlsl.RootSignature(Hlsl.Rs1), Rs2 = Hlsl.RootSignature(Hlsl.Rs2);
+        public readonly List<(byte[] Vs, byte[]? Ps)> Records;
+        public Game Game => new("test:carved", "carved", Store.Other, Dir, Path.Combine(Dir, "game.exe"));
+
+        public Fixture()
+        {
+            for (var i = 0; i < Pairs; i++) Shaders.Add((Hlsl.Vs(i + 1, i % 2 == 0 ? Hlsl.Rs1 : Hlsl.Rs2), Hlsl.Ps(i + 1, i % 2 == 0 ? Hlsl.Rs1 : Hlsl.Rs2), i % 2 + 1));
+            // pack: every shader 100 bytes apart (a pool), the two root signatures at the end
+            var pack = new MemoryStream();
+            foreach (var (vs, ps, _) in Shaders) { Pad(pack, 100); pack.Write(vs); Pad(pack, 100); pack.Write(ps); }
+            Pad(pack, 100); pack.Write(Rs1); Pad(pack, 100); pack.Write(Rs2);
+            Directory.CreateDirectory(Path.Combine(Dir, "Shaders"));
+            File.WriteAllBytes(Path.Combine(Dir, "Shaders", "pack.bin"), pack.ToArray());
+            // PSO records: [desc][VS][8-byte hash][PS] back to back, records 600 bytes apart; one VS-only record
+            Records = [(Shaders[0].Vs, Shaders[0].Ps), (Shaders[3].Vs, Shaders[3].Ps), (Shaders[5].Vs, null)];
+            var rec = new MemoryStream();
+            foreach (var (vs, ps) in Records) { Pad(rec, 600); rec.Write(vs); if (ps != null) { Pad(rec, 8); rec.Write(ps); } }
+            Directory.CreateDirectory(Path.Combine(Dir, "cache"));
+            File.WriteAllBytes(Path.Combine(Dir, "cache", "default.psocache"), rec.ToArray());
+            // junk: "DXBC" magic followed by garbage, and a truncated container
+            var junk = new MemoryStream();
+            for (var i = 0; i < 1000; i++) { junk.Write("DXBC"u8); Pad(junk, 60 + i % 7); }
+            junk.Write(Shaders[7].Vs.AsSpan(0, Shaders[7].Vs.Length / 2));
+            Pad(junk, 70 << 10);
+            File.WriteAllBytes(Path.Combine(Dir, "Shaders", "junk.bin"), junk.ToArray());
+        }
+
+        static void Pad(Stream s, int n) => s.Write(RandomNumberGenerator.GetBytes(n));
+    }
+
+    static readonly Lazy<Fixture> Data = new(() => new Fixture());
+    static string Sha(byte[] b) => Convert.ToHexStringLower(SHA1.HashData(b));
+
+    [Fact]
+    public void ContainersValidate()
+    {
+        var (vs, ps, _) = Data.Value.Shaders[0];
+        Assert.True(Dxbc.Valid(vs) && Dxbc.Valid(ps) && Dxbc.Valid(Data.Value.Rs1));
+        Assert.Equal((1, 0, -1), (Dxbc.Kind(vs), Dxbc.Kind(ps), Dxbc.Kind(Data.Value.Rs1)));
+        Assert.Equal(Dxbc.Part(Data.Value.Rs1, "RTS0"u8).ToArray(), Dxbc.Part(vs, "RTS0"u8).ToArray()); // the shader's part = the standalone blob's
+        Assert.False(Dxbc.Valid(vs.AsSpan(0, vs.Length - 1)));
+        var bad = vs.ToArray();
+        var chunk = BitConverter.ToInt32(bad, 32);
+        bad[chunk] = (byte)'?'; // FourCC outside [A-Z0-9]
+        Assert.False(Dxbc.Valid(bad));
+        bad = vs.ToArray();
+        BitConverter.GetBytes(vs.Length).CopyTo(bad, chunk + 4); // chunk runs past the container
+        Assert.False(Dxbc.Valid(bad));
+    }
+
+    [Fact]
+    public void RecordsNeedEveryRunToBeAPipeline()
+    {
+        (long, int, int, string) C(long off, int kind, string sha, int size = 100) => (off, size, kind, sha);
+        // records: VS+PS 8 bytes apart, records 600 apart; a VS-only record; a tessellated one
+        var recs = CarvedReader.Records([C(0, 1, "v1"), C(108, 0, "p1"), C(800, 1, "v2"), C(1500, 1, "v3"), C(1608, 0, "p3"), C(1716, 4, "d3"), C(1824, 3, "h3")]);
+        Assert.Equal([["v1", "p1"], ["v2"], ["v3", "p3", "d3", "h3"]], recs);
+        Assert.Null(CarvedReader.Records([C(0, 1, "v1"), C(116, 0, "p1"), C(232, 1, "v2"), C(348, 0, "p2")]));   // a pack stored back to back (Cyberpunk: 16 bytes)
+        Assert.Null(CarvedReader.Records([C(0, 1, "v1"), C(500, 0, "p1"), C(1000, 1, "v2")]));                   // a pack stored apart (Resonance)
+        Assert.Null(CarvedReader.Records([C(0, 5, "c1"), C(100, -1, "rs"), C(200, 5, "c2"), C(900, 1, "v"), C(1000, 0, "p")])); // RTS0-only containers don't split runs (Starfield)
+        Assert.Null(CarvedReader.Records([C(0, 0, "p1"), C(100, 1, "v1"), C(900, 0, "p2")]));                   // a lone PS is no pipeline
+    }
+
+    [Fact]
+    public void DetectsIndexesAndServesRawShaders()
+    {
+        var d = Data.Value;
+        var reader = new CarvedReader();
+        var engine = reader.Detect(d.Game)!;
+        Assert.Equal(new EngineInfo(CarvedReader.Family, "DXBC+RTS0", null, "D3D11 or D3D12", false, null), engine);
+        var index = reader.Index(d.Game, engine, null, CancellationToken.None);
+        Assert.Equal(2 * Pairs, index.Shaders.Count);
+        var (rs1, rs2) = (Sha(d.Rs1), Sha(d.Rs2));
+        foreach (var (vs, ps, rs) in d.Shaders)
+        {
+            Assert.Equal(rs == 1 ? rs1 : rs2, index.Shaders[Sha(vs)].RootSignature); // the standalone RTS0 container, not the shader
+            Assert.Equal(rs == 1 ? rs1 : rs2, index.Shaders[Sha(ps)].RootSignature);
+            Assert.Equal(Stage.Vertex, index.Shaders[Sha(vs)].Stage);
+            Assert.Equal(new ResourceCounts(1, 1, 0, 1), index.Shaders[Sha(ps)].Counts);
+        }
+        var pool = Assert.Single(index.Maps, m => !m.IsPipeline);
+        Assert.Equal(Path.Combine("Shaders", "pack.bin"), pool.Library);
+        Assert.Equal(2 * Pairs, pool.Shaders.Count);
+        Assert.Equal(d.Records.Select(r => new[] { Sha(r.Vs) }.Concat(r.Ps == null ? [] : [Sha(r.Ps)]).ToList()),
+            index.Maps.Where(m => m.IsPipeline).Select(m => m.Shaders.ToList()));
+
+        var want = new HashSet<string> { Sha(d.Shaders[9].Ps), rs2, "0000000000000000000000000000000000000000" };
+        var got = new Dictionary<string, byte[]>();
+        reader.ReadShaders(d.Game, engine, want, (h, b) => got.Add(h, b), CancellationToken.None);
+        Assert.Equal(d.Shaders[9].Ps, got[Sha(d.Shaders[9].Ps)]);
+        Assert.Equal(d.Rs2, got[rs2]);
+        Assert.Equal(2, got.Count);
+        Assert.Equal(index.ContentHash, new CarvedReader().Index(d.Game, engine, null, CancellationToken.None).ContentHash);
+    }
+
+    [Fact]
+    public void DetectExplainsWhatItDidNotFind()
+    {
+        var dir = Ff7.TempDir("carved-few");
+        var game = new Game("test:few", "few", Store.Other, dir, Path.Combine(dir, "game.exe"));
+        Assert.Contains("no raw DXBC/DXIL shaders", new CarvedReader().Detect(game)!.Unsupported);
+        File.WriteAllBytes(Path.Combine(dir, "shaders.bin"), [.. Data.Value.Shaders[0].Vs, .. Data.Value.Shaders[0].Ps]);
+        var e = new CarvedReader().Detect(game)!;
+        Assert.Equal("only 2 raw graphics shaders: the rest are compressed or packed: needs an engine reader", e.Unsupported);
+        Assert.Equal(Readiness.Unsupported, new Planner().Check(game, e, null, Ff7.Nvidia).Readiness);
+        Assert.Null(new CarvedReader().Detect(game with { InstallDir = Path.Combine(dir, "missing") }));
+    }
+
+    sealed class Stub(EngineInfo? e, bool throws = false) : IEngineReader
+    {
+        public int Indexed;
+        public EngineInfo? Detect(Game game) => throws ? throw new IOException("unreadable") : e;
+        public ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, CancellationToken ct) { Indexed++; return new("", [], new Dictionary<string, ShaderInfo>(), []); }
+        public void ReadShaders(Game game, EngineInfo engine, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct) { }
+    }
+
+    [Fact]
+    public void ReadersAreTriedInOrder()
+    {
+        var game = Data.Value.Game;
+        var ue = new EngineInfo("Unreal", "5.5", null, "D3D12", false, null);
+        var carved = new EngineInfo(CarvedReader.Family, "DXIL", null, "D3D12", false, null);
+        var (u, c) = (new Stub(ue), new Stub(carved));
+        var chain = new EngineReaders(("Unreal", u), (CarvedReader.Family, c));
+        Assert.Equal(ue, chain.Detect(game));                                   // indexable: the first wins
+        chain.Index(game, carved, null, CancellationToken.None);                 // by family, without a Detect (cached EngineInfo)
+        Assert.Equal((0, 1), (u.Indexed, c.Indexed));
+        var packed = ue with { Unsupported = "shaders stored inside materials" };
+        Assert.Equal(carved, new EngineReaders(("Unreal", new Stub(packed)), (CarvedReader.Family, c)).Detect(game)); // Unreal can't: the carver can
+        Assert.Equal(packed, new EngineReaders(("Unreal", new Stub(packed)), (CarvedReader.Family, new Stub(carved with { Unsupported = "packed" }))).Detect(game)); // neither: the first reason
+        Assert.Equal(carved, new EngineReaders(("Unreal", new Stub(null, throws: true)), (CarvedReader.Family, c)).Detect(game));
+        Assert.Throws<IOException>(() => new EngineReaders(("Unreal", new Stub(null, throws: true)), (CarvedReader.Family, new Stub(null))).Detect(game));
+        Assert.Null(new EngineReaders(("Unreal", new Stub(null)), (CarvedReader.Family, new Stub(null))).Detect(game));
+    }
+
+    /// <summary>Planner: embedded root signatures without a recording, pairs only within one root signature, IsPipeline
+    /// maps as shipped; Materialize pulls the root-signature containers from the game like shaders.</summary>
+    [Fact]
+    public void PlannerUsesEmbeddedRootSignaturesAndExactPipelines()
+    {
+        var d = Data.Value;
+        var reader = new CarvedReader();
+        var engine = reader.Detect(d.Game)!;
+        var planner = new Planner();
+        Assert.Equal(new PlanCheck(Readiness.Ready, "no recording needed; also compiles every DirectX 11 shader (the game may run on either)"), // its SM 5.1 shaders: none for DX11
+            planner.Check(d.Game, engine, null, Ff7.Nvidia));
+        Assert.Equal(Readiness.NeedsRecording, planner.Check(d.Game, engine with { Version = "DXBC", GraphicsApi = "D3D12" }, null, Ff7.Nvidia).Readiness); // ambiguous: Ready for DX11 anyway
+        var index = reader.Index(d.Game, engine, null, CancellationToken.None);
+        var dir = Ff7.TempDir("carved-plan");
+        var plan = planner.Build(d.Game, engine, index, null, Ff7.Nvidia, dir, null, CancellationToken.None);
+        var body = PlanFile.Read(plan.FilePath).Records.ToList();
+        Assert.DoesNotContain(body, r => r.Tag == 'B'); // game bytes (the RTS0 containers) never go into a plan
+        var psos = body.Where(r => r.Tag == 'S').Select(r => (PsoDb.Parse(r).Rs, PsoDb.Parse(r).Stages))
+            .Concat(body.Where(r => r.Tag == 'P').Select(r => PsoDb.ParseItem(r.Payload)).Select(i => (i.Rs, i.Stages))).ToList();
+        foreach (var (rs, st) in psos) Assert.All(st.Values, h => Assert.Equal(index.Shaders[h].RootSignature, rs));
+        // every VS alone, every VS with every PS of its root signature (same signatures), nothing across root signatures
+        Assert.Equal(Pairs + 2 * (Pairs / 2) * (Pairs / 2), psos.Count);
+        Assert.Equal(2, plan.Stats.RootSignatures);
+        Assert.True(plan.Stats.RootSigRuleVerified);
+
+        // an IsPipeline map is emitted as is, even across root signatures (the game shipped it); the pool is not paired
+        var (vs, ps) = (Sha(d.Shaders[0].Vs), Sha(d.Shaders[1].Ps));
+        var only = index with { Maps = [new ShaderMap("x", "records", CarvedReader.Platform, [vs, ps], IsPipeline: true)] };
+        var one = planner.Build(d.Game, engine, only, null, Ff7.Nvidia, Path.Combine(dir, "one"), null, CancellationToken.None);
+        var rec = Assert.Single(PlanFile.Read(one.FilePath).Records);
+        Assert.Equal([vs, ps], PsoDb.Parse(rec).Stages.Values);
+
+        var work = Path.Combine(dir, "work");
+        planner.Materialize(plan, d.Game, engine, reader, null, work, CancellationToken.None);
+        Ff7.CheckWarmReady(work);
+    }
+}

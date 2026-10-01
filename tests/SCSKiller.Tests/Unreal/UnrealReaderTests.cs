@@ -1,0 +1,203 @@
+﻿using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text.Json;
+using SCSKiller.Core;
+using SCSKiller.Core.Unreal;
+using SCSKiller.Tests.Planning;
+using Xunit.Abstractions;
+
+namespace SCSKiller.Tests.Unreal;
+
+public class UnrealReaderTests(ITestOutputHelper output)
+{
+    readonly UnrealReader reader = new(Ff7.TempDir("reader-data")); // AES keys found for encrypted games go here, not to the app's data
+
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void Ff7IndexMatchesTheOldTool()
+    {
+        if (!Ff7.HasInstall || !Ff7.HasDump) return;
+        Ff7.Codecs();
+        var engine = reader.Detect(Ff7.Game)!;
+        Assert.Equal(new EngineInfo("Unreal", "4.26", "GAME_FinalFantasy7Rebirth", "D3D12", false, null), engine);
+
+        var index = reader.Index(Ff7.Game, engine, new Progress<string>(output.WriteLine), CancellationToken.None);
+        var summary = JsonDocument.Parse(File.ReadAllText(Path.Combine(Ff7.Out, "summary.json"))).RootElement;
+        var libs = summary.GetProperty("libraries").EnumerateArray().ToList();
+        Assert.Equal(summary.GetProperty("unique_bytecode").GetInt32(), index.Shaders.Count);
+        Assert.Equal(libs.Sum(l => l.GetProperty("shader_maps").GetInt32()), index.Maps.Count);
+        Assert.Equal(File.ReadLines(Path.Combine(Ff7.Out, "shaders.jsonl")).Count(), index.Maps.Sum(m => m.Shaders.Count)); // one line per (map, slot)
+        Assert.Equal(summary.GetProperty("platforms").EnumerateArray().Select(p => p.GetString()), index.Platforms);
+
+        // every field the planner uses, shader by shader
+        var old = Ff7.Index();
+        Assert.Equal(old.Shaders.Count, index.Shaders.Count);
+        foreach (var (sha, a) in old.Shaders)
+        {
+            var b = index.Shaders[sha];
+            Assert.True(a.Stage == b.Stage && a.ShaderModel == b.ShaderModel && a.Size == b.Size && a.Counts == b.Counts
+                && (a.Bindings.SequenceEqual(b.Bindings) || b.Stage == Stage.Library) && a.Inputs.SequenceEqual(b.Inputs.Select(Old)) && a.Outputs.SequenceEqual(b.Outputs.Where(o => o.Register < ShaderContainer.PrimitiveRow).Select(Old)), sha);
+        }
+
+        // the old tool didn't dump read masks or interpolation modes, a DXIL library's resources (RDAT), nor a mesh shader's
+        // per-primitive outputs
+        static SigElement Old(SigElement e) => e with { ReadMask = SigElement.UnknownReadMask, Interpolation = 0 };
+
+        var again = reader.Index(Ff7.Game, engine, null, CancellationToken.None);
+        Assert.Equal(index.ContentHash, again.ContentHash);
+        output.WriteLine($"{index.Shaders.Count} shaders, {index.Maps.Count} maps, content hash {index.ContentHash} (stable)");
+    }
+
+    /// <summary>DXBC geometry shaders (fxc, SM5): dcl_inputprimitive -> GsInputPrimitive, D3D_PRIMITIVE numbering.
+    /// (DXIL's PSV0 path is covered on FF7 by PlannerTests.GsChainsGetTheirInputTopology.)</summary>
+    [Theory]
+    [InlineData("point", 1, 1)]
+    [InlineData("line", 2, 2)]
+    [InlineData("triangle", 3, 3)]
+    [InlineData("lineadj", 4, 6)]
+    [InlineData("triangleadj", 6, 7)]
+    public void DxbcGsInputPrimitive(string prim, int vertices, int expected)
+    {
+        var code = Fxc($"struct V {{ float4 p : SV_Position; }}; [maxvertexcount(1)] void main({prim} V v[{vertices}], inout PointStream<V> s) {{ s.Append(v[0]); }}", "gs_5_0");
+        var info = ShaderContainer.Parse(code, "", new(0, 0, 0, 0))!;
+        Assert.Equal((Stage.Geometry, expected), (info.Stage, info.GsInputPrimitive));
+        var vs = ShaderContainer.Parse(Fxc("float4 main() : SV_Position { return 0; }", "vs_5_0"), "", new(0, 0, 0, 0))!;
+        Assert.Equal(0, vs.GsInputPrimitive);
+    }
+
+    internal static byte[] Fxc(string src, string target)
+    {
+        Assert.Equal(0, D3DCompile(src, src.Length, null, 0, 0, "main", target, 0, 0, out var code, out _));
+        var bytes = new byte[code.GetBufferSize()];
+        Marshal.Copy(code.GetBufferPointer(), bytes, 0, bytes.Length);
+        return bytes;
+    }
+
+    [ComImport, Guid("8BA5FB08-5195-40e2-AC58-0D989C3A0102"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ID3DBlob { [PreserveSig] nint GetBufferPointer(); [PreserveSig] int GetBufferSize(); }
+
+    [DllImport("d3dcompiler_47.dll", CharSet = CharSet.Ansi)]
+    static extern int D3DCompile(string src, nint size, string? name, nint defines, nint include, string entry, string target, uint flags1, uint flags2,
+        out ID3DBlob code, out ID3DBlob? errors);
+
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void ReadShadersReturnsContainerBytes()
+    {
+        if (!Ff7.HasInstall || !Ff7.HasDump) return;
+        Ff7.Codecs();
+        var engine = reader.Detect(Ff7.Game)!;
+        var want = Ff7.Index().Shaders.Keys.Where((_, i) => i % 5000 == 0).ToHashSet();
+        var got = new Dictionary<string, byte[]>();
+        reader.ReadShaders(Ff7.Game, engine, want, (h, b) => got.Add(h, b), CancellationToken.None);
+        Assert.Equal(want.Order(), got.Keys.Order());
+        foreach (var (h, b) in got)
+        {
+            Assert.Equal(h, Convert.ToHexStringLower(SHA1.HashData(b)));
+            Assert.Equal(File.ReadAllBytes(Path.Combine(Ff7.Out, "bytecode", h + ".bin")), b);
+        }
+    }
+
+    /// <summary>A package a patch pak overrides is listed once per pak, so maps built in parallel share a hash: however the
+    /// threads finish, <see cref="UnrealReader.Canonical"/> gives one order and one content hash.</summary>
+    [Fact]
+    public void MapsBuiltInParallelComeOutInOneOrder()
+    {
+        var maps = Enumerable.Range(0, 200).Select(i => new ShaderMap($"pkg{i % 50}", $"pkg{i % 50}", "PCD3D_SM5",
+            [.. Enumerable.Range(0, 1 + i % 7).Select(k => ExactLayoutsTests.Hash($"{i % 120}-{k}"))])).ToList();
+        maps.AddRange(maps.Take(10)); // the same copy twice
+        static string Lines(IEnumerable<ShaderMap> ms) => string.Concat(ms.Select(m => $"{m.Hash}:{string.Join(',', m.Shaders)}\n"));
+        List<ShaderMap> Shuffled(int seed) { var r = new Random(seed); return [.. maps.OrderBy(_ => r.Next())]; }
+        Assert.NotEqual(Lines(Shuffled(1).OrderBy(m => m.Hash, StringComparer.Ordinal)), Lines(Shuffled(2).OrderBy(m => m.Hash, StringComparer.Ordinal)));
+
+        string Built(int seed)
+        {
+            var bag = new ConcurrentBag<ShaderMap>();
+            Parallel.ForEach(Shuffled(seed), bag.Add);
+            return Lines(UnrealReader.Canonical(bag));
+        }
+        var first = Built(1);
+        foreach (var seed in Enumerable.Range(2, 8)) Assert.Equal(first, Built(seed));
+    }
+
+    /// <summary>Tiny Tina's Wonderlands: version-1 archives (maps from package references) and patch paks that override
+    /// packages; two indexes give the same maps and content hash.</summary>
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void PatchedPackagesIndexTheSameEveryTime()
+    {
+        var dir = TestEnv.GameDir("Tiny Tina's Wonderlands");
+        var game = new Game("steam:1286680", "Tiny Tina's Wonderlands", Store.Steam, dir, Path.Combine(dir, @"OakGame\Binaries\Win64\Wonderlands.exe"));
+        if (!File.Exists(game.ExePath)) return;
+        Ff7.Codecs();
+        var engine = reader.Detect(game)!;
+        var a = reader.Index(game, engine, null, CancellationToken.None);
+        var b = reader.Index(game, engine, null, CancellationToken.None);
+        Assert.Equal(a.Maps.Select(m => $"{m.Hash}:{string.Join(',', m.Shaders)}"), b.Maps.Select(m => $"{m.Hash}:{string.Join(',', m.Shaders)}"));
+        Assert.Equal(a.ContentHash, b.ContentHash);
+        output.WriteLine($"{a.Shaders.Count} shaders, {a.Maps.Count} maps, content hash {a.ContentHash}");
+    }
+
+    /// <summary>SILENT HILL: Townfall (5.6) ships compute shaders with a [WaveSize] of 16 or 64 lanes: they get their own
+    /// platform, so NVIDIA's plan (32 lanes) has none of them; every other shader stays on PCD3D_SM6.</summary>
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void WaveSizePermutationsGetTheirOwnPlatform()
+    {
+        var game = new SCSKiller.Core.Games.SteamSource().Discover().FirstOrDefault(g => g.Id == "steam:1636440");
+        if (game == null) return;
+        Ff7.Codecs();
+        var engine = reader.Detect(game)!;
+        var index = reader.Index(game, engine, null, CancellationToken.None);
+        var wave = index.Maps.Where(m => m.Platform.StartsWith("PCD3D_SM6 wave")).SelectMany(m => m.Shaders).ToHashSet();
+        output.WriteLine($"platforms {string.Join(", ", index.Platforms)}; {wave.Count} wave-size shaders");
+        Assert.NotEmpty(wave);
+        Assert.Empty(wave.Intersect(index.Maps.Where(m => m.Platform == "PCD3D_SM6").SelectMany(m => m.Shaders)));
+        var lanes = new List<(uint Min, uint Max)?>();
+        reader.ReadShaders(game, engine, wave, (_, b) => lanes.Add(SCSKiller.Core.Carved.Dxbc.WaveLanes(b)), CancellationToken.None);
+        Assert.Equal(wave.Count, lanes.Count);
+        Assert.All(lanes, l => Assert.True(l is { } x && (x.Min > 32 || x.Max < 32), $"{l}"));
+        var plan = new SCSKiller.Core.Planning.Planner().Build(game, engine, index, null, Ff7.Nvidia with { PerStageCache = true }, Ff7.TempDir("townfall-wave"), null, CancellationToken.None);
+        var planned = SCSKiller.Core.Planning.PlanFile.Read(plan.FilePath).Records.Where(r => r.Tag == 'S').SelectMany(r => SCSKiller.Core.Planning.PsoDb.Parse(r).Stages.Values);
+        Assert.Empty(planned.Where(wave.Contains));
+    }
+
+    /// <summary>Every game the old tool indexed: same engine version (except Windrose, 5.6, exe 5.6.1, which the old tool's
+    /// TOC guess called 5.5; and Darwin's Paradox, 5.4 with TOC version 6, which it took for 5.3), and the right verdict for
+    /// games without shader libraries (encrypted, or indexable with the shaders inside the packages).</summary>
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void DetectsIndexedGames()
+    {
+        var outDir = Path.Combine(Ff7.Main, "out");
+        if (!Directory.Exists(outDir)) return;
+        Ff7.Codecs();
+        foreach (var file in Directory.EnumerateFiles(outDir, "summary.json", SearchOption.AllDirectories))
+        {
+            var s = JsonDocument.Parse(File.ReadAllText(file)).RootElement;
+            var dir = s.GetProperty("game_dir").GetString()!;
+            if (!Directory.Exists(dir)) continue;
+            var exe = s.TryGetProperty("exe", out var x) && x.ValueKind == JsonValueKind.String ? x.GetString()! : "";
+            if (exe != "" && !File.Exists(exe)) continue; // uninstalled since the old tool's dump (a leftover folder remains)
+            var e = reader.Detect(new Game("test:" + Path.GetFileName(dir), Path.GetFileName(dir), Store.Steam, dir, exe))!;
+            output.WriteLine($"{Path.GetFileName(dir)}: {e}");
+            var engine = s.GetProperty("engine").GetString()!; // e.g. GAME_UE4_26
+            Assert.Equal(Path.GetFileName(dir) switch { "Windrose Demo" when !e.Encrypted => "5.6", "Darwin's Paradox" => "5.4", _ => engine[7..].Replace('_', '.') }, e.Version);
+            var fork = s.GetProperty("game").GetString();
+            Assert.Equal(fork == engine ? null : fork, e.Fork);
+            var libraries = s.GetProperty("libraries").GetArrayLength();
+            var aes = s.GetProperty("aes_needed").GetBoolean();
+            if (libraries == 0 && aes && !e.Encrypted) continue; // we found the AES key the old tool didn't have (UnrealKeysTests)
+            Assert.Equal(libraries == 0 && aes ? "encrypted game files (needs the game's AES key)" : null, e.Unsupported);
+            Assert.Equal(libraries == 0 && aes, e.Encrypted);
+            // full index of every game (IoStore included): ~1 min of all cores, so opt-in
+            if (libraries == 0 || Environment.GetEnvironmentVariable("SCSKILLER_ALL_GAMES") != "1") continue;
+            var index = reader.Index(new Game("test", "", Store.Steam, dir, exe), e, null, CancellationToken.None);
+            output.WriteLine($"  indexed: {index.Shaders.Count} shaders, {index.Maps.Count} maps, platforms {string.Join(",", index.Platforms)}");
+            Assert.Equal(s.GetProperty("unique_bytecode").GetInt32(), index.Shaders.Count);
+            Assert.Equal(s.GetProperty("libraries").EnumerateArray().Sum(l => l.GetProperty("shader_maps").GetInt32()), index.Maps.Count(m => !m.Platform.Contains(" wave")));
+        }
+        Assert.Null(reader.Detect(new Game("test", "none", Store.Other, Directory.CreateTempSubdirectory().FullName, "")));
+    }
+}

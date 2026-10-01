@@ -1,0 +1,702 @@
+using System.Diagnostics;
+using System.Text.RegularExpressions;
+using SCSKiller.Core;
+using SCSKiller.Core.Vendors;
+using SCSKiller.Core.Warming;
+
+namespace SCSKiller.Tests.Platform;
+
+// Each test runs the fake warm through cmd and PowerShell (seconds to start on a loaded PC) and some assert on reaction
+// times (the stuck-stop limit, pause): alone, not next to the thread-pool-saturating index tests; waits are generous.
+[Collection(TimingCollection.Name)]
+public class WarmerTests : IDisposable
+{
+    // Stand-in for scskiller_warm.exe: prints canned protocol lines; the scenario comes from <workdir>\mode.txt.
+    const string FakeScript = """
+        $work = $args[0]; $exe = $args[1]; $ev = $null
+        for ($i = 2; $i -lt $args.Count; $i++) { if ($args[$i] -eq '--stop-event') { $ev = $args[$i + 1] } }
+        Set-Content (Join-Path $work 'args.txt') ($args -join "`n")
+        function Say($s) { [Console]::Out.WriteLine($s); [Console]::Out.Flush() }
+        $mode = (Get-Content (Join-Path $work 'mode.txt')).Trim()
+        Say 'scskiller_warm: a banner line that is not JSON'
+        Say ('{"event":"start","total":1000,"adapter":"Fake GPU","exe":"' + $exe + '"}')
+        if ($mode -eq 'complete') {
+            Say '{"event":"progress","done":500,"total":1000,"failed":1,"rate":480.5}'
+            Say '{"event":"done","done":1000,"total":1000,"failed":2,"seconds":2.1,"stopped":false}'
+            exit 0
+        }
+        if ($mode -eq 'error') { Say '{"event":"error","message":"no D3D12 device"}'; exit 3 }
+        if ($mode -eq 'passcrash') {   # pass 1 blames cc (a removal, then done); the later passes get it with the given keys
+            Set-Content (Join-Path $work "run-$PID.txt") ($args -join ' ')
+            $p = $args[[array]::IndexOf($args, '--pass') + 1]; $iso = [array]::IndexOf($args, '--isolate')
+            if ($p -eq '1' -and $iso -lt 0) { Say '{"event":"retry","from":1,"rtThreads":2,"failedItem":-1,"done":1,"total":7,"failed":0,"seconds":0.1,"reason":"removed","crashed":[],"isolate":[1]}'; exit 3 }
+            if ($p -eq '1') { Say '{"event":"done","done":7,"total":7,"failed":0,"seconds":0.1,"stopped":false,"crashed":["00000000000000000000000000000000000000cc"]}'; exit 0 }
+            Say '{"event":"done","done":7,"total":7,"failed":0,"seconds":0.1,"stopped":false}'; exit 0
+        }        if ($mode -eq 'passes') {   # 7 items in the whole-run numbering of each pass; one failure per pass
+            Set-Content (Join-Path $work "run-$PID.txt") ($args -join ' ')
+            Say '{"event":"progress","done":3,"total":7,"failed":0,"rate":5}'
+            Say '{"event":"done","done":7,"total":7,"failed":1,"seconds":0.1,"stopped":false}'; exit 0
+        }
+        if ($mode -eq 'nodone') { Say '{"event":"progress","done":10,"total":1000,"failed":0,"rate":5}'; exit 0 }
+        if ($mode -eq 'stuck') { while ($true) { Say '{"event":"progress","done":7,"total":1000,"failed":0,"rate":5}'; Start-Sleep -Milliseconds 100 } }   # deaf to the stop event
+        if ($mode -eq 'retrystuck') {   # a retry, then the second process is deaf to the stop event
+            if ([array]::IndexOf($args, '--rt-threads') -lt 0) { Say '{"event":"retry","from":600,"rtThreads":8,"failedItem":-1,"done":600,"total":1000,"failed":1,"seconds":1.0}'; exit 3 }
+            Set-Content (Join-Path $work 'pid.tmp') $PID; Move-Item (Join-Path $work 'pid.tmp') (Join-Path $work 'pid.txt')   # appears whole
+            while ($true) { Say '{"event":"progress","done":650,"total":1000,"failed":0,"rate":5}'; Start-Sleep -Milliseconds 100 }
+        }
+        if ($mode -eq 'retry') {   # 32 threads: a fault -> retry from 600 on 8; there a fault alone at 650 -> from 700 on 2; then done
+            Set-Content (Join-Path $work "run-$PID.txt") ($args -join ' ')
+            $rt = [array]::IndexOf($args, '--rt-threads'); $rt = if ($rt -ge 0) { $args[$rt + 1] } else { '' }
+            if ($rt -eq '') { Say '{"event":"progress","done":550,"total":1000,"failed":1,"rate":400}'; Say '{"event":"retry","from":600,"rtThreads":8,"failedItem":-1,"done":600,"total":1000,"failed":1,"seconds":1.0}'; exit 3 }
+            if ($rt -eq '8') { Say '{"event":"retry","from":700,"rtThreads":2,"failedItem":650,"done":700,"total":1000,"failed":2,"seconds":1.0}'; exit 3 }
+            Say '{"event":"progress","done":900,"total":1000,"failed":0,"rate":300}'
+            Start-Sleep -Milliseconds 400
+            Say '{"event":"done","done":1000,"total":1000,"failed":0,"seconds":1.0,"stopped":false}'; exit 0
+        }
+        if ($mode -eq 'removed') {   # removed with 600, 610, 611 in flight -> 610 removes it alone -> done without it
+            Set-Content (Join-Path $work "run-$PID.txt") ($args -join ' ')
+            $iso = [array]::IndexOf($args, '--isolate'); $iso = if ($iso -ge 0) { $args[$iso + 1] } else { '' }
+            if ($iso -eq '') { Say '{"event":"retry","from":600,"rtThreads":4,"failedItem":-1,"done":600,"total":1000,"failed":1,"seconds":1.0,"reason":"removed","crashed":["00000000000000000000000000000000000000bb"],"isolate":[600,610,611]}'; exit 3 }
+            if ($iso -ne '611') { Say '{"event":"retry","from":601,"rtThreads":4,"failedItem":-1,"done":601,"total":1000,"failed":0,"seconds":1.0,"reason":"removed","crashed":["00000000000000000000000000000000000000aa"],"isolate":[611]}'; exit 3 }
+            Say '{"event":"done","done":1000,"total":1000,"failed":0,"seconds":1.0,"stopped":false,"crashed":["00000000000000000000000000000000000000AA","00000000000000000000000000000000000000bb"]}'; exit 0
+        }
+        if ($mode -eq 'removedloop') { Say '{"event":"retry","from":10,"rtThreads":0,"failedItem":-1,"done":10,"total":1000,"failed":0,"seconds":1.0,"reason":"removed","crashed":[],"isolate":[10,11]}'; exit 3 }
+        $h = [System.Threading.EventWaitHandle]::OpenExisting($ev); $done = 0
+        while (-not $h.WaitOne(0)) { $done++; Say ('{"event":"progress","done":' + $done + ',"total":1000,"failed":0,"rate":20}'); Start-Sleep -Milliseconds 50 }
+        Say ('{"event":"done","done":' + $done + ',"total":1000,"failed":0,"seconds":1.0,"stopped":true}')
+        if ($mode -eq 'flush') { Start-Sleep -Seconds 3 }   # the driver writing its cache as the process exits
+        exit 0
+        """;
+
+    readonly string _dir = Path.Combine(Path.GetTempPath(), "scskiller-warm-test-" + Guid.NewGuid().ToString("N")[..8]);
+    readonly string _exe;
+    static readonly Game Game = new("test:1", "Fake", Store.Other, @"C:\nowhere", @"C:\nowhere\Binaries\Win64\Fake-Win64-Shipping.exe");
+    static readonly UnsupportedVendor Vendor = new(new GpuInfo(GpuVendor.Unknown, "Fake GPU", "1.0", 0x1234ABCD, 0));
+
+    public WarmerTests()
+    {
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(Path.Combine(_dir, "fake_warm.ps1"), FakeScript);
+        _exe = Path.Combine(_dir, "fake_warm.cmd");
+        File.WriteAllText(_exe, "@powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0fake_warm.ps1\" %*\r\n@exit /b %ERRORLEVEL%\r\n");
+    }
+
+    public void Dispose() => Directory.Delete(_dir, true);
+
+    string Work(string mode)
+    {
+        var w = Path.Combine(_dir, mode);
+        Directory.CreateDirectory(w);
+        File.WriteAllText(Path.Combine(w, "mode.txt"), mode);
+        return w;
+    }
+
+    sealed class Counter : IProgress<WarmProgress>
+    {
+        public int Count;
+        public WarmProgress? Last;
+        public void Report(WarmProgress p) { Last = p; Interlocked.Increment(ref Count); }
+    }
+
+    [Fact]
+    public void Parser_reads_every_event_and_ignores_noise()
+    {
+        var start = WarmEvent.Parse("""{"event":"start","total":117197,"adapter":"NVIDIA GeForce","exe":"ff7rebirth_.exe"}""")!;
+        Assert.Equal(("start", 117197L), (start.Event, start.Total));
+        var p = WarmEvent.Parse("""{"event":"progress","done":64210,"total":117197,"failed":3,"rate":480.2}""")!;
+        Assert.Equal((64210L, 117197L, 3L, 480.2), (p.Done, p.Total, p.Failed, p.Rate));
+        var done = WarmEvent.Parse("""{"event":"done","done":117197,"total":117197,"failed":5,"seconds":288.1,"stopped":false}""")!;
+        Assert.Equal((117197L, 5L, 288.1, false), (done.Done, done.Failed, done.Seconds, done.Stopped));
+        Assert.True(WarmEvent.Parse("""{"event":"done","done":10,"total":20,"failed":0,"seconds":1,"stopped":true}""")!.Stopped);
+        const string same = """{"event":"done","done":10,"total":20,"failed":0,"seconds":1,"stopped":true,"crashed":[]}""";
+        Assert.Equal(WarmEvent.Parse(same), WarmEvent.Parse(same));   // WarmOutput.Pump folds equal lines
+        Assert.Equal("boom", WarmEvent.Parse("""{"event":"error","message":"boom"}""")!.Message);
+        Assert.Null(WarmEvent.Parse("scskiller_warm: warming the cache of 'x.exe'"));
+        Assert.Null(WarmEvent.Parse("{not json"));
+        Assert.Null(WarmEvent.Parse("""{"done":1}"""));
+    }
+
+    [Fact]
+    public async Task Completed_run_reports_progress_and_passes_the_protocol_arguments()
+    {
+        var work = Work("complete");
+        var c = new Counter();
+        var r = await new Warmer(Vendor, _exe).Start(Game, work, new WarmOptions(7, WarmPriority.Idle, 42, 6144), c).Completion;
+        Assert.Equal(WarmOutcome.Completed, r.Outcome);
+        Assert.Equal((1000L, 1000L, 2L), (r.Done, r.Total, r.Failed));
+        Assert.InRange(c.Count, 1, 2);   // lines closer together than the report interval fold into the latest
+        Assert.Equal(1000, c.Last!.Done);
+        Assert.Null(r.Error);
+        Assert.Equal(Path.Combine(work, "stage", "scskiller.log"), r.LogPath);
+        var a = File.ReadAllLines(Path.Combine(work, "args.txt"));
+        Assert.Equal(work, a[0]);
+        Assert.Equal("Fake-Win64-Shipping.exe", a[1]);
+        Assert.Equal(["--threads", "7", "--priority", "idle", "--start", "42", "--stop-event"], a[2..9]);
+        Assert.Equal(["--adapter-luid", "000000001234ABCD", "--memory-mb", "6144"], a[10..14]);
+        Assert.Equal(["--stage-path", @"nowhere\Binaries\Win64\Fake-Win64-Shipping.exe"], a[14..]);
+    }
+
+    [Theory]
+    [InlineData(@"C:\Games\Hogwarts Legacy", @"C:\Games\Hogwarts Legacy\Phoenix\Binaries\Win64\HogwartsLegacy.exe", @"Hogwarts Legacy\Phoenix\Binaries\Win64\HogwartsLegacy.exe")]
+    [InlineData(@"C:\Games\Hogwarts Legacy\", @"C:\Games\Hogwarts Legacy\Phoenix\Binaries\Win64\HogwartsLegacy.exe", @"Hogwarts Legacy\Phoenix\Binaries\Win64\HogwartsLegacy.exe")]
+    [InlineData(@"C:\Games\Hogwarts Legacy", @"C:\Games\Hogwarts Legacy\HOGWARTSLEGACY.EXE", @"Hogwarts Legacy\HOGWARTSLEGACY.EXE")]
+    [InlineData(@"D:\Steam\common\Tiny Tina's Wonderlands", @"D:\Steam\common\Tiny Tina's Wonderlands\OakGame\Binaries\Win64\Wonderlands.exe", @"Tiny Tina's Wonderlands\OakGame\Binaries\Win64\Wonderlands.exe")]
+    [InlineData(@"D:\Games\Ōkami HD v1.2 (GOG)", @"D:\Games\Ōkami HD v1.2 (GOG)\..data\bin.x64\okami.exe", @"Ōkami HD v1.2 (GOG)\..data\bin.x64\okami.exe")]
+    [InlineData(@"d:\games\hogwarts legacy", @"D:\Games\Hogwarts Legacy\Phoenix\HogwartsLegacy.exe", @"hogwarts legacy\Phoenix\HogwartsLegacy.exe")]
+    public void The_stage_path_is_the_install_folder_and_the_exe_path_inside_it(string install, string exe, string expected)
+    {
+        Assert.Equal(expected, Warmer.StagePath(Game with { InstallDir = install, ExePath = exe }, @"C:\Users\x\AppData\Local\SCSKiller\games\steam_990080\work", out var why));
+        Assert.Null(why);
+    }
+
+    [Theory]
+    [InlineData(@"C:\Games\Hogwarts Legacy", @"C:\Games\Hogwarts Legacy2\HogwartsLegacy.exe", "outside")]
+    [InlineData(@"C:\Games\Hogwarts Legacy", @"D:\Hogwarts Legacy\HogwartsLegacy.exe", "outside")]
+    [InlineData(@"C:\Games\Hogwarts Legacy", @"C:\Games\HogwartsLegacy.exe", "outside")]
+    [InlineData(@"D:\", @"D:\Binaries\Game.exe", "drive root")]
+    public void An_exe_outside_its_install_gets_no_stage_path(string install, string exe, string reason)
+    {
+        Assert.Null(Warmer.StagePath(Game with { InstallDir = install, ExePath = exe }, @"C:\work", out var why));
+        Assert.Contains(reason, why);
+    }
+
+    [Fact]
+    public void A_stage_path_that_would_reach_MAX_PATH_is_left_out()
+    {
+        var install = @"C:\Games\" + new string('i', 60);
+        var g = Game with { InstallDir = install, ExePath = Path.Combine(install, new string('d', 60), "Game.exe") };
+        var work = @"C:\" + new string('w', 100);
+        Assert.NotNull(Warmer.StagePath(g, work + "www", out _));   // 106 + @"\stage\" + 60 + 1 + 60 + 1 + 24 = 259
+        Assert.Null(Warmer.StagePath(g, work + "wwww", out var why));
+        Assert.Contains("longer than 259", why);
+    }
+
+    [Fact]
+    public async Task An_exe_outside_its_install_warms_without_a_stage_path_and_logs_why()
+    {
+        var work = Work("complete");
+        var log = new List<string>();
+        var warmer = new Warmer(Vendor, _exe) { Log = new Progress(log.Add) };
+        await warmer.Start(Game with { ExePath = @"C:\elsewhere\Fake-Win64-Shipping.exe" }, work, new WarmOptions(1, WarmPriority.BelowNormal), null).Completion;
+        Assert.DoesNotContain("--stage-path", File.ReadAllLines(Path.Combine(work, "args.txt")));
+        Assert.Equal([@"Fake: the compile runs without the install's folder layout: C:\elsewhere\Fake-Win64-Shipping.exe is outside C:\nowhere"], log);
+    }
+
+    sealed class Progress(Action<string> a) : IProgress<string> { public void Report(string s) { lock (a) a(s); } }
+
+    /// <summary>The real scskiller_warm on WARP (no GPU cache): with --stage-path the child runs from
+    /// stage\&lt;install folder&gt;\&lt;dir&gt;\&lt;exe&gt; (the proxy logs its process's path), its log ends up in stage\ and the
+    /// staged folders are gone; a path that would reach MAX_PATH stages the exe alone. Needs this checkout's proxy built.</summary>
+    [Fact]
+    public async Task The_real_warm_runs_its_child_from_the_stage_path_and_removes_it()
+    {
+        var bin = Path.Combine(TestEnv.RepoRoot, "proxy", "build", "Release");
+        if (!File.Exists(Path.Combine(bin, "scskiller_warm.exe"))) return;
+        var luid = Process.Start(new ProcessStartInfo(Path.Combine(bin, "selftest.exe"), "warpluid") { RedirectStandardOutput = true })!.StandardOutput.ReadToEnd().Trim();
+        var vendor = new UnsupportedVendor(new GpuInfo(GpuVendor.Unknown, "WARP", "1.0", Convert.ToInt64(luid, 16), 0));
+        var install = Path.Combine(_dir, "games", "Fake Game's (x) é.v2");
+        var exe = $"scsk-stage-{Guid.NewGuid():N}"[..20] + ".exe";
+        var game = Game with { InstallDir = install, ExePath = Path.Combine(install, "Bin", "Win64", exe) };
+        var work = Path.Combine(_dir, "work");
+        Directory.CreateDirectory(work);
+        var r = await new Warmer(vendor, Path.Combine(bin, "scskiller_warm.exe")).Start(game, work, new WarmOptions(1, WarmPriority.BelowNormal), null).Completion.WaitAsync(Patience);
+        Assert.Equal(WarmOutcome.Completed, r.Outcome);
+        var stage = Path.Combine(work, "stage");
+        Assert.Equal(Path.Combine(stage, "scskiller.log"), r.LogPath);
+        var loaded = File.ReadLines(r.LogPath, System.Text.Encoding.Latin1).First(l => l.Contains("loaded into "));
+        Assert.Contains(Path.Combine(stage, "Fake Game's (x) "), loaded);
+        Assert.EndsWith(Path.Combine(".v2", "Bin", "Win64", exe), loaded);
+        Assert.Empty(Directory.GetDirectories(stage));
+        Assert.Equal(["scskiller.log", "scskiller_creates.csv"], Directory.GetFiles(stage).Select(Path.GetFileName).Order(StringComparer.Ordinal));
+        Assert.False(Directory.Exists(install));
+
+        var p = Process.Start(new ProcessStartInfo(Path.Combine(bin, "scskiller_warm.exe"),
+            [work, exe, "--adapter-luid", luid, "--stage-path", Path.Combine(new string('x', 120), new string('y', 120), exe)]) { RedirectStandardOutput = true, RedirectStandardError = true })!;
+        var err = p.StandardError.ReadToEndAsync();
+        Assert.Contains("\"done\"", await p.StandardOutput.ReadToEndAsync());
+        await p.WaitForExitAsync();
+        Assert.Contains("--stage-path too long", await err);
+        Assert.EndsWith(Path.Combine(stage, exe), File.ReadLines(r.LogPath).First(l => l.Contains("loaded into ")));
+        Assert.Empty(Directory.GetDirectories(stage));
+    }
+
+    /// <summary>NVIDIA warms with the segment-heap build (its staged copy is that exe), the other vendors with the NT-heap
+    /// one; the segment-heap build stages the proxy from its parent folder. Needs this checkout's proxy built.</summary>
+    [Fact]
+    public async Task NVIDIA_warms_on_the_segment_heap_build_and_the_other_vendors_on_the_NT_heap_one()
+    {
+        Assert.Equal(@"segheap\scskiller_warm.exe", Warmer.ExeFor(GpuVendor.Nvidia));
+        Assert.Equal("scskiller_warm.exe", Warmer.ExeFor(GpuVendor.Amd));
+        Assert.Equal("scskiller_warm.exe", Warmer.ExeFor(GpuVendor.Unknown));
+        var bin = Path.Combine(TestEnv.RepoRoot, "proxy", "build", "Release");
+        if (!File.Exists(Path.Combine(bin, "segheap", "scskiller_warm.exe"))) return;
+        bool Segment(string exe) => System.Text.Encoding.UTF8.GetString(File.ReadAllBytes(Path.Combine(bin, exe))).Contains(">SegmentHeap</heapType>");
+        Assert.True(Segment(Warmer.ExeFor(GpuVendor.Nvidia)));
+        Assert.False(Segment(Warmer.ExeFor(GpuVendor.Amd)));
+
+        var luid = Process.Start(new ProcessStartInfo(Path.Combine(bin, "selftest.exe"), "warpluid") { RedirectStandardOutput = true })!.StandardOutput.ReadToEnd().Trim();
+        var work = Path.Combine(_dir, "work");
+        Directory.CreateDirectory(work);
+        var exeName = $"scsk-heap-{Guid.NewGuid():N}"[..20] + ".exe";
+        var p = Process.Start(new ProcessStartInfo(Path.Combine(bin, Warmer.ExeFor(GpuVendor.Nvidia)), [work, exeName, "--adapter-luid", luid])
+            { RedirectStandardOutput = true, RedirectStandardError = true })!;
+        var err = p.StandardError.ReadToEndAsync();
+        Assert.Contains("\"done\"", await p.StandardOutput.ReadToEndAsync());
+        await p.WaitForExitAsync();
+        Assert.Equal(0, p.ExitCode);
+        Assert.Equal(File.ReadAllBytes(Path.Combine(bin, "d3d12.dll")), File.ReadAllBytes(Path.Combine(work, "stage", "d3d12.dll")));
+    }
+
+    static readonly AgsRegistration Townfall = new("Townfall", "UnrealEngine5.6");
+
+    [Fact]
+    public void AGS_arguments_only_on_AMD_for_a_registering_game_that_is_not_a_package()
+    {
+        const string dll = @"C:\app\native\amd_ags_x64.dll";
+        Assert.Equal(["--ags", dll, "--ags-app", "Townfall", "--ags-engine", "UnrealEngine5.6"], Warmer.AgsArgs(GpuVendor.Amd, Game, Townfall, dll, out var why));
+        Assert.Null(why);
+        Assert.Empty(Warmer.AgsArgs(GpuVendor.Nvidia, Game, Townfall, dll, out why));
+        Assert.Empty(Warmer.AgsArgs(GpuVendor.Amd, Game, null, dll, out why));
+        Assert.Null(why);
+        Assert.Empty(Warmer.AgsArgs(GpuVendor.Amd, Game, Townfall, null, out why));
+        Assert.Contains("amd_ags_x64.dll not found", why);
+        Assert.Contains("AGS app name Townfall", why);
+
+        var content = Path.Combine(_dir, "Content");   // an Xbox package: no AGS arguments
+        Directory.CreateDirectory(content);
+        File.WriteAllText(Path.Combine(content, "appxmanifest.xml"), """
+            <?xml version="1.0" encoding="utf-8"?>
+            <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+              <Applications><Application Id="App" Executable="Game.exe" EntryPoint="Windows.FullTrustApplication" /></Applications>
+            </Package>
+            """);
+        Assert.Empty(Warmer.AgsArgs(GpuVendor.Amd, new Game("xbox:P.G_1", "G", Store.Xbox, content, Path.Combine(content, "Game.exe")), Townfall, dll, out why));
+    }
+
+    sealed class AmdVendor(GpuInfo gpu) : IGpuVendorBackend
+    {
+        public GpuVendor Vendor => GpuVendor.Amd;
+        public GpuInfo Gpu => gpu;
+        public VendorCaps Caps => new("fake-amd", true, false, false);
+        public CacheUsage GetCacheUsage() => new("", 0, true);
+        public CacheLimit? GetCacheLimit() => null;
+        public void SetCacheLimit(CacheLimit limit) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task The_warm_passes_the_AGS_registration_on_AMD_only()
+    {
+        foreach (var amd in new[] { true, false })
+        {
+            var work = Work("complete");
+            var log = new List<string>();
+            var warmer = new Warmer(amd ? new AmdVendor(Vendor.Gpu) : Vendor, _exe) { Log = new Progress(log.Add), Ags = _ => Townfall };
+            await warmer.Start(Game, work, new WarmOptions(1, WarmPriority.BelowNormal), null).Completion;
+            var a = File.ReadAllLines(Path.Combine(work, "args.txt"));
+            var bundled = NativeTools.Find(AmdAgs.DllName);
+            if (amd && bundled != null)
+                Assert.Equal(["--ags", bundled, "--ags-app", "Townfall", "--ags-engine", "UnrealEngine5.6"], a.SkipWhile(x => x != "--ags").ToArray());
+            else Assert.DoesNotContain("--ags", a);
+            if (amd && bundled == null) Assert.Contains(log, l => l.Contains("amd_ags_x64.dll not found"));
+        }
+    }
+
+    /// <summary>The real scskiller_warm on WARP with an AGS DLL that isn't there: it says why and warms on a plain device.</summary>
+    [Fact]
+    public async Task The_real_warm_falls_back_to_a_plain_device_when_AGS_fails()
+    {
+        var bin = Path.Combine(TestEnv.RepoRoot, "proxy", "build", "Release");
+        if (!File.Exists(Path.Combine(bin, "scskiller_warm.exe"))) return;
+        var luid = Process.Start(new ProcessStartInfo(Path.Combine(bin, "selftest.exe"), "warpluid") { RedirectStandardOutput = true })!.StandardOutput.ReadToEnd().Trim();
+        var work = Path.Combine(_dir, "agswork");
+        Directory.CreateDirectory(work);
+        var exe = $"scsk-ags-{Guid.NewGuid():N}"[..18] + ".exe";
+        var missing = Path.Combine(_dir, "nowhere", AmdAgs.DllName);
+        var p = Process.Start(new ProcessStartInfo(Path.Combine(bin, "scskiller_warm.exe"),
+            [work, exe, "--adapter-luid", luid, "--ags", missing, "--ags-app", "Townfall", "--ags-engine", "UnrealEngine5.6"]) { RedirectStandardOutput = true, RedirectStandardError = true })!;
+        var err = p.StandardError.ReadToEndAsync();
+        var output = await p.StandardOutput.ReadToEndAsync().WaitAsync(Patience);
+        await p.WaitForExitAsync();
+        Assert.Equal(0, p.ExitCode);
+        Assert.Contains("\"done\"", output);
+        Assert.Contains($"AGS app Townfall: loading {missing} failed", await err);
+        Assert.Contains("a plain device", await err);
+    }
+
+    /// <summary>The real scskiller_warm on WARP: with a pass file each process creates only its pass's items (three D3D11
+    /// items whose shader is missing: each fails once, in its own pass) and counts the others done; a pass file that doesn't
+    /// match the dbs is an error. Needs this checkout's proxy built.</summary>
+    [Fact]
+    public async Task The_real_warm_creates_only_its_passs_items()
+    {
+        var bin = Path.Combine(TestEnv.RepoRoot, "proxy", "build", "Release");
+        if (!File.Exists(Path.Combine(bin, "scskiller_warm.exe"))) return;
+        var luid = Process.Start(new ProcessStartInfo(Path.Combine(bin, "selftest.exe"), "warpluid") { RedirectStandardOutput = true })!.StandardOutput.ReadToEnd().Trim();
+        var vendor = new UnsupportedVendor(new GpuInfo(GpuVendor.Unknown, "WARP", "1.0", Convert.ToInt64(luid, 16), 0));
+        var work = Path.Combine(_dir, "work");
+        Directory.CreateDirectory(work);
+        using (var gen = File.Create(Path.Combine(work, "scskiller_gen.db")))
+            for (var i = 1; i <= 3; i++) Core.Planning.PsoDb.Write(gen, '1', Core.Planning.PsoDb.D3D11Item(Stage.Vertex, $"{i:x40}"));
+        var game = Game with { ExePath = Path.Combine(_dir, $"scsk-pass-{Guid.NewGuid():N}"[..20] + ".exe") };
+        var warmer = new Warmer(vendor, Path.Combine(bin, "scskiller_warm.exe"));
+
+        File.WriteAllBytes(Path.Combine(work, WarmPasses.FileName), [1, WarmPasses.FastPass, 1]);
+        var r = await warmer.Start(game, work, new WarmOptions(1, WarmPriority.BelowNormal), null).Completion.WaitAsync(Patience);
+        Assert.Equal((WarmOutcome.Completed, 3L, 3L, 3L), (r.Outcome, r.Done, r.Total, r.Failed));
+        Assert.Contains("(pass 255, 2 items of other passes)", File.ReadAllText(r.LogPath));
+
+        File.WriteAllBytes(Path.Combine(work, WarmPasses.FileName), [1, WarmPasses.FastPass, 1, 1]);
+        r = await warmer.Start(game, work, new WarmOptions(1, WarmPriority.BelowNormal), null).Completion.WaitAsync(Patience);
+        Assert.Equal((WarmOutcome.Failed, "scskiller_pass.bin has 4 items, the dbs 3"), (r.Outcome, r.Error));
+    }
+
+    sealed class PackageKeyedVendor : IGpuVendorBackend
+    {
+        public GpuVendor Vendor => GpuVendor.Nvidia;
+        public GpuInfo Gpu => WarmerTests.Vendor.Gpu;
+        public VendorCaps Caps => new("fake-1", true, true, false, PackageKeyed: true);
+        public CacheUsage GetCacheUsage() => new("", 0, true);
+        public CacheLimit? GetCacheLimit() => null;
+        public void SetCacheLimit(CacheLimit limit) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task An_xbox_game_warms_with_its_package_identity_where_the_vendor_keys_packaged_games_by_it()
+    {
+        var content = Path.Combine(_dir, "Content");
+        Directory.CreateDirectory(content);
+        File.WriteAllText(Path.Combine(content, "appxmanifest.xml"), """
+            <?xml version="1.0" encoding="utf-8"?>
+            <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+              <Applications><Application Id="AppUEGameShipping" Executable="GameLaunchHelper.exe" EntryPoint="Windows.FullTrustApplication" /></Applications>
+            </Package>
+            """);
+        var xbox = new Game("xbox:Publisher.Game_3275kfvn8vcwc", "Fake", Store.Xbox, content, Path.Combine(content, "Fake-WinGDK-Shipping.exe"));
+        Assert.Equal("Publisher.Game_3275kfvn8vcwc!AppUEGameShipping", Core.Games.XboxSource.AppUserModelId(xbox));
+        Assert.Null(Core.Games.XboxSource.AppUserModelId(Game));                               // not an Xbox game
+        Assert.Null(Core.Games.XboxSource.AppUserModelId(xbox with { InstallDir = _dir }));    // no manifest
+
+        foreach (var (vendor, package) in new (IGpuVendorBackend, bool)[] { (new PackageKeyedVendor(), true), (Vendor, false) })
+        {
+            var work = Work("complete");
+            await new Warmer(vendor, _exe).Start(xbox, work, new WarmOptions(1, WarmPriority.BelowNormal), null).Completion;
+            var a = File.ReadAllLines(Path.Combine(work, "args.txt"));
+            Assert.DoesNotContain("--stage-path", a);
+            Assert.Equal(package ? ["--package", "Publisher.Game_3275kfvn8vcwc!AppUEGameShipping"] : [], a.SkipWhile(x => x != "--package").ToArray());
+        }
+    }
+
+    /// <summary>A process poisoned by a ray tracing fault ends with "retry": the warm goes on in a new process from its point,
+    /// with its ray tracing threads and the items that failed alone skipped, until "done"; failures add up; meanwhile the
+    /// progress says it's retrying.</summary>
+    [Fact]
+    public async Task Retry_events_relaunch_with_fewer_ray_tracing_threads_until_done()
+    {
+        var work = Work("retry");
+        var notes = new System.Collections.Concurrent.ConcurrentBag<string>();
+        var c = new Counter();
+        var r = await new Warmer(Vendor, _exe).Start(Game, work, new WarmOptions(32, WarmPriority.BelowNormal), new Tee(c, p => { if (p.Note != null) notes.Add(p.Note); }))
+            .Completion.WaitAsync(Patience);
+        Assert.Equal(WarmOutcome.Completed, r.Outcome);
+        Assert.Null(r.Error);
+        Assert.Equal((1000L, 3L), (r.Done, r.Failed));   // 1 + 2 before the retry points, 0 after
+        var runs = Directory.GetFiles(work, "run-*.txt").Select(File.ReadAllText).OrderBy(a => a.Contains("--rt-threads 2") ? 2 : a.Contains("--rt-threads") ? 1 : 0).ToArray();
+        Assert.Equal(3, runs.Length);
+        Assert.DoesNotContain("--rt-threads", runs[0]);
+        Assert.Contains("--start 600", runs[1]);
+        Assert.Contains("--rt-threads 8", runs[1]);
+        Assert.DoesNotContain("--skip", runs[1]);
+        Assert.Contains("--start 700", runs[2]);
+        Assert.Contains("--rt-threads 2 --skip 650", runs[2]);
+        Assert.Contains("retrying ray tracing with fewer threads (2)", notes);
+        var e = WarmEvent.Parse("""{"event":"retry","from":7,"rtThreads":2,"failedItem":5,"done":7,"total":9,"failed":1,"seconds":0.1}""")!;
+        Assert.Equal(("retry", 7L, 2, 5L), (e.Event, e.From, e.RtThreads, e.FailedItem));
+    }
+
+    /// <summary>A process whose device was removed ends with a "removed" retry: the next one gets the items that were in
+    /// flight to create alone and the same ray tracing threads; the keys of what crashes the driver (the given ones and the
+    /// blamed one) are skipped from then on and come back in the result, apart from the failed count.</summary>
+    [Fact]
+    public async Task A_removed_device_relaunches_with_the_items_in_flight_alone_and_skips_what_crashes_the_driver()
+    {
+        var work = Work("removed");
+        var notes = new System.Collections.Concurrent.ConcurrentBag<string>();
+        var bb = new string('0', 38) + "bb";
+        var r = await new Warmer(Vendor, _exe).Start(Game, work, new WarmOptions(32, WarmPriority.BelowNormal, SkipKeys: [bb]),
+            new Tee(new Counter(), p => { if (p.Note != null) notes.Add(p.Note); })).Completion.WaitAsync(Patience);
+        Assert.Equal(WarmOutcome.Completed, r.Outcome);
+        Assert.Null(r.Error);
+        Assert.Equal((1000L, 1L), (r.Done, r.Failed));
+        Assert.Equal([new string('0', 38) + "aa", bb], r.Crashed!.Select(k => k.ToLowerInvariant()).Order());
+        var runs = Directory.GetFiles(work, "run-*.txt").Select(File.ReadAllText).OrderBy(a => a.Contains("--isolate 611") ? 2 : a.Contains("--isolate") ? 1 : 0).ToArray();
+        Assert.Equal(3, runs.Length);
+        Assert.EndsWith($"--skip-keys {bb}", runs[0].TrimEnd());
+        Assert.Contains("--start 600", runs[1]);
+        Assert.Contains("--rt-threads 4", runs[1]);   // not a quarter: the driver wasn't poisoned by ray tracing
+        Assert.EndsWith($"--skip-keys {bb} --isolate 600,610,611", runs[1].TrimEnd());
+        Assert.Contains("--start 601", runs[2]);
+        Assert.EndsWith($"--skip-keys {new string('0', 38)}aa,{bb} --isolate 611", runs[2].TrimEnd());
+        Assert.Contains("recovering from a GPU driver crash", notes);
+        var e = WarmEvent.Parse("""{"event":"retry","from":7,"rtThreads":0,"failedItem":-1,"done":7,"total":9,"failed":0,"seconds":0.1,"reason":"removed","crashed":["ab"],"isolate":[7,8]}""")!;
+        Assert.Equal(("removed", "ab", 8L), (e.Reason, Assert.Single(e.Crashed!), e.Isolate![1]));
+    }
+
+    [Fact]
+    public async Task A_device_removed_again_and_again_stops_after_the_recoveries_with_an_error()
+    {
+        var work = Work("removedloop");
+        var r = await new Warmer(Vendor, _exe) { MaxRecoveries = 2 }.Start(Game, work, new WarmOptions(4, WarmPriority.BelowNormal), null).Completion.WaitAsync(Patience);
+        Assert.Equal(WarmOutcome.Failed, r.Outcome);
+        Assert.Equal("the GPU driver crashed 3 times in this compile (the D3D12 device was removed); stopped", r.Error);
+        Assert.Equal(10, r.Done);
+    }
+
+
+    /// <summary>A careful warm: one process per pass with --pass, in order, the careful ones on CarefulThreads and the fast one
+    /// on Threads; progress and Done count the whole warm's items, failures add up; a StartAt inside pass 2 starts there, at
+    /// that pass's item.</summary>
+    [Fact]
+    public async Task A_work_folder_with_passes_runs_one_process_per_pass()
+    {
+        foreach (var (startAt, expected) in new[]
+                 {
+                     (0L, new[] { "--pass 1 --start 0 --threads 2", "--pass 2 --start 0 --threads 2", "--pass 255 --start 0 --threads 8" }),
+                     (3L, ["--pass 2 --start 2 --threads 2", "--pass 255 --start 0 --threads 8"]),
+                 })
+        {
+            var work = Work("passes");
+            foreach (var old in Directory.GetFiles(work, "run-*.txt")) File.Delete(old);
+            File.WriteAllBytes(Path.Combine(work, WarmPasses.FileName), WarmPasses.Split(["a", "b", "a", null, "a", "b", "c"], 4));   // 1 1 2 1 F F F
+            var notes = new System.Collections.Concurrent.ConcurrentBag<string>();
+            var c = new Counter();
+            var r = await new Warmer(Vendor, _exe).Start(Game, work, new WarmOptions(8, WarmPriority.BelowNormal, startAt, CarefulThreads: 2),
+                new Tee(c, p => { if (p.Note != null) notes.Add(p.Note); })).Completion.WaitAsync(Patience);
+            Assert.Equal(WarmOutcome.Completed, r.Outcome);
+            Assert.Equal((7L, 7L, (long)expected.Length), (r.Done, r.Total, r.Failed));
+            string Run(string args) => $"--pass {Regex.Match(args, @"--pass (\d+)").Groups[1]} --start {Regex.Match(args, @"--start (\d+)").Groups[1]} --threads {Regex.Match(args, @"--threads (\d+)").Groups[1]}";
+            Assert.Equal(expected, Directory.GetFiles(work, "run-*.txt").Select(f => Run(File.ReadAllText(f))).Order());
+            Assert.Contains("careful compile: the plan's other pipelines at full speed", notes);
+            Assert.Equal((7L, 7L), (c.Last!.Done, c.Last.Total));
+        }
+    }
+    /// <summary>Every pass of a careful warm gets the keys that crash the driver: the given ones and the ones an earlier pass
+    /// blamed; a removed device inside a pass recovers in that pass (the same --pass, the items in flight alone) and the
+    /// remaining passes still run.</summary>
+    [Fact]
+    public async Task Each_pass_skips_the_crash_keys_and_a_removed_device_recovers_inside_its_pass()
+    {
+        var work = Work("passcrash");
+        File.WriteAllBytes(Path.Combine(work, WarmPasses.FileName), WarmPasses.Split(["a", "b", "a", null, "a", "b", "c"], 4));   // 1 1 2 1 F F F
+        var bb = new string('0', 38) + "bb";
+        var cc = new string('0', 38) + "cc";
+        var r = await new Warmer(Vendor, _exe).Start(Game, work, new WarmOptions(8, WarmPriority.BelowNormal, SkipKeys: [bb], CarefulThreads: 2), null)
+            .Completion.WaitAsync(Patience);
+        Assert.Equal((WarmOutcome.Completed, 7L), (r.Outcome, r.Done));
+        Assert.Equal([cc], r.Crashed!.Select(k => k.ToLowerInvariant()));
+        var runs = Directory.GetFiles(work, "run-*.txt").Select(File.ReadAllText).ToList();
+        string? Arg(string a, string name) => Regex.Match(a, name + @" (\S+)") is { Success: true } m ? m.Groups[1].Value : null;
+        Assert.Equal(["1", "1", "2", "255"], runs.Select(a => Arg(a, "--pass")!).Order());
+        Assert.All(runs, a => Assert.Contains(bb, Arg(a, "--skip-keys")));
+        Assert.Equal("1", Arg(runs.Single(a => a.Contains("--isolate")), "--isolate"));
+        Assert.All(runs.Where(a => Arg(a, "--pass") is "2" or "255"), a => Assert.Equal($"{bb},{cc}", Arg(a, "--skip-keys")));
+    }
+    /// <summary>Every pass process of a careful warm runs like a normal warm of that game: on AMD with its AGS registration
+    /// and its stage path; on NVIDIA without AGS; an Xbox package with neither.</summary>
+    [Fact]
+    public async Task Each_pass_gets_the_games_AGS_registration_and_stage_path_like_a_normal_warm()
+    {
+        var content = Path.Combine(_dir, "XContent");
+        Directory.CreateDirectory(content);
+        File.WriteAllText(Path.Combine(content, "appxmanifest.xml"), """
+            <?xml version="1.0" encoding="utf-8"?>
+            <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+              <Applications><Application Id="App" Executable="Game.exe" EntryPoint="Windows.FullTrustApplication" /></Applications>
+            </Package>
+            """);
+        var xbox = new Game("xbox:P.G_1", "G", Store.Xbox, content, Path.Combine(content, "Game.exe"));
+        var bundled = NativeTools.Find(AmdAgs.DllName);
+        foreach (var (vendor, game) in new (IGpuVendorBackend, Game)[] { (new AmdVendor(Vendor.Gpu), Game), (new PackageKeyedVendor(), Game), (new AmdVendor(Vendor.Gpu), xbox) })
+        {
+            var work = Work("passes");
+            foreach (var old in Directory.GetFiles(work, "run-*.txt")) File.Delete(old);
+            File.WriteAllBytes(Path.Combine(work, WarmPasses.FileName), WarmPasses.Split(["a", "b", "a", null, "a", "b", "c"], 4));   // 1 1 2 1 F F F
+            var r = await new Warmer(vendor, _exe) { Ags = _ => Townfall }.Start(game, work, new WarmOptions(8, WarmPriority.BelowNormal, CarefulThreads: 4), null)
+                .Completion.WaitAsync(Patience);
+            Assert.Equal(WarmOutcome.Completed, r.Outcome);
+            var runs = Directory.GetFiles(work, "run-*.txt").Select(File.ReadAllText).ToList();
+            Assert.Equal(3, runs.Count);   // passes 1, 2 and the fast one
+            var amd = vendor.Vendor == GpuVendor.Amd && game == Game;
+            var ags = amd && bundled != null ? $"--ags {bundled} --ags-app Townfall --ags-engine UnrealEngine5.6" : null;
+            foreach (var a in runs)
+            {
+                if (ags != null) Assert.Contains(ags, a); else Assert.DoesNotContain("--ags", a);
+                if (game == Game) Assert.Contains(@"--stage-path nowhere\Binaries\Win64\Fake-Win64-Shipping.exe", a);
+                else Assert.DoesNotContain("--stage-path", a);
+                Assert.Contains("--pass", a);
+            }
+        }
+    }
+    sealed class Tee(IProgress<WarmProgress> a, Action<WarmProgress> b) : IProgress<WarmProgress>
+    {
+        public void Report(WarmProgress p) { a.Report(p); b(p); }
+    }
+
+    [Fact]
+    public async Task Progress_carries_cache_growth_sampled_at_most_every_few_seconds()
+    {
+        var vendor = new GrowingCache();
+        var c = new Counter();
+        var r = await new Warmer(vendor, _exe).Start(Game, Work("complete"), new WarmOptions(1, WarmPriority.BelowNormal), c).Completion;
+        Assert.InRange(c.Count, 1, 2);        // progress + done, 0.1 s apart (usually folded into one report): one sample serves both
+        Assert.Equal(100, c.Last!.CacheGrowthBytes);
+        Assert.Equal(200, r.CacheGrowthBytes); // measured again after exit
+        Assert.Equal(3, vendor.Calls);
+    }
+
+    sealed class GrowingCache : IGpuVendorBackend
+    {
+        public int Calls;
+        public GpuVendor Vendor => GpuVendor.Unknown;
+        public GpuInfo Gpu { get; } = new(GpuVendor.Unknown, "Fake GPU", "1.0", 1, 0);
+        public VendorCaps Caps { get; } = new("fake", true, true, false);
+        public CacheUsage GetCacheUsage() => new("", 1000 + 100 * (Interlocked.Increment(ref Calls) - 1), true);
+        public CacheLimit? GetCacheLimit() => null;
+        public void SetCacheLimit(CacheLimit limit) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task Error_line_and_exit_code_fail_the_run()
+    {
+        var r = await new Warmer(Vendor, _exe).Start(Game, Work("error"), new WarmOptions(1, WarmPriority.BelowNormal), null).Completion;
+        Assert.Equal(WarmOutcome.Failed, r.Outcome);
+        Assert.Equal("no D3D12 device", r.Error);
+    }
+
+    [Fact]
+    public async Task Exit_without_done_is_a_failure()
+    {
+        var r = await new Warmer(Vendor, _exe).Start(Game, Work("nodone"), new WarmOptions(1, WarmPriority.BelowNormal), null).Completion;
+        Assert.Equal(WarmOutcome.Failed, r.Outcome);
+        Assert.Equal(10, r.Done);
+    }
+
+    [Fact]
+    public async Task Warms_and_their_children_are_in_a_job_that_kills_them_when_its_owner_ends()
+    {
+        // cmd -> ping under a name of its own (other tests or other programs may run ping): a warm and the staged child it starts
+        var name = $"scsk-ping-{Guid.NewGuid():N}"[..20];
+        var ping = Path.Combine(_dir, name + ".exe");
+        File.Copy(Path.Combine(Environment.SystemDirectory, "PING.EXE"), ping);
+        var pinger = Path.Combine(_dir, "pinger.cmd");
+        File.WriteAllText(pinger, $"@\"{ping}\" -t 127.0.0.1\r\n");
+        int[] Pings() => Process.GetProcessesByName(name).Select(p => p.Id).ToArray();
+        var run = new Warmer(Vendor, pinger).Start(Game, Work("job"), new WarmOptions(1, WarmPriority.BelowNormal), null);
+        await Until(() => Pings().Length == 1);
+        var child = Pings()[0];
+        Assert.True(WarmJob.Current.Contains(child));   // the Warmer's start path put the whole tree in this process's job
+
+        // what this process ending does to its job: a job of our own, with the same limits, closed
+        var job = new WarmJob();
+        var tree = Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"\"{ping}\" -t 127.0.0.1\"") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true })!;
+        await Until(() => Pings().Length == 2);
+        var grandchild = Process.GetProcessById(Pings().Single(id => id != child));
+        job.Add(tree.Id);   // after it started ping: Add takes the running descendants too
+        Assert.True(job.Contains(grandchild.Id));
+        job.Dispose();
+        Assert.True(grandchild.WaitForExit(30_000), "ping survived its job's owner");
+        Assert.True(tree.WaitForExit(30_000));
+
+        run.Stop();   // cmd ignores the stop event: StuckAfter (30 s) would end it; don't wait for that here
+        Process.GetProcessById(child).Kill();
+        await run.Completion.WaitAsync(Patience);   // cmd exits after ping: the work folder is free again
+    }
+
+    [Fact]
+    public async Task A_warm_deaf_to_the_stop_event_is_ended_and_says_so()
+    {
+        var c = new Counter();
+        var run = new Warmer(Vendor, _exe) { StuckAfter = TimeSpan.FromSeconds(2) }.Start(Game, Work("stuck"), new WarmOptions(1, WarmPriority.BelowNormal), c);
+        await Until(() => c.Count >= 1);
+        var clock = Stopwatch.StartNew();
+        run.Stop();
+        var r = await run.Completion.WaitAsync(Patience);
+        Assert.Equal((WarmOutcome.Failed, Warmer.StuckError), (r.Outcome, r.Error));
+        Assert.True(clock.Elapsed.TotalSeconds >= 1.5, $"ended after {clock.Elapsed}: before StuckAfter");
+    }
+
+    [Fact]
+    public async Task A_relaunched_warm_is_in_the_job_too_and_is_ended_if_it_ignores_the_stop()
+    {
+        var c = new Counter();
+        var work = Work("retrystuck");
+        var run = new Warmer(Vendor, _exe) { StuckAfter = TimeSpan.FromSeconds(2) }.Start(Game, work, new WarmOptions(1, WarmPriority.BelowNormal), c);
+        await Until(() => File.Exists(Path.Combine(work, "pid.txt")));
+        Assert.True(WarmJob.Current.Contains(int.Parse(File.ReadAllText(Path.Combine(work, "pid.txt")).Trim())));   // the second process's powershell
+        run.Stop();
+        var r = await run.Completion.WaitAsync(Patience);
+        Assert.Equal((WarmOutcome.Failed, Warmer.StuckError), (r.Outcome, r.Error));
+    }
+
+    [Fact]
+    public async Task A_warm_that_stopped_and_is_still_writing_its_cache_is_not_ended()
+    {
+        var c = new Counter();
+        var run = new Warmer(Vendor, _exe) { StuckAfter = TimeSpan.FromSeconds(20) }.Start(Game, Work("flush"), new WarmOptions(1, WarmPriority.BelowNormal), c);
+        await Until(() => c.Count >= 1);
+        run.Stop();
+        var r = await run.Completion.WaitAsync(Patience);   // done at once, then 3 s "writing the cache"
+        Assert.Equal(WarmOutcome.Stopped, r.Outcome);
+        Assert.Null(r.Error);
+    }
+
+    [Fact]
+    public async Task Pause_suspends_resume_continues_stop_sets_the_event()
+    {
+        var c = new Counter();
+        var run = new Warmer(Vendor, _exe).Start(Game, Work("stop"), new WarmOptions(1, WarmPriority.BelowNormal), c);
+        await Until(() => c.Count >= 3);
+
+        run.Pause();
+        await Until(() => Steady(c, TimeSpan.FromSeconds(1)));   // lines already in the pipe drain and the last one is reported
+        var paused = c.Count;
+        await Task.Delay(1500);
+        Assert.Equal(paused, c.Count);
+
+        run.Resume();
+        await Until(() => c.Count > paused + 2);
+
+        run.Stop();
+        var r = await run.Completion.WaitAsync(Patience);
+        Assert.Equal(WarmOutcome.Stopped, r.Outcome);
+        Assert.True(r.Done >= c.Last!.Done);
+    }
+
+    [Fact]
+    public async Task Stop_while_paused_still_stops()
+    {
+        var c = new Counter();
+        var run = new Warmer(Vendor, _exe).Start(Game, Work("stop"), new WarmOptions(1, WarmPriority.BelowNormal), c);
+        await Until(() => c.Count >= 1);
+        run.Pause();
+        run.Stop();
+        var r = await run.Completion.WaitAsync(Patience);
+        Assert.Equal(WarmOutcome.Stopped, r.Outcome);
+    }
+
+    /// <summary>For anything the fake warm has to do: PowerShell alone can take seconds to start on a loaded PC.</summary>
+    static readonly TimeSpan Patience = TimeSpan.FromSeconds(90);
+
+    static async Task Until(Func<bool> cond)
+    {
+        for (var t = DateTime.Now; !cond(); await Task.Delay(50))
+            if (DateTime.Now - t > Patience) throw new TimeoutException();
+    }
+
+    /// <summary>True once the count hasn't changed for <paramref name="quiet"/> (call repeatedly, e.g. from Until).</summary>
+    static bool Steady(Counter c, TimeSpan quiet)
+    {
+        var before = c.Count;
+        Thread.Sleep(quiet);
+        return c.Count == before;
+    }
+}
