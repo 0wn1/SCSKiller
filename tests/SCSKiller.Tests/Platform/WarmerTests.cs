@@ -16,16 +16,23 @@ public class WarmerTests : IDisposable
         $work = $args[0]; $exe = $args[1]; $ev = $null
         for ($i = 2; $i -lt $args.Count; $i++) { if ($args[$i] -eq '--stop-event') { $ev = $args[$i + 1] } }
         Set-Content (Join-Path $work 'args.txt') ($args -join "`n")
+        [Console]::OutputEncoding = [Text.Encoding]::UTF8   # as scskiller_warm writes it
         function Say($s) { [Console]::Out.WriteLine($s); [Console]::Out.Flush() }
         $mode = (Get-Content (Join-Path $work 'mode.txt')).Trim()
         Say 'scskiller_warm: a banner line that is not JSON'
+        Say ('{"event":"stage","stage":"' + ((Join-Path $work "stage-$PID-1") -replace '\\', '\\') + '"}')
+        if ($mode -eq 'error') { Say '{"event":"error","message":"no D3D12 device"}'; exit 3 }   # before start: its log is in the stage
+        if ($mode -eq 'retryfail') {   # a retry, then the second process fails before its start
+            Set-Content (Join-Path $work "run-$PID.txt") ($args -join ' ')
+            if ([array]::IndexOf($args, '--rt-threads') -lt 0) { Say '{"event":"retry","from":600,"rtThreads":8,"failedItem":-1,"done":600,"total":1000,"failed":1,"seconds":1.0}'; exit 3 }
+            Say '{"event":"error","message":"no D3D12 device"}'; exit 1
+        }
         Say ('{"event":"start","total":1000,"adapter":"Fake GPU","exe":"' + $exe + '"}')
         if ($mode -eq 'complete') {
             Say '{"event":"progress","done":500,"total":1000,"failed":1,"rate":480.5}'
             Say '{"event":"done","done":1000,"total":1000,"failed":2,"seconds":2.1,"stopped":false}'
             exit 0
         }
-        if ($mode -eq 'error') { Say '{"event":"error","message":"no D3D12 device"}'; exit 3 }
         if ($mode -eq 'passcrash') {   # pass 1 blames cc (a removal, then done); the later passes get it with the given keys
             Set-Content (Join-Path $work "run-$PID.txt") ($args -join ' ')
             $p = $args[[array]::IndexOf($args, '--pass') + 1]; $iso = [array]::IndexOf($args, '--isolate')
@@ -103,6 +110,8 @@ public class WarmerTests : IDisposable
     {
         var start = WarmEvent.Parse("""{"event":"start","total":117197,"adapter":"NVIDIA GeForce","exe":"ff7rebirth_.exe"}""")!;
         Assert.Equal(("start", 117197L), (start.Event, start.Total));
+        var stage = WarmEvent.Parse("""{"event":"stage","stage":"C:\\w\\stage-12-1"}""")!;
+        Assert.Equal(("stage", @"C:\w\stage-12-1"), (stage.Event, stage.Stage));
         var p = WarmEvent.Parse("""{"event":"progress","done":64210,"total":117197,"failed":3,"rate":480.2}""")!;
         Assert.Equal((64210L, 117197L, 3L, 480.2), (p.Done, p.Total, p.Failed, p.Rate));
         var done = WarmEvent.Parse("""{"event":"done","done":117197,"total":117197,"failed":5,"seconds":288.1,"stopped":false}""")!;
@@ -127,7 +136,8 @@ public class WarmerTests : IDisposable
         Assert.InRange(c.Count, 1, 2);   // lines closer together than the report interval fold into the latest
         Assert.Equal(1000, c.Last!.Done);
         Assert.Null(r.Error);
-        Assert.Equal(Path.Combine(work, "stage", "scskiller.log"), r.LogPath);
+        Assert.Matches(@"\\stage-\d+-1\\scskiller\.log$", r.LogPath);   // the stage event's folder
+        Assert.StartsWith(work, r.LogPath);
         var a = File.ReadAllLines(Path.Combine(work, "args.txt"));
         Assert.Equal(work, a[0]);
         Assert.Equal("Fake-Win64-Shipping.exe", a[1]);
@@ -165,8 +175,8 @@ public class WarmerTests : IDisposable
     {
         var install = @"C:\Games\" + new string('i', 60);
         var g = Game with { InstallDir = install, ExePath = Path.Combine(install, new string('d', 60), "Game.exe") };
-        var work = @"C:\" + new string('w', 100);
-        Assert.NotNull(Warmer.StagePath(g, work + "www", out _));   // 106 + @"\stage\" + 60 + 1 + 60 + 1 + 24 = 259
+        var work = @"C:\" + new string('w', 86);
+        Assert.NotNull(Warmer.StagePath(g, work + "www", out _));   // 92 + @"\stage-4294967295-99\" + 60 + 1 + 60 + 1 + 24 = 259
         Assert.Null(Warmer.StagePath(g, work + "wwww", out var why));
         Assert.Contains("longer than 259", why);
     }
@@ -201,8 +211,8 @@ public class WarmerTests : IDisposable
         Directory.CreateDirectory(work);
         var r = await new Warmer(vendor, Path.Combine(bin, "scskiller_warm.exe")).Start(game, work, new WarmOptions(1, WarmPriority.BelowNormal), null).Completion.WaitAsync(Patience);
         Assert.Equal(WarmOutcome.Completed, r.Outcome);
-        var stage = Path.Combine(work, "stage");
-        Assert.Equal(Path.Combine(stage, "scskiller.log"), r.LogPath);
+        var stage = Path.GetDirectoryName(r.LogPath)!;
+        Assert.StartsWith(Path.Combine(work, "stage-"), stage);   // the run's own new staging folder
         var loaded = File.ReadLines(r.LogPath, System.Text.Encoding.Latin1).First(l => l.Contains("loaded into "));
         Assert.Contains(Path.Combine(stage, "Fake Game's (x) "), loaded);
         Assert.EndsWith(Path.Combine(".v2", "Bin", "Win64", exe), loaded);
@@ -211,13 +221,16 @@ public class WarmerTests : IDisposable
         Assert.False(Directory.Exists(install));
 
         var p = Process.Start(new ProcessStartInfo(Path.Combine(bin, "scskiller_warm.exe"),
-            [work, exe, "--adapter-luid", luid, "--stage-path", Path.Combine(new string('x', 120), new string('y', 120), exe)]) { RedirectStandardOutput = true, RedirectStandardError = true })!;
+            [work, exe, "--adapter-luid", luid, "--stage-path", Path.Combine(new string('x', 120), new string('y', 120), exe)]) { StandardOutputEncoding = System.Text.Encoding.UTF8, RedirectStandardOutput = true, RedirectStandardError = true })!;
         var err = p.StandardError.ReadToEndAsync();
         Assert.Contains("\"done\"", await p.StandardOutput.ReadToEndAsync());
         await p.WaitForExitAsync();
         Assert.Contains("--stage-path too long", await err);
-        Assert.EndsWith(Path.Combine(stage, exe), File.ReadLines(r.LogPath).First(l => l.Contains("loaded into ")));
-        Assert.Empty(Directory.GetDirectories(stage));
+        var flat = Assert.Single(Directory.GetDirectories(work, "stage-*"), d => d != stage);   // a second run stages in a new folder
+        Assert.EndsWith(Path.Combine(flat, exe), File.ReadLines(Path.Combine(flat, "scskiller.log")).First(l => l.Contains("loaded into ")));
+        Assert.Equal(["scskiller.log", "scskiller_creates.csv"], Directory.GetFiles(flat).Select(Path.GetFileName).Order(StringComparer.Ordinal));
+        Assert.Empty(Directory.GetDirectories(flat));
+        Assert.Equal(["scskiller.log", "scskiller_creates.csv"], Directory.GetFiles(stage).Select(Path.GetFileName).Order(StringComparer.Ordinal));
     }
 
     /// <summary>NVIDIA warms with the segment-heap build (its staged copy is that exe), the other vendors with the NT-heap
@@ -239,12 +252,15 @@ public class WarmerTests : IDisposable
         Directory.CreateDirectory(work);
         var exeName = $"scsk-heap-{Guid.NewGuid():N}"[..20] + ".exe";
         var p = Process.Start(new ProcessStartInfo(Path.Combine(bin, Warmer.ExeFor(GpuVendor.Nvidia)), [work, exeName, "--adapter-luid", luid])
-            { RedirectStandardOutput = true, RedirectStandardError = true })!;
+            { StandardOutputEncoding = System.Text.Encoding.UTF8, RedirectStandardOutput = true, RedirectStandardError = true })!;
         var err = p.StandardError.ReadToEndAsync();
-        Assert.Contains("\"done\"", await p.StandardOutput.ReadToEndAsync());
+        var o = await p.StandardOutput.ReadToEndAsync();
+        Assert.Contains("\"done\"", o);
         await p.WaitForExitAsync();
         Assert.Equal(0, p.ExitCode);
-        Assert.Equal(File.ReadAllBytes(Path.Combine(bin, "d3d12.dll")), File.ReadAllBytes(Path.Combine(work, "stage", "d3d12.dll")));
+        // segheap\ has no proxy of its own: the warm ran on its parent folder's, which the proxy's log shows
+        Assert.False(File.Exists(Path.Combine(bin, "segheap", "d3d12.dll")));
+        Assert.Contains("loaded into ", File.ReadAllText(Path.Combine(TestEnv.WarmStage(o, work), "scskiller.log")));
     }
 
     static readonly AgsRegistration Townfall = new("Townfall", "UnrealEngine5.6");
@@ -313,7 +329,7 @@ public class WarmerTests : IDisposable
         var exe = $"scsk-ags-{Guid.NewGuid():N}"[..18] + ".exe";
         var missing = Path.Combine(_dir, "nowhere", AmdAgs.DllName);
         var p = Process.Start(new ProcessStartInfo(Path.Combine(bin, "scskiller_warm.exe"),
-            [work, exe, "--adapter-luid", luid, "--ags", missing, "--ags-app", "Townfall", "--ags-engine", "UnrealEngine5.6"]) { RedirectStandardOutput = true, RedirectStandardError = true })!;
+            [work, exe, "--adapter-luid", luid, "--ags", missing, "--ags-app", "Townfall", "--ags-engine", "UnrealEngine5.6"]) { StandardOutputEncoding = System.Text.Encoding.UTF8, RedirectStandardOutput = true, RedirectStandardError = true })!;
         var err = p.StandardError.ReadToEndAsync();
         var output = await p.StandardOutput.ReadToEndAsync().WaitAsync(Patience);
         await p.WaitForExitAsync();
@@ -570,6 +586,18 @@ public class WarmerTests : IDisposable
         var r = await new Warmer(Vendor, _exe).Start(Game, Work("error"), new WarmOptions(1, WarmPriority.BelowNormal), null).Completion;
         Assert.Equal(WarmOutcome.Failed, r.Outcome);
         Assert.Equal("no D3D12 device", r.Error);
+        Assert.Matches(@"\\stage-\d+-1\\scskiller\.log$", r.LogPath);   // failed before its start: the stage event came first
+    }
+
+    [Fact]
+    public async Task A_process_that_fails_before_its_start_reports_its_own_log_not_an_earlier_ones()
+    {
+        var work = Work("retryfail");
+        var r = await new Warmer(Vendor, _exe).Start(Game, work, new WarmOptions(32, WarmPriority.BelowNormal), null).Completion.WaitAsync(Patience);
+        Assert.Equal(WarmOutcome.Failed, r.Outcome);
+        var second = Directory.GetFiles(work, "run-*.txt").Single(f => File.ReadAllText(f).Contains("--rt-threads"));
+        var pid = Path.GetFileNameWithoutExtension(second)["run-".Length..];
+        Assert.Equal(Path.Combine(work, $"stage-{pid}-1", "scskiller.log"), r.LogPath);
     }
 
     [Fact]

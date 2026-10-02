@@ -153,7 +153,8 @@ public sealed record PlanStats(long Recorded, long Generated, long SynthesizedTe
     long RtUncovered = 0,         // of those, the ones this plan can't compile: no collection synthesized for them and no recorded
                                   // ray tracing state object (0 when the recording has some, or has RayQuery shaders and none: inline ray tracing)
     long StageSets = 0,           // distinct stage sets the planner found in the game files (0 = a plan from before this was counted)
-    long LeftOut = 0);            // of those, the ones not in the plan for any reason (no root signature, no template, Uncovered)
+    long LeftOut = 0,             // of those, the ones not in the plan for any reason (no root signature, no template, Uncovered)
+    long MiddlewareSharedItems = 0); // of MiddlewareItems, the ones only a shared pack (downloaded from the community database) had
 
 /// <summary>Hash-only plan (no game bytes), persisted at <see cref="FilePath"/> in the planner's format.</summary>
 public sealed record Plan(string GameId, string IndexContentHash, string Platform, string VendorProfile, PlanStats Stats, string FilePath);
@@ -211,7 +212,9 @@ public enum GameStatus { Unsupported, NeedsRecording, Ready, Warmed, Stale }   /
 public sealed record SessionStats(TimeSpan Duration, long Requests, long FromGameLibrary, long CacheHits, long Compiles, double WorstCompileMs,
     long RayQueryRecompiles = 0,    // NVIDIA: creates of compiled RayQuery PSOs at the driver's floor (SessionLog.RayQueryFloorMs), not in Compiles
     long StateObjectsReady = 0,     // ray tracing state object creates (CreateStateObject, AddToStateObject) under SessionLog.StateObjectCompileMs; in Requests only
-    long StateObjectsCompiled = 0); // ...and from it: compiled during play
+    long StateObjectsCompiled = 0,  // ...and from it: compiled during play
+    long StartupCompiles = 0,       // compiles while the game started up (FrameLog.StartupEnd), not in Compiles or WorstCompileMs
+    long StateObjectsStartupCompiled = 0);   // state objects compiled while it started up, not in StateObjectsCompiled
 
 public sealed record GameState(
     Game Game, EngineInfo? Engine, AntiCheat AntiCheat, GameStatus Status, string StatusReason,
@@ -226,7 +229,7 @@ public sealed record GameState(
     CommunityInfo? Community = null,    // a community database recording in use (Settings.UseCommunityDb); null = none
     DateTimeOffset? RecordingSharedAt = null,   // when this PC's recording was last shared (Settings.ShareRecordings); null = never
     bool? InCommunityDb = null,   // the community database's manifest (the last one fetched) has an entry for this build; null = not known
-    long? NewPipelines = null,   // a newer planner rebuilt the warmed game's plan: its records the warm didn't compile; null = not known
+    long? NewPipelines = null,   // the plan's planner-made records the last complete warm didn't take; null = not known
     bool Playing = false,       // always false in the CLI (no game watcher)
     RecorderOverride RecorderOverride = RecorderOverride.Default,
     bool RecorderEffective = false,   // should be installed (it may not be yet: RecorderNote)
@@ -239,7 +242,7 @@ public sealed record GameState(
     CarefulCompile? Careful = null,        // AMD's careful compile (ScsKiller.CarefulThreads); null = not this vendor's
     long RecordingBytes = 0,        // the recorder's data files in the game folder plus SCSKiller's copy of its recording
     bool RecordingPaused = false,   // the recorder is in and its recording reached Settings.RecordingLimitMB: no new records
-    long RecordedSinceWarm = 0,     // pipelines recorded here or downloaded from the community database since the last complete warm that its plan lacks
+    long RecordedSinceWarm = 0,     // pipelines its recordings and packs have that the last complete warm didn't compile, apart from NewPipelines (derived)
     int CommunityDbPsos = 0,        // the manifest entry's pipelines while InCommunityDb
     double? PsoPerSecond = null,   // the game's last complete warm onto a cold cache (ScsKiller.ColdWarm); null = none measured
     FrameReport? LastFrames = null);   // the last launch's frame times (FrameLog); null = none measured
@@ -248,7 +251,8 @@ public sealed record GameState(
 /// play (the game's own precompile and first load), the 1% low of play, every frame of 50 ms or more, and for a graph
 /// the longest frame of each of <see cref="App.FrameLog.GraphColumns"/> equal slices of the launch (0 = no frame started in it).</summary>
 public sealed record FrameReport(TimeSpan Duration, TimeSpan Startup, long Frames, double Low1PctFps, IReadOnlyList<Hitch> Hitches,
-    IReadOnlyList<float> Peaks);
+    IReadOnlyList<float> Peaks,
+    long LaunchUnixMs = 0);   // the frame log's launch stamp: SessionLog takes its Duration (the last frame) for the launch's end
 
 /// <summary>A frame of 50 ms or more, <paramref name="At"/> into the launch.</summary>
 public sealed record Hitch(TimeSpan At, double Ms, HitchCause Cause);
@@ -319,6 +323,8 @@ public interface IScsKiller
     IReadOnlyList<QueueItem> Queue { get; }      // in run order
     event Action<QueueItem>? QueueChanged;
     bool QueueRunning { get; }
+    /// <summary>An item is running, a stopped or removed one too until its warm has exited (the driver writes its cache).</summary>
+    bool Compiling { get; }
     /// <summary>Adds the game (index + plan if stale + materialize + warm) at the end; no-op if already queued. Starts only
     /// if the queue is running (see <see cref="StartQueue"/>).</summary>
     void Enqueue(string gameId);

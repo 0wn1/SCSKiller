@@ -201,6 +201,7 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         // materialized: each library's own payload; the ray generation one once per other payload (12 and 64)
         var libs = new Dictionary<string, byte[]> { [hit.Sha1] = HitLib, [shadow.Sha1] = ShadowLib, [rayGen.Sha1] = RayGenLib };
         new Planner().Materialize(plan, Ff7.Game, Ue427, new Shaders(libs), null, Path.Combine(dir, "work"), CancellationToken.None);
+        Assert.Equal("103de659042dfb8a2a8070b2029174e752c188665dee38e02a9804de568d3be6", MaterializeOutputTests.Digest(Path.Combine(dir, "work")));
         var made = Read(Path.Combine(dir, "work", "scskiller_gen.db")).Where(r => r.Tag == 'R').Select(RtCollections.Read).ToList();
         Assert.Equal([(hit.Sha1, 64u), (rayGen.Sha1, 12u), (rayGen.Sha1, 64u), (shadow.Sha1, 12u)], made.Select(c => (c!.Library, c.Payload)).Order());
         Assert.Equal(0, Planner.SkippedIn(Path.Combine(dir, "work")));
@@ -228,6 +229,7 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         var plan = new Plan("t", "t", "PCD3D_SM5", "nvidia-1", new PlanStats(0, 1, 0, 0, true), Path.Combine(dir, "plan.bin"));
         PlanFile.Write(plan, [new('Y', RtCollections.Item(hit.Sha1, rule.GlobalRs, Zero, Zero, rule, new(0, 1001, 0)))]);
         new Planner().Materialize(plan, Ff7.Game, Ue427, new Shaders(new() { [hit.Sha1] = HitLib }), null, Path.Combine(dir, "work"), CancellationToken.None);
+        Assert.Equal("f1a3b6f12bea1b04b24beead706ab935a8d86cf556ed0bcd58e8d7c537c89b1a", MaterializeOutputTests.Digest(Path.Combine(dir, "work")));
         var gen = Read(Path.Combine(dir, "work", "scskiller_gen.db")).ToList();
         var r = Assert.Single(gen, r => r.Tag == 'R');
         Assert.Equal(new NvState(r.Key, 0, 1001, 2, 0), NvState.Parse(Assert.Single(gen, r => r.Tag == 'N')));
@@ -477,13 +479,14 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         Assert.Equal(0, Planner.SkippedIn(work));
         (long Done, long Failed, double[] Ms, string Log) Run(string exe, params string[] extra)
         {
-            var psi = new ProcessStartInfo(warm, [work, exe, .. extra]) { RedirectStandardOutput = true, UseShellExecute = false };
+            var psi = new ProcessStartInfo(warm, [work, exe, .. extra]) { StandardOutputEncoding = System.Text.Encoding.UTF8, RedirectStandardOutput = true, UseShellExecute = false };
             psi.Environment["SCSKILLER_WARM_TIMES"] = "1";
             string o;
             using (var p = Process.Start(psi)!) { o = p.StandardOutput.ReadToEnd(); p.WaitForExit(); }
             var done = System.Text.Json.JsonDocument.Parse(o.Split('\n', StringSplitOptions.RemoveEmptyEntries)[^1]).RootElement;
-            var ms = File.ReadAllLines(Path.Combine(work, "stage", "scskiller_warm_times.csv")).Select(l => double.Parse(l.Split(',')[1], CultureInfo.InvariantCulture)).Order().ToArray();
-            return (done.GetProperty("done").GetInt64(), done.GetProperty("failed").GetInt64(), ms, File.ReadAllText(Path.Combine(work, "stage", "scskiller.log")));
+            var stage = TestEnv.WarmStage(o, work);
+            var ms = File.ReadAllLines(Path.Combine(stage, "scskiller_warm_times.csv")).Select(l => double.Parse(l.Split(',')[1], CultureInfo.InvariantCulture)).Order().ToArray();
+            return (done.GetProperty("done").GetInt64(), done.GetProperty("failed").GetInt64(), ms, File.ReadAllText(Path.Combine(stage, "scskiller.log")));
         }
         string Stats(double[] v) => $"median {v[v.Length / 2]:F2} ms, p90 {v[(int)(v.Length * 0.9)]:F2}, max {v[^1]:F1}, total {v.Sum() / 1000:F1} s";
 
@@ -594,12 +597,14 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
                 output.WriteLine($"{made.Count} new driver-cache files{(made.Count <= 8 ? ", deleted" : ": not all ours, left in place: " + string.Join(", ", made))}");
             }
 
+        string? stage = null;
         (long Ok, long Failed, double Seconds) Run(string work, string exe, bool timed)
         {
-            var psi = new ProcessStartInfo(warm, timed ? [work, exe, "--threads", "1"] : [work, exe]) { RedirectStandardOutput = true, UseShellExecute = false };
+            var psi = new ProcessStartInfo(warm, timed ? [work, exe, "--threads", "1"] : [work, exe]) { StandardOutputEncoding = System.Text.Encoding.UTF8, RedirectStandardOutput = true, UseShellExecute = false };
             if (timed) psi.Environment["SCSKILLER_WARM_TIMES"] = "1";
             string o;
             using (var p = Process.Start(psi)!) { o = p.StandardOutput.ReadToEnd(); p.WaitForExit(); }
+            stage = TestEnv.WarmStage(o, work);
             var done = System.Text.Json.JsonDocument.Parse(o.Split('\n', StringSplitOptions.RemoveEmptyEntries)[^1]).RootElement;
             return (done.GetProperty("done").GetInt64() - done.GetProperty("failed").GetInt64(), done.GetProperty("failed").GetInt64(), done.GetProperty("seconds").GetDouble());
         }
@@ -609,7 +614,7 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
             var (_, failed, _) = Run(work, exe, true);
             Assert.Equal(0, failed);
             var ms = new double[kinds.Length];
-            foreach (var l in File.ReadAllLines(Path.Combine(work, "stage", "scskiller_warm_times.csv")).Select(l => l.Split(',')))
+            foreach (var l in File.ReadAllLines(Path.Combine(stage!, "scskiller_warm_times.csv")).Select(l => l.Split(',')))
                 ms[int.Parse(l[0])] = double.Parse(l[1], CultureInfo.InvariantCulture);
             return ms;
         }

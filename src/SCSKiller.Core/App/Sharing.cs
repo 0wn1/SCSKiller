@@ -80,7 +80,7 @@ public sealed class Sharing
         if (last.Stamp == stamp) return null;
         var shared = Path.Combine(gameDir, "shared.json");
         List<PsoDb.Rec> records;
-        try { records = HashOnly.Canonical(PsoDb.Read(db.FullName), local: true, out _); }   // shader and DXIL library blobs dropped (state objects kept)
+        try { records = HashOnly.Canonical(PsoDb.Read(db.FullName), local: true, out _, HashOnly.MaxEntryStateObjectRefs); }   // shader and DXIL library blobs dropped (state objects kept)
         catch (InvalidDataException e)   // e.g. no PSOs yet: not again until the recording changes
         {
             Community.Write(shared, last with { Stamp = stamp });
@@ -90,13 +90,15 @@ public sealed class Sharing
         if (Shipped(gameDir, contentHash) is { } shipped)
         {
             shipped.UnionWith(middlewareShaders?.Invoke() ?? []);
-            records = HashOnly.Canonical([.. records, .. HashOnly.LocalOnly(records, shipped.Contains)], local: false, out _);
+            records = HashOnly.Canonical([.. records, .. HashOnly.LocalOnly(records, shipped.Contains)], local: false, out _, HashOnly.MaxEntryStateObjectRefs);
         }
         var have = Community.Downloaded(gameDir)?.ContentHash == contentHash
             ? PsoDb.Read(Path.Combine(gameDir, "community.db")).Where(r => r.Tag != 'B').Select(r => r.Key).ToHashSet() : [];
         var sent = new List<string>();
         var (uploadId, psos, fresh) = ((string?)null, 0, 0);
-        foreach (var chunk in HashOnly.Chunks(records, ChunkRecords, ChunkRaw))
+        var chunks = HashOnly.Chunks(records, ChunkRecords, ChunkRaw, out var tooLarge);
+        if (tooLarge > 0) Problem = $"{tooLarge} ray tracing records name more than an upload may carry ({HashOnly.MaxStateObjectRefs} references with what they build on): shared without them.";
+        foreach (var chunk in chunks)
         {
             var id = Id(chunk, contentHash);   // the same records for another build are new there
             if (last.Sent?.Contains(id) == true || chunk.All(r => r.Tag == 'B' || have.Contains(r.Key)))
@@ -156,6 +158,85 @@ public sealed class Sharing
             if (why is not null) Problem = why;
             return null;
         }
+    }
+
+    /// <summary>Uploads each pack of a shared vendor (<see cref="Middleware.SharedVendors"/>) in <paramref name="packsDir"/>
+    /// (this PC's own, filled from its recordings on the GPU vendor <paramref name="gpu"/>: <see cref="MiddlewarePack.PackHeader.Gpu"/>)
+    /// that changed since its last upload, under its pack key for that vendor (docs/db-contract.md "Middleware packs"), when sharing is on. Stamped per pack file in
+    /// packs-shared.json, so a pack goes again only once it gains records. Returns the DLL name and PSO count of each upload.</summary>
+    public async Task<List<(string Dll, int Psos)>> SharePacksAsync(string packsDir, string gpu, string appVersion, CancellationToken ct = default)
+    {
+        var done = new List<(string, int)>();
+        if (!enabled() || clock.GetUtcNow() < backoffUntil) return done;
+        var stampFile = Path.Combine(Path.GetDirectoryName(file)!, "packs-shared.json");
+        var stamps = Community.Read<Dictionary<string, string>>(stampFile) ?? [];
+        var files = Middleware.SharedVendors.Select(v => Path.Combine(packsDir, v)).Where(Directory.Exists)
+            .SelectMany(d => Directory.EnumerateFiles(d, "*.pack")).Order(StringComparer.OrdinalIgnoreCase).ToList();
+        try
+        {
+            foreach (var path in files)
+            {
+                var fi = new FileInfo(path);
+                var stamp = $"{fi.Length}:{fi.LastWriteTimeUtc.Ticks}|{gpu}";
+                var name = Path.GetFileName(path);
+                if (stamps.GetValueOrDefault(name) == stamp) continue;
+                List<PsoDb.Rec> records;
+                MiddlewarePack pack;
+                try { records = MiddlewarePacks.Records(pack = MiddlewarePack.Read(path)); }
+                catch (Exception e) when (e is InvalidDataException or IOException or JsonException)
+                {
+                    stamps[name] = stamp;   // nothing to share until it changes
+                    continue;
+                }
+                if (pack.Header.Gpu != gpu)   // another GPU vendor's, or from before packs kept theirs: shared once a recording here adopts it
+                {
+                    stamps[name] = stamp;
+                    continue;
+                }
+                var key = HashOnly.PackKey(gpu, pack.Header.Vendor, pack.Header.Dll, pack.Header.ContentHash);
+                var body = HashOnly.Compress(records);
+                if (body.Length > MaxBody)
+                {
+                    Problem = $"An upscaler pack is too large to share ({body.Length >> 20} MB compressed, the limit is {MaxBody >> 20} MB).";
+                    stamps[name] = stamp;
+                    continue;
+                }
+                var meta = new UploadMeta(key, HashOnly.PackHash(key), Vendor: gpu, AppVersion: appVersion);
+                var r = await PostAsync(body, meta, ct);
+                if (r?.StatusCode == HttpStatusCode.Unauthorized)   // the device expired or was revoked: once with a new one
+                {
+                    r.Dispose();
+                    Reset();
+                    r = await PostAsync(body, meta, ct);
+                }
+                if (r == null) break;
+                using (r)
+                {
+                    if (r.StatusCode == HttpStatusCode.Accepted)
+                    {
+                        done.Add((pack.Header.Dll, (await r.Content.ReadFromJsonAsync<JsonElement>(ct)).GetProperty("records").GetInt32()));
+                        stamps[name] = stamp;
+                        continue;
+                    }
+                    Problem = $"Sharing an upscaler pack was refused (error {(int)r.StatusCode}).";
+                    if (r.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.RequestEntityTooLarge)
+                    {
+                        stamps[name] = stamp;   // refused for good: not again until it changes
+                        continue;
+                    }
+                    if (r.StatusCode == HttpStatusCode.Forbidden) stamps[name] = stamp;   // blocked: not again until the pack changes, like a recording
+                    else BackOff(r);
+                    break;
+                }
+            }
+        }
+        catch (Exception e) when (!ct.IsCancellationRequested)
+        {
+            backoffUntil = clock.GetUtcNow() + TimeSpan.FromMinutes(5);
+            Problem = e is HttpRequestException or OperationCanceledException ? "Can't reach the community database to share an upscaler pack." : e.Message;
+        }
+        finally { Community.Write(stampFile, stamps); }
+        return done;
     }
 
     /// <summary>A game folder's list of the shaders its build ships (the index's): the content hash (20 bytes), then each

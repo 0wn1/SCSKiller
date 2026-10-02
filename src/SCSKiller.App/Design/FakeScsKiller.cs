@@ -129,6 +129,7 @@ public sealed class FakeScsKiller : IScsKiller
     public IReadOnlyList<GameState> DriverStaleGames() => StaleGames().Where(g => g.WarmedDriverVersion != vendor.Gpu.DriverVersion).ToList();
     public void DismissStale() { }
     public bool QueueRunning => running;
+    public bool Compiling => Queue.Any(Format.Running);
     public bool SetEncryptionKey(string gameId, string key) => false;
     public bool ShouldNotifyStale() => Settings.OnDriverUpdate == DriverUpdateMode.Ask && DriverStaleGames().Count > 0;
     public void ApplyDriverUpdateMode() { }

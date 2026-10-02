@@ -93,6 +93,24 @@ public static class UpdateFeeds
         ? new($"https://github.com/{GhRepo}/releases/download/v{v}/{Uri.EscapeDataString(fileName)}")
         : new(PackageHost, $"v1/updates/{v.Channel}/{Uri.EscapeDataString(fileName)}");
 
+    /// <summary>A package body into <paramref name="to"/>: at most the signed feed's <paramref name="size"/> (its SHA-256 is
+    /// only checked once the download ends), and refused when no byte arrives for <paramref name="stall"/>.</summary>
+    public static async Task Download(Stream from, Stream to, long size, TimeSpan stall, CancellationToken ct)
+    {
+        var buf = new byte[81920];
+        using var idle = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        for (long total = 0; ;)
+        {
+            idle.CancelAfter(stall);
+            int n;
+            try { n = await from.ReadAsync(buf, idle.Token); }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new TimeoutException($"no package bytes for {stall.TotalSeconds:0} s"); }
+            if (n == 0) return;
+            if ((total += n) > size) throw new FeedRejectedException($"a package over the feed's {size} bytes");
+            await to.WriteAsync(buf.AsMemory(0, n), ct);
+        }
+    }
+
     // SCSKILLER_API (a local backend) serves the packages too
     static Uri PackageHost => Environment.GetEnvironmentVariable("SCSKILLER_API") is { Length: > 0 } ? RouteFailover.Default.Primary : Packages;
 
@@ -190,6 +208,17 @@ public static class Busy
     /// affinity, awkward across awaits) isn't needed.</summary>
     public static IDisposable Hold(string name = Name) => new Mutex(false, name);
 
+    /// <summary>A compile worker's hold, taken before it reads the marker (the updater writes the marker before it reads
+    /// <see cref="IsHeld"/>), so an update and a compile never both go ahead; null, holding nothing, while an update is
+    /// being handed over.</summary>
+    public static IDisposable? TryHold(string dataDir, DateTimeOffset now, string name = Name)
+    {
+        var hold = Hold(name);
+        if (!Applying(dataDir, now)) return hold;
+        hold.Dispose();
+        return null;
+    }
+
     public static bool IsHeld(string name = Name)
     {
         if (!Mutex.TryOpenExisting(name, out var m)) return false;
@@ -211,7 +240,9 @@ public static class Busy
     {
         try
         {
-            return DateTimeOffset.TryParse(File.ReadAllText(Marker(dataDir)), CultureInfo.InvariantCulture, DateTimeStyles.None, out var at)
+            // a reader polls it: the updater's ClearApplying must be able to delete it meanwhile
+            using var f = new FileStream(Marker(dataDir), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return DateTimeOffset.TryParse(new StreamReader(f).ReadToEnd(), CultureInfo.InvariantCulture, DateTimeStyles.None, out var at)
                 && now - at < ApplyingFor && at - now < ApplyingFor;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return false; }

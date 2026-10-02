@@ -7,12 +7,12 @@ namespace SCSKiller.Core.Vendors;
 /// all-or-nothing delete. Only file attributes and handles are touched, never content.</summary>
 public static class AppCacheFiles
 {
-    /// <summary>Keys of <paramref name="files"/> (path, key) opened by a running process with this exe file name.</summary>
+    /// <summary>Keys of <paramref name="files"/> (path, key) opened by a running process with this exe file name (from the
+    /// process snapshot: none opened).</summary>
     public static IReadOnlySet<string> KeysOpenBy(string exeFileName, IEnumerable<(string Path, string Key)> files)
     {
-        var pids = new HashSet<nuint>();
-        foreach (var p in System.Diagnostics.Process.GetProcessesByName(Path.GetFileNameWithoutExtension(exeFileName)))
-            using (p) pids.Add((nuint)p.Id);
+        var pids = Warming.ProcessTree.Snapshot().Where(p => p.Exe.Equals(exeFileName, StringComparison.OrdinalIgnoreCase))
+            .Select(p => (nuint)p.Pid).ToHashSet();
         var keys = new HashSet<string>();
         if (pids.Count == 0) return keys;
         foreach (var (path, key) in files)
@@ -41,11 +41,8 @@ public static class AppCacheFiles
         finally { foreach (var h in held) h.Dispose(); }
     }
 
-    static string Describe(nuint pid)
-    {
-        try { using var p = System.Diagnostics.Process.GetProcessById((int)pid); return $"{p.ProcessName}.exe (pid {pid})"; }
-        catch (ArgumentException) { return $"pid {pid}"; }   // exited meanwhile
-    }
+    static string Describe(nuint pid) =>
+        Warming.ProcessTree.Snapshot().FirstOrDefault(p => (nuint)p.Pid == pid).Exe is { } exe ? $"{exe} (pid {pid})" : $"pid {pid}";   // exited meanwhile
 
     public static HashSet<nuint> ProcessesUsing(string path)
     {

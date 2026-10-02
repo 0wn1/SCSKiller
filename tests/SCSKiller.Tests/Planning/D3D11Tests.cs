@@ -83,6 +83,7 @@ public class D3D11Tests(ITestOutputHelper output)
         // materialized: each D3D11 item's blob in gen.db, pulled through the reader
         var work = Path.Combine(dir, "work");
         new Planner().Materialize(plan, Ff7.Game, Ue426, new FakeBytes(), null, work, CancellationToken.None);
+        Assert.Equal("b4ea484f4f1015b7db42e1d51bbadbe95d85f1e6744d87a73d82b883cf3f7013", MaterializeOutputTests.Digest(work));
         Ff7.CheckWarmReady(work);
         var gen = PsoDb.Read(Path.Combine(work, "scskiller_gen.db")).ToList();
         Assert.Equal(sm5.Select(s => s.Sha1).Order(), gen.Where(r => r.Tag == 'B').Select(r => PsoDb.Hex(r.Payload.AsSpan(0, 20))).Where(sm5.Select(s => s.Sha1).Contains).Order());

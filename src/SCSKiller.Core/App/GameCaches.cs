@@ -43,6 +43,14 @@ public static class D3DSCache
 
     static readonly Regex WalExe = new(@"[A-Za-z]:\\[ -~]{3,}?\.[Ee][Xx][Ee]");
 
+    /// <summary>The runtime's files in a cache folder, nothing else it may hold: <c>&lt;GUID&gt;[_VEN_..&amp;DEV_..&amp;SUBSYS_..&amp;REV_..]</c>
+    /// with .dxcache (and its -shm, -wal) or the older .idx, .val, .lock.</summary>
+    public static IEnumerable<FileInfo> CacheFiles(string dir) =>
+        new DirectoryInfo(dir).EnumerateFiles().Where(f => CacheFile.IsMatch(f.Name));
+
+    static readonly Regex CacheFile = new(@"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}(_VEN_[0-9A-F]+&DEV_[0-9A-F]+&SUBSYS_[0-9A-F]+&REV_[0-9A-F]+)?\.(dxcache(-shm|-wal)?|idx|val|lock)$",
+        RegexOptions.IgnoreCase);
+
     /// <summary>An Xbox game's exe runs from <c>...\WindowsApps\&lt;Name&gt;_&lt;Version&gt;_&lt;Arch&gt;_&lt;ResourceId&gt;_&lt;PublisherId&gt;\&lt;path in Content&gt;</c>:
     /// Name_PublisherId is its package family, any version matches.</summary>
     public static bool IsGameExe(string path, Game g)

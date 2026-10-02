@@ -158,8 +158,9 @@ static std::string partner_vs(const Shader& s) {
         }
         if (c < 4) pad(4 - c);
     }
-    if (!pos) f += "float4 pos:SV_Position;";
-    return "struct O{" + f + "};O main(uint i:SV_VertexID){O o=(O)0;o.pos=float4(i==1?3:-1,i==2?3:-1,0.5,1);return o;}";
+    // only a PS needs a position from it; a HS or GS may already take all 32 registers
+    if (!pos && (s.type == 0 || f.empty())) f += "float4 pos:SV_Position;", pos = true;
+    return "struct O{" + f + "};O main(uint i:SV_VertexID){O o=(O)0;" + (pos ? "o.pos=float4(i==1?3:-1,i==2?3:-1,0.5,1);" : "") + "return o;}";
 }
 
 static bool iequal(const std::string& a, const std::string& b) { return _stricmp(a.c_str(), b.c_str()) == 0; }
@@ -355,7 +356,7 @@ Dev11* warm11_open(LUID luid, bool debug) {
 }
 
 static ID3D11VertexShader* partner(Dev11& v, const Shader& s, const char** why) {
-    auto [it, fresh] = v.partner.try_emplace(s.in_raw + std::string((const char*)s.interp, sizeof s.interp));
+    auto [it, fresh] = v.partner.try_emplace(s.in_raw + std::string((const char*)s.interp, sizeof s.interp) + (char)s.type);
     if (fresh) {
         std::string src = partner_vs(s), err;
         ComPtr<ID3DBlob> b = src.empty() ? nullptr : compile(src, "vs_5_0", &err);

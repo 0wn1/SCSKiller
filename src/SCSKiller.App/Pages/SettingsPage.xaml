@@ -157,7 +157,7 @@
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Spacing="12">
                                     <Button Content="Refresh status" Click="OnRefreshAccount" IsEnabled="{x:Bind Patreon.Idle, Mode=OneWay}" />
-                                    <Button Content="Sign out" Click="OnSignOut" IsEnabled="{x:Bind Patreon.Idle, Mode=OneWay}" />
+                                    <Button Content="Sign out" Click="OnSignOut" IsEnabled="{x:Bind Patreon.CanSignOut, Mode=OneWay}" />
                                     <ProgressRing IsActive="{x:Bind Patreon.Busy, Mode=OneWay}" Width="16" Height="16" />
                                 </StackPanel>
                                 <InfoBar IsOpen="{x:Bind Patreon.OffersSharing, Mode=OneWay}" Visibility="{x:Bind Patreon.OffersSharing, Mode=OneWay}" Severity="Success" IsClosable="False"
@@ -174,9 +174,9 @@
                             <StackPanel Spacing="8" Visibility="{x:Bind Patreon.ShowsUpdates, Mode=OneWay}">
                                 <Rectangle Height="1" Fill="{ThemeResource CardStrokeColorDefaultBrush}" />
                                 <ComboBox Header="Update channel" ItemsSource="{x:Bind Patreon.ChannelLabels, Mode=OneWay}" SelectedIndex="{x:Bind Patreon.ChannelIndex, Mode=TwoWay}"
-                                          MinWidth="260" Visibility="{x:Bind Patreon.ShowsChannels, Mode=OneWay}" />
+                                          IsEnabled="{x:Bind Patreon.CanPickChannel, Mode=OneWay}" MinWidth="260" Visibility="{x:Bind Patreon.ShowsChannels, Mode=OneWay}" />
                                 <TextBlock Text="{x:Bind Patreon.ChannelNote, Mode=OneWay}" Style="{StaticResource Caption}" TextWrapping="Wrap" />
-                                <Button Content="Go back to stable now" Click="OnBackToStable" Visibility="{x:Bind Patreon.OffersBackToStable, Mode=OneWay}" />
+                                <Button Content="Go back to stable now" Click="OnBackToStable" IsEnabled="{x:Bind Patreon.CanPickChannel, Mode=OneWay}" Visibility="{x:Bind Patreon.OffersBackToStable, Mode=OneWay}" />
                                 <InfoBar IsOpen="{x:Bind Patreon.HasUpdateProblem, Mode=OneWay}" Visibility="{x:Bind Patreon.HasUpdateProblem, Mode=OneWay}"
                                          Message="{x:Bind Patreon.UpdateProblem, Mode=OneWay}" Severity="Warning" IsClosable="False" />
                             </StackPanel>
@@ -185,7 +185,7 @@
                                 <CheckBox IsChecked="{x:Bind Patreon.UseCommunityDb, Mode=TwoWay}" IsEnabled="{x:Bind Patreon.HasDb, Mode=OneWay}" AutomationProperties.Name="Download shared shader hashes">
                                     <StackPanel Spacing="2">
                                         <TextBlock Text="Download shared shader hashes" TextWrapping="Wrap" />
-                                        <TextBlock Text="Hashes other players recorded for your games, so they compile without you recording them first. No game files: your GPU compiles everything from your own install."
+                                        <TextBlock Text="Hashes other players recorded for your games, so they compile without you recording them first. No game files: your GPU compiles everything from your own install. Upscaler pipelines (FSR, XeSS) download for everyone, without it."
                                                    Style="{StaticResource Caption}" TextWrapping="Wrap" />
                                     </StackPanel>
                                 </CheckBox>
@@ -194,7 +194,7 @@
                             <CheckBox IsChecked="{x:Bind Vm.ShareRecordings, Mode=TwoWay}" AutomationProperties.Name="Share anonymous shader hashes">
                                 <StackPanel Spacing="2">
                                     <TextBlock Text="Share anonymous shader hashes" TextWrapping="Wrap" />
-                                    <TextBlock Text="Helps everyone get better coverage. Never linked to your Patreon account; nothing else about your games leaves your PC. Free for everyone." Style="{StaticResource Caption}" TextWrapping="Wrap" />
+                                    <TextBlock Text="Helps everyone get better coverage. Your recordings' upscaler pipelines (FSR, XeSS) also reach everyone with the same upscaler version. Never linked to your Patreon account; nothing else about your games leaves your PC. Free for everyone." Style="{StaticResource Caption}" TextWrapping="Wrap" />
                                 </StackPanel>
                             </CheckBox>
                         </StackPanel>
@@ -265,7 +265,7 @@
                             </Grid.ColumnDefinitions>
                             <StackPanel Spacing="2">
                                 <TextBlock Text="Record in all compatible games" Style="{StaticResource Section}" />
-                                <TextBlock Text="Adds a small d3d12.dll to games without anti-cheat to catch shaders the plan missed and time each frame, so the game page shows what stuttered. Frame times stay on this PC. Never used in anti-cheat games. Switch off to remove it everywhere."
+                                <TextBlock Text="Adds a small d3d12.dll to games without anti-cheat to catch shaders the plan missed and time each frame, so the game page shows what stuttered. Frame times stay on this PC. Never used in anti-cheat games. Switch off to remove it from every game you haven't turned it on for yourself."
                                            Style="{StaticResource Caption}" TextWrapping="Wrap" />
                             </StackPanel>
                             <ToggleSwitch Grid.Column="1" MinWidth="0" VerticalAlignment="Top" OnContent="" OffContent="" IsOn="{x:Bind Vm.RecordAllGames, Mode=TwoWay}"

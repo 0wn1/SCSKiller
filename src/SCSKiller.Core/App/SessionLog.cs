@@ -12,7 +12,8 @@ public sealed record LaunchedExe(string Name, DateTimeOffset At);
 /// which this reader ignores; appended per game launch, t_ms restarts at each launch). Lowercase kind = loaded from the
 /// game's own pipeline library; a create over 3 ms is a real driver compile (but a RayQuery PSO's floor, see
 /// <see cref="RayQueryFloorMs"/>), under it a cache hit. Kinds 'R' / 'A' (ray
-/// tracing state objects) are counted apart: compiled from <see cref="StateObjectCompileMs"/>, else ready. Newer proxies bracket each launch with <c>#session,&lt;unix_ms&gt;,&lt;exe&gt;</c> and <c>#end,&lt;unix_ms&gt;</c>
+/// tracing state objects) are counted apart: compiled from <see cref="StateObjectCompileMs"/>, else ready. Compiles during
+/// the launch's startup (<see cref="FrameLog.StartupEnd"/>, the frame report's rule) are counted apart too. Newer proxies bracket each launch with <c>#session,&lt;unix_ms&gt;,&lt;exe&gt;</c> and <c>#end,&lt;unix_ms&gt;</c>
 /// (missing after a crash, and whenever the game terminates its own process, as Unreal does); other <c>#</c> lines are ignored. The #session exe is
 /// GetModuleFileNameW(NULL)'s file name inside the game process: the name exactly as launched (measured: a process started
 /// as CASEPROBE.EXE from the file caseProbe.exe has CASEPROBE.EXE there, while its kernel image name and
@@ -21,23 +22,62 @@ public static class SessionLog
 {
     const double CompileMs = 3.0;
 
-    sealed class Session
-    {
-        public long? Start, End;
-        public bool OtherExe;
-        public long Rows, Library, Hits, Compiles, RayQuery, SoReady, SoCompiled;
-        public double LastT = double.NegativeInfinity, Worst;
+    /// <summary>The driver compiled the create: not from the game's library, a state object from
+    /// <see cref="StateObjectCompileMs"/>, anything else over 3 ms but a RayQuery PSO at the floor.</summary>
+    internal static bool IsCompile(char kind, double ms, string? key, IReadOnlySet<string>? rayQuery) =>
+        char.IsUpper(kind) && (kind is 'R' or 'A' ? ms >= StateObjectCompileMs
+            : ms > CompileMs && !(ms <= RayQueryFloorMs && key != null && rayQuery?.Contains(key) == true));
 
-        // Play time = end - start. Without an #end (a crash, an older proxy, or a game that terminates itself, as Unreal
-        // does, so DLL_PROCESS_DETACH never runs): the watched exit of the run this launch started in, else the last create's t_ms.
-        public SessionStats Stats(PlayWindow? played)
+    sealed class Session(CsvLaunch launch)
+    {
+        public CsvLaunch Launch => launch;
+        public long? Start => launch.Start;
+        public long? End => launch.End;
+        public bool OtherExe;
+        public List<(double T, char Kind, double Ms, string? Key)> Creates => launch.Creates;
+        public double LastT => Creates.Count > 0 ? Creates[^1].T : double.NegativeInfinity;
+
+        public long Hits, Compiles, StartupCompiles, Library, RayQuery, SoReady, SoCompiled, SoStartupCompiled;
+        public double Worst;
+
+        /// <summary>Compiles that end by <paramref name="startup"/> (<see cref="FrameLog.InStartup"/>) count in StartupCompiles (state objects in
+        /// SoStartupCompiled), and Worst is of the creates after it.</summary>
+        public Session Count(IReadOnlySet<string>? rayQuery, double startup = double.NegativeInfinity)
         {
-            double ms = Rows > 0 ? LastT : 0;
-            if (Start is { } s && End is { } e && e >= s) ms = e - s;
-            else if (Start is { } st && played is { } p && p.From.ToUnixTimeMilliseconds() <= st && st <= p.To.ToUnixTimeMilliseconds())
-                ms = Math.Max(ms, p.To.ToUnixTimeMilliseconds() - st);
-            return new(TimeSpan.FromMilliseconds(ms), Rows, Library, Hits, Compiles, Worst, RayQuery, SoReady, SoCompiled);
+            Hits = Compiles = StartupCompiles = Library = RayQuery = SoReady = SoCompiled = SoStartupCompiled = 0;
+            Worst = 0;
+            foreach (var (t, kind, ms, key) in Creates)
+            {
+                if (!char.IsUpper(kind)) { Library++; continue; }
+                if (kind is 'R' or 'A')
+                {
+                    if (ms < StateObjectCompileMs) SoReady++;
+                    else if (FrameLog.InStartup(t, startup)) SoStartupCompiled++;
+                    else SoCompiled++;
+                    continue;
+                }
+                if (ms > CompileMs && ms <= RayQueryFloorMs && key != null && rayQuery?.Contains(key) == true) { RayQuery++; continue; }
+                if (ms <= CompileMs) Hits++;
+                else if (FrameLog.InStartup(t, startup)) StartupCompiles++;
+                else Compiles++;
+                if (!FrameLog.InStartup(t, startup)) Worst = Math.Max(Worst, ms);
+            }
+            return this;
         }
+
+        // Play time: the launch's end on the recorder's clock (FrameLog.SessionEnd), as the frame report's Duration. Without
+        // an #end (a crash, an older proxy, or a game that terminates itself, as Unreal does, so DLL_PROCESS_DETACH never
+        // runs) the watched exit of the run it started in, its last frame or its last create stand in.
+        public SessionStats Stats(PlayWindow? played, IReadOnlySet<string>? rayQuery, FrameReport? frames)
+        {
+            double lastFrame = frames?.Duration.TotalMilliseconds ?? 0;   // the caller passes only this launch's
+            double end = FrameLog.SessionEnd(launch, lastFrame, played);
+            Count(rayQuery, FrameLog.StartupEnd(Creates, rayQuery, end));
+            return new(TimeSpan.FromMilliseconds(end), Creates.Count, Library, Hits, Compiles, Worst, RayQuery, SoReady, SoCompiled, StartupCompiles, SoStartupCompiled);
+        }
+
+        /// <summary>The app saw the run this launch started in exit.</summary>
+        public bool Exited(PlayWindow? played) => Start is { } st && played is { } p && p.From.ToUnixTimeMilliseconds() <= st && st <= p.To.ToUnixTimeMilliseconds();
     }
 
     /// <summary>NVIDIA recompiles part of a cached RayQuery PSO at every create: about 7-15% of its cold create, 9-35 ms
@@ -60,20 +100,70 @@ public static class SessionLog
     /// have no start time: never that one. <paramref name="rayQuery"/>: keys of PSOs SCSKiller compiled whose shaders trace
     /// rays inline (<see cref="WriteRayQueryKeys"/>); a create of one over 3 ms and up to <see cref="RayQueryFloorMs"/>
     /// counts in <see cref="SessionStats.RayQueryRecompiles"/> only. Null: every create is a hit or a compile.
-    /// <paramref name="played"/>: the game's last watched run, the play time of a launch without <c>#end</c> that started in it.</summary>
+    /// <paramref name="played"/>: the game's last watched run, the play time of a launch without <c>#end</c> that started in it.
+    /// <paramref name="frames"/>: the frame log's report, whose last frame (of the same launch) is one of the launch's
+    /// ends (<see cref="FrameLog.SessionEnd"/>), so both reports draw the same startup.</summary>
     public static (SessionStats? Last, LaunchedExe? Exe, LaunchCheck? First) Read(string csvPath, string? exeFileName = null,
-        DateTimeOffset? firstAfter = null, long minCreates = 1, IReadOnlySet<string>? rayQuery = null, PlayWindow? played = null)
+        DateTimeOffset? firstAfter = null, long minCreates = 1, IReadOnlySet<string>? rayQuery = null, PlayWindow? played = null,
+        FrameReport? frames = null) => Read(csvPath, out _, exeFileName, firstAfter, minCreates, rayQuery, played, frames);
+
+    /// <summary>The same, and whether <paramref name="frames"/> is the last session's launch (<paramref name="framesMatch"/>):
+    /// the game page shows frame times only next to their own launch's counts.</summary>
+    public static (SessionStats? Last, LaunchedExe? Exe, LaunchCheck? First) Read(string csvPath, out bool framesMatch, string? exeFileName = null,
+        DateTimeOffset? firstAfter = null, long minCreates = 1, IReadOnlySet<string>? rayQuery = null, PlayWindow? played = null,
+        FrameReport? frames = null)
     {
+        framesMatch = false;
         if (!File.Exists(csvPath)) return (null, null, null);
         Session? cur = null;
         LaunchedExe? exe = null;
         LaunchCheck? first = null;
-        void Ended(Session? s)
+        // the whole launch, startup included: what still compiles there after a warm is what the check measures
+        void Ended(Session s)
         {
-            if (first == null && firstAfter is { } a && s is { Start: { } st, OtherExe: false } && st > a.ToUnixTimeMilliseconds() && s.Hits + s.Compiles >= minCreates)
-                first = new LaunchCheck(DateTimeOffset.FromUnixTimeMilliseconds(st), s.Hits, s.Compiles);
+            if (first == null && firstAfter is { } a && s is { Start: { } st, OtherExe: false } && st > a.ToUnixTimeMilliseconds()
+                && s.Count(rayQuery) is var c && c.Hits + c.Compiles >= minCreates)
+                first = new LaunchCheck(DateTimeOffset.FromUnixTimeMilliseconds(st), c.Hits, c.Compiles);
         }
-        using var reader = new StreamReader(new FileStream(csvPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+        Session? game = null;   // the last launch of exeFileName's (an unmarked launch counts: older proxies wrote no name)
+        var launches = Launches(csvPath).ToList();
+        foreach (var l in launches)
+        {
+            if (cur != null) Ended(cur);   // a later launch began
+            bool other = l.Start != null && OtherExe(l.Exe, exeFileName);
+            if (l.Start is long ms && ms > 0 && l.Exe.Length > 0 && !other) exe = new LaunchedExe(l.Exe, DateTimeOffset.FromUnixTimeMilliseconds(ms));
+            cur = new Session(l) { OtherExe = other };
+            if (!other) game = cur;
+        }
+        if (cur != null && (cur.End != null || cur.Exited(played))) Ended(cur);
+        framesMatch = game != null && frames != null && FrameLog.OwnerOf(launches, frames.LaunchUnixMs) == game.Launch;
+        return (game?.Stats(played, rayQuery, framesMatch ? frames : null), exe, first);
+    }
+
+    /// <summary>A launch whose #session names <paramref name="named"/> is another exe's than <paramref name="exeFileName"/>
+    /// (null: any exe's is the game's). The proxy writes the name through the C locale, so a non-ASCII name comes out
+    /// mangled: an exe name with non-ASCII letters can't be told apart, and every launch counts as its own.</summary>
+    internal static bool OtherExe(string named, string? exeFileName) =>
+        exeFileName != null && exeFileName.All(char.IsAscii) && !named.Equals(exeFileName, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>One launch of the csv, as both reports split it (<see cref="Launches"/>).</summary>
+    internal sealed class CsvLaunch
+    {
+        public long? Start, End;   // the #session and #end stamps (unix ms)
+        public double? StartT, EndT;   // the same instants on the recorder's clock (t_ms); null from an older proxy
+        public string Exe = "";
+        public readonly List<(double T, char Kind, double Ms, string? Key)> Creates = [];
+    }
+
+    /// <summary>The csv's launches, the one split both reports use: a <c>#session</c> line opens one; rows before any, after
+    /// a launch's <c>#end</c> (the proxy writes it as its process detaches, so they are another process's) or after t_ms
+    /// restarted (an older proxy without markers) open one without a stamp, which the frame report never matches.
+    /// Kinds as written (lowercase: from the game's pipeline library).</summary>
+    internal static IEnumerable<CsvLaunch> Launches(string path)
+    {
+        if (!File.Exists(path)) yield break;
+        using var reader = new StreamReader(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+        CsvLaunch? cur = null;
         while (reader.ReadLine() is { } line)
         {
             var f = line.Split(',');
@@ -82,37 +172,28 @@ public static class SessionLog
                 long ms = f.Length > 1 && long.TryParse(f[1], CultureInfo.InvariantCulture, out var x) ? x : 0;
                 if (f[0] == "#session")
                 {
-                    Ended(cur);
-                    cur = new Session { Start = ms };
-                    // the name may hold commas; the proxy writes it through the C locale, so a non-ASCII name comes out mangled:
-                    // callers only accept it when it matches the install's exe name apart from case
-                    var name = f.Length > 2 ? string.Join(',', f[2..]).Trim() : "";
-                    cur.OtherExe = exeFileName != null && !name.Equals(exeFileName, StringComparison.OrdinalIgnoreCase);
-                    if (ms > 0 && name.Length > 0 && !cur.OtherExe) exe = new LaunchedExe(name, DateTimeOffset.FromUnixTimeMilliseconds(ms));
+                    if (cur != null) yield return cur;
+                    cur = new CsvLaunch { Start = ms, Exe = f.Length > 2 ? string.Join(',', f[2..]).Trim() : "" };   // the name may hold commas
                 }
-                else if (f[0] == "#end" && cur != null) { cur.End = ms; Ended(cur); }
+                else if (f[0] == "#clock" && cur is { Start: not null, Creates.Count: 0 } && double.TryParse(f.Length > 1 ? f[1] : "", CultureInfo.InvariantCulture, out var st))
+                    cur.StartT = st;
+                else if (f[0] == "#end" && cur != null)
+                {
+                    cur.End = ms;
+                    if (f.Length > 2 && double.TryParse(f[2], CultureInfo.InvariantCulture, out var et)) cur.EndT = et;
+                }
                 continue;
             }
             if (f.Length < 5 || f[1].Length != 1 || !double.TryParse(f[0], CultureInfo.InvariantCulture, out var t)
                 || !double.TryParse(f[4], CultureInfo.InvariantCulture, out var ms2)) continue;
-            if (cur == null || cur.End != null || t < cur.LastT)   // no markers (older proxy): t_ms restarting = a new launch
+            if (cur == null || cur.End != null || cur.Creates.Count > 0 && t < cur.Creates[^1].T)
             {
-                if (cur?.End == null) Ended(cur);
-                cur = new Session();
+                if (cur != null) yield return cur;
+                cur = new CsvLaunch();
             }
-            cur.Rows++;
-            cur.LastT = t;
-            if (!char.IsUpper(f[1][0])) { cur.Library++; continue; }
-            if (f[1][0] is 'R' or 'A')
-            {
-                if (ms2 >= StateObjectCompileMs) cur.SoCompiled++; else cur.SoReady++;
-                continue;
-            }
-            if (ms2 > CompileMs && ms2 <= RayQueryFloorMs && f.Length > 5 && rayQuery?.Contains(f[5]) == true) { cur.RayQuery++; continue; }
-            if (ms2 > CompileMs) cur.Compiles++; else cur.Hits++;
-            cur.Worst = Math.Max(cur.Worst, ms2);
+            cur.Creates.Add((t, f[1][0], ms2, f.Length > 5 ? f[5] : null));
         }
-        return (cur?.Stats(played), exe, first);
+        if (cur != null) yield return cur;
     }
 
     /// <summary>Writes the keys of the recording's PSOs with a shader that traces rays inline (SFI0's RayQuery flag), one

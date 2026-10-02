@@ -17,7 +17,7 @@ sealed class PlanBuilder
     readonly IProgress<string>? log;
     readonly CancellationToken ct;
     readonly bool maximum;
-    readonly MiddlewarePacks? packs;
+    readonly MiddlewarePacks? packs, sharedPacks;
 
     readonly IReadOnlyDictionary<string, ShaderInfo> bc;
     /// <summary>Shader maps; Global shaders pair across maps (one fullscreen VS serves pixel shaders from many global maps): pooled.</summary>
@@ -48,7 +48,7 @@ sealed class PlanBuilder
     List<string> d3d11 = [];
     readonly List<(string Hs, string Ds)> tess11 = [];
 
-    readonly Dictionary<string, string> rsCache = [];
+    readonly Dictionary<string, string?> rsCache = [];   // null: the runtime won't serialize it
     readonly Dictionary<string, byte[]> rsBlobs = [];
 
     // the plan
@@ -66,9 +66,10 @@ sealed class PlanBuilder
     /// <param name="maximum">with a per-stage cache: also every stage set whose units the cover already has, on its first
     /// resolved state (every pre-linked pair, as a whole-pipeline plan has them); the units stay the same</param>
     public PlanBuilder(Game game, EngineInfo engine, ShaderIndex index, Recording? recording, VendorCaps caps, string outDir,
-        IProgress<string>? log, CancellationToken ct, bool maximum = false, MiddlewarePacks? packs = null)
+        IProgress<string>? log, CancellationToken ct, bool maximum = false, MiddlewarePacks? packs = null, MiddlewarePacks? sharedPacks = null)
     {
-        (this.game, this.engine, this.index, this.recording, this.caps, this.outDir, this.log, this.ct, this.maximum, this.packs) = (game, engine, index, recording, caps, outDir, log, ct, maximum, packs);
+        (this.game, this.engine, this.index, this.recording, this.caps, this.outDir, this.log, this.ct, this.maximum, this.packs, this.sharedPacks) =
+            (game, engine, index, recording, caps, outDir, log, ct, maximum, packs, sharedPacks);
         bc = index.Shaders;
         maps = index.Maps.Select(m => (m.Platform, Pooled: false, Shas: m.Shaders, m.IsPipeline)).ToList();
         maps.AddRange(index.Maps.Where(m => m.Library == "Global").GroupBy(m => m.Platform)
@@ -85,43 +86,71 @@ sealed class PlanBuilder
         if (dx12) RuntimeBuilt();
         if (dx12 && UnitPolicy.For(caps) is { } policy) PerStage(policy);
         else StageSets(Emit);
-        if (dx12 && Planner.RtCollectionCache(caps)) RtPlan();
-        if (dx12 && packs != null) SeedMiddleware();
+        if (dx12 && Planner.RtCollectionCache(caps))
+            try { RtPlan(); }
+            catch (RootSig.SerializeException e)   // the rule's global root signature: no collections, the PSOs still plan
+            {
+                rtItems.Clear();
+                log?.Report($"warning: ray tracing: no collections: the runtime won't serialize the rule's global root signature ({e.Message})");
+            }
+        if (Planner.SeedsPacks(engine) && (packs ?? sharedPacks) != null) SeedMiddleware();
         return Write();
     }
 
     // middleware packs: entries seeded into this plan ('M' records) and the root signatures they use
     readonly List<Rec> packEntries = [];
     readonly Dictionary<string, byte[]> packRs = [];
-    long packNew;
+    long packNew, packShared;
+
+    /// <summary>What seeding read of both kinds of pack (<see cref="Planner.PackFingerprint"/>'s form); null when it read none.</summary>
+    public string? PackFingerprint { get; private set; }
 
     /// <summary>Middleware DLLs next to the exe: this recording's PSOs made only of a DLL's shaders (none in the game's
     /// index) go into that DLL version's pack (<see cref="MiddlewarePacks.Promote"/>); then every pack of a DLL version this
-    /// install has seeds the plan, whichever game's recording filled it. Recorded PSOs aren't enumerated: only replayed.</summary>
+    /// install has seeds the plan, whichever game's recording filled it: this PC's packs, then the shared ones downloaded
+    /// for this GPU vendor. Recorded PSOs aren't enumerated: only replayed. A PSO with a [WaveSize] this vendor doesn't run
+    /// is left out (a pack recorded on another vendor's GPU: the runtime would reject it).</summary>
     void SeedMiddleware()
     {
         var dlls = Middleware.Detect(game);
         if (dlls.Count == 0) return;
-        if (recs.Count > 0)
-            foreach (var p in packs!.Promote(recs, recBlobs, bc, dlls, game.Id))
+        if (recs.Count > 0 && packs != null)
+            foreach (var p in packs.Promote(recs, recBlobs, bc, dlls, game.Id, caps.Profile.StartsWith("amd") ? "amd" : caps.Profile.StartsWith("nvidia") ? "nvidia" : null))
                 log?.Report($"middleware: {p.Records} recorded PSOs are {p.Dll.Name}'s ({p.Dll.Vendor}, {p.ContentHash[..12]}), {p.New} new in its pack");
         var seen = new HashSet<string>();
         var recKeys = recs.Select(r => r.Key).ToHashSet();
-        foreach (var s in packs!.Seed(dlls))
-        {
-            int n = 0, recorded = 0, shared = 0;
-            foreach (var e in s.Pack.Entries)
+        var amd = caps.Profile.StartsWith("amd");
+        var lanes = new Dictionary<string, bool>();
+        var wrongLanes = 0;
+        string local = "", remote = "";
+        List<MiddlewarePacks.Seeded> ours = packs?.Seed(dlls, out local) ?? [], theirs = sharedPacks?.Seed(dlls, out remote) ?? [];
+        PackFingerprint = local + (remote.Length > 0 ? "|shared:" + remote : "");
+        foreach (var (seeded, shared) in new[] { (ours, false), (theirs, true) })
+            foreach (var s in seeded)
             {
-                if (!seen.Add(e.Key)) { shared++; continue; } // its shaders are in two DLLs (FSR 3.1 in amdxcffx64 and the upscaler DLL): one pack seeds it
-                packEntries.Add(MiddlewarePacks.Wrap(e, s.Dll.Name, s.ContentHash));
-                var rs = Parse(e).Rs;
-                if (s.Pack.RootSignatures.TryGetValue(rs, out var b)) packRs[rs] = b;
-                n++;
-                if (recKeys.Contains(e.Key)) recorded++; // replayed from scskiller.db anyway (Materialize skips it)
-                else packNew++;
+                var image = Middleware.Scan(s.Dll.Path);
+                int n = 0, recorded = 0, dup = 0, lanesOut = 0;
+                foreach (var e in s.Pack.Entries)
+                {
+                    if (!seen.Add(e.Key)) { dup++; continue; } // in this PC's pack too, or its shaders are in two DLLs (FSR 3.1 in amdxcffx64 and the upscaler DLL): seeded once
+                    if (!MiddlewarePacks.Runs(e, image, amd, lanes)) { lanesOut++; continue; }
+                    var pso = Parse(e);
+                    packEntries.Add(MiddlewarePacks.Wrap(e, s.Dll.Name, s.ContentHash));
+                    if (s.Pack.RootSignatures.TryGetValue(pso.Rs, out var rs)) packRs[pso.Rs] = rs;
+                    n++;
+                    if (recKeys.Contains(e.Key)) recorded++; // replayed from scskiller.db anyway (Materialize skips it)
+                    else
+                    {
+                        packNew++;
+                        if (shared) packShared++;
+                    }
+                }
+                wrongLanes += lanesOut;
+                log?.Report($"middleware: {s.Dll.Name} ({s.Dll.Vendor}, {s.ContentHash[..12]}): {n} {(shared ? "shared " : "")}pack PSOs ({recorded} already in the recording, {n - recorded} new"
+                    + (dup > 0 ? $"; {dup} seeded already" : "") + (lanesOut > 0 ? $"; {lanesOut} with a wave size this GPU doesn't run left out" : "")
+                    + $"; from {string.Join(", ", s.Pack.Header.Sources)})");
             }
-            log?.Report($"middleware: {s.Dll.Name} ({s.Dll.Vendor}, {s.ContentHash[..12]}): {n} pack PSOs ({recorded} already in the recording, {n - recorded} new{(shared > 0 ? $"; {shared} more seeded from another DLL's pack" : "")}; from {string.Join(", ", s.Pack.Header.Sources)})");
-        }
+        if (wrongLanes > 0) stats["vendor_extension"] = stats.GetValueOrDefault("vendor_extension") + wrongLanes;
     }
 
     /// <summary>Recorded PSOs with a shader in no file of the install (neither the index nor a middleware DLL next to the exe):
@@ -147,20 +176,37 @@ sealed class PlanBuilder
                 else if (r.Tag is 'G' or 'C' or 'S') recs.Add(r);
                 else if (IsStateObject(r.Tag)) stateObjects.Add(r);
                 else if (r.Tag == 'N') nvRecs.Add(r);
+        // a root signature the readers can't follow (a shared recording's) goes with the records naming it, not the game
+        var named = recs.Select(r => Parse(r).Rs).Concat(stateObjects.SelectMany(r => ParseStateObject(r).RootSignatures)).ToHashSet();
+        var bad = named.Where(h => recBlobs.TryGetValue(h, out var b) && !Carved.Dxbc.RootSignatureValid(b)).ToHashSet();
+        if (bad.Count > 0)
+        {
+            foreach (var h in bad) recBlobs.Remove(h);
+            var left = recs.RemoveAll(r => bad.Contains(Parse(r).Rs)) + stateObjects.RemoveAll(r => ParseStateObject(r).RootSignatures.Any(bad.Contains));
+            log?.Report($"warning: recorded: {bad.Count} malformed root signatures left out with the {left} records naming them");
+        }
+        var unbuilt = 0;
         foreach (var r in recs)
         {
             var pso = Parse(r);
-            have.Add(pso.Tuple);
-            if (!pso.Stages.Values.All(bc.ContainsKey)) continue; // not a library shader (e.g. an overlay's): no template
+            if (!pso.Stages.Values.All(bc.ContainsKey)) { have.Add(pso.Tuple); continue; } // not a library shader (e.g. an overlay's): no template
             var st = Infos(pso.Stages);
-            foreach (var h in pso.Stages.Values) plats[platOfSha[h]] = plats.GetValueOrDefault(platOfSha[h]) + 1;
-            rsByCounts[Planner.CountsKey(st)] = pso.Rs;
             if (recBlobs.TryGetValue(pso.Rs, out var rsBlob))
             {
-                samplers ??= RootSig.Samplers(rsBlob);
+                // the rule's rebuild with these samplers the runtime won't serialize (its ranges overlap them): the rule
+                // doesn't reproduce this one, which still replays as recorded
                 builtN++;
-                if (RootSig.Serialize(RootSig.Build(rule, st, MeshTier(pso.Stages), maxSrvs), samplers).AsSpan().SequenceEqual(rsBlob)) builtOk++;
+                var s = samplers ?? RootSig.Samplers(rsBlob);
+                try
+                {
+                    if (RootSig.Serialize(RootSig.Build(rule, st, MeshTier(pso.Stages), maxSrvs), s).AsSpan().SequenceEqual(rsBlob)) builtOk++;
+                    samplers = s;
+                }
+                catch (RootSig.SerializeException) { unbuilt++; }
             }
+            have.Add(pso.Tuple);
+            foreach (var h in pso.Stages.Values) plats[platOfSha[h]] = plats.GetValueOrDefault(platOfSha[h]) + 1;
+            rsByCounts[Planner.CountsKey(st)] = pso.Rs;
             var t = (r.Key, pso.Rs, pso.HasLayout);
             recByKey[r.Key] = r;
             var shape = Planner.Shape(pso.Stages);
@@ -168,6 +214,7 @@ sealed class PlanBuilder
             Add(shape, t); // fallback: any template with these stages
             if (pso.Stages.ContainsKey((int)Stage.Geometry)) gsTopo.TryAdd((pso.Topology, shape), t);
         }
+        if (unbuilt > 0) log?.Report($"recorded: the rule's rebuild of {unbuilt} root signatures doesn't serialize with their static samplers: counted as not rebuilt (they replay as recorded)");
         void Add(string shape, (string, string, bool) t) { if (!templates.TryGetValue(shape, out var l)) templates[shape] = l = []; l.Add(t); }
     }
 
@@ -199,6 +246,9 @@ sealed class PlanBuilder
         if (unpaired > 0) stats["d3d11_tess_unpaired"] = unpaired;
     }
 
+    /// <summary>The stage set's root signature, null when there is none. One the runtime won't serialize (a rule's ranges
+    /// overlapping a recording's static samplers) is null too, counted as "rs_unserializable": that stage set is left
+    /// out, not the plan.</summary>
     string? RootSigOf(SortedDictionary<int, string> stages)
     {
         // carved shaders carrying their root signature (RTS0): exact, served by the reader at materialize time
@@ -207,12 +257,23 @@ sealed class PlanBuilder
         var desc = RootSig.Build(rule, Infos(stages), MeshTier(stages), maxSrvs);
         if (!rsCache.TryGetValue(desc.Key, out var h))
         {
-            var b = RootSig.Serialize(desc, samplers!);
-            rsCache[desc.Key] = h = Hex(SHA1.HashData(b));
-            rsBlobs[h] = b;
+            try
+            {
+                var b = RootSig.Serialize(desc, samplers!);
+                rsCache[desc.Key] = h = Hex(SHA1.HashData(b));
+                rsBlobs[h] = b;
+            }
+            catch (RootSig.SerializeException e)
+            {
+                rsCache[desc.Key] = h = null;
+                unserializable ??= e.Message;
+            }
         }
+        if (h == null) Count("rs_unserializable");
         return h;
     }
+
+    string? unserializable;   // the first serializer error
 
     readonly Dictionary<string, RootSig.Ranges?> rsRanges = [];
     readonly Dictionary<(string Rs, string Sha, int Stage), bool> covered = [];
@@ -604,7 +665,8 @@ sealed class PlanBuilder
             foreach (var c in learned.Where(c => recBlobs.ContainsKey(c.Library) && bc.ContainsKey(c.Library)))
             {
                 n++;
-                var synth = RtCollections.Collection(recBlobs[c.Library], c.Library, rule.GlobalRs, LocalRs(bc[c.Library], true), LocalRs(bc[c.Library], false),
+                if ((LocalRs(bc[c.Library], true), LocalRs(bc[c.Library], false)) is not ({ } localGen, { } localOther)) continue;
+                var synth = RtCollections.Collection(recBlobs[c.Library], c.Library, rule.GlobalRs, localGen, localOther,
                     c.Payload, c.Attributes, rule.Depth, rule.Flags, c.NameHash);
                 if (synth != null && recordedKeys.Contains(new Rec('R', synth).Key)) same++;
             }
@@ -654,7 +716,11 @@ sealed class PlanBuilder
         foreach (var h in libs)
         {
             if (recordedLibs.Contains(h)) { Count("rt_recorded"); continue; }
-            var (lg, lo) = guessedLocal != null ? (guessedLocal, guessedLocal) : (LocalRs(bc[h], true), LocalRs(bc[h], false));
+            if ((guessedLocal != null ? (guessedLocal, guessedLocal) : (LocalRs(bc[h], true), LocalRs(bc[h], false))) is not ({ } lg, { } lo))
+            {
+                Count("rt_unserializable");
+                continue;
+            }
             if (global != null && RootSig.Uncovered(new RootSig.Ranges(0, [.. global.Slots, .. RootSig.Parse(rsBlobs[lo]).Slots]), Stage.Library, bc[h]) is { } why)
             {
                 Count("rt_uncovered");
@@ -668,16 +734,21 @@ sealed class PlanBuilder
             + $", {stats.GetValueOrDefault("rt_recorded")} already recorded, {stats.GetValueOrDefault("rt_uncovered")} uncovered");
     }
 
-    /// <summary>A library's local root signature (<see cref="RtCollections.LocalRs"/>), serialized once per shape.</summary>
-    string LocalRs(ShaderInfo lib, bool rayGen)
+    /// <summary>A library's local root signature (<see cref="RtCollections.LocalRs"/>), serialized once per shape; null when
+    /// the runtime won't serialize it (that library is left out).</summary>
+    string? LocalRs(ShaderInfo lib, bool rayGen)
     {
         // UE 5 hit groups: 6 system root constants (other 5.x than 5.1 only through a recording's check)
         var d = RtCollections.LocalRs(lib.Counts, rayGen, lib.Bindings, engine.Family == "Unreal" && engine.Version.StartsWith("5.") ? 6u : 4u);
         if (!rsCache.TryGetValue(d.Key, out var h))
         {
-            (h, var b) = RtCollections.Serialize(d, []);
+            try
+            {
+                (h, var b) = RtCollections.Serialize(d, []);
+                rsBlobs[h] = b;
+            }
+            catch (RootSig.SerializeException e) { unserializable ??= e.Message; }
             rsCache[d.Key] = h;
-            rsBlobs[h] = b;
         }
         return h;
     }
@@ -709,7 +780,8 @@ sealed class PlanBuilder
             new PlanStats(recs.Count + stateObjects.Count, items.Count + synthesized.Count + rtItems.Count, synthesized.Count, usedRs.Count, dx12 && (verified || embeddedRs > 0),
                 unitsBy[(int)Provenance.Exact], unitsBy[(int)Provenance.Inferred], unitsBy[(int)Provenance.Guessed], layoutCoverage, n11, packNew,
                 stats.GetValueOrDefault("rs_uncovered"), rtLibs, stateObjects.Count > 0 || inlineOnly ? 0 : rtLibs - rtPlanned,
-                StageSets: seen.Count, LeftOut: new[] { "no_rs", "no_template", "no_gs_template", "rs_uncovered" }.Sum(stats.GetValueOrDefault)),
+                StageSets: seen.Count, LeftOut: new[] { "no_rs", "no_template", "no_gs_template", "rs_uncovered" }.Sum(stats.GetValueOrDefault),
+                MiddlewareSharedItems: packShared),
             Path.Combine(outDir, "plan.bin"));
         PlanFile.Write(plan, body);
         log?.Report($"plan: {items.Count + synthesized.Count} PSOs{(rtItems.Count > 0 ? $" + {rtItems.Count} ray tracing collections" : "")} ({string.Join(", ", stats.Select(s => $"{s.Key} {s.Value}"))}), "
@@ -717,6 +789,9 @@ sealed class PlanBuilder
             + (packEntries.Count > 0 ? $", {packEntries.Count} middleware pack PSOs ({packNew} not in the recording)" : "")
             + (n11 > 0 ? $" ({string.Join(", ", d3d11.GroupBy(h => bc[h].Stage).Select(g => $"{g.Count()} {g.Key}").Append(tess11.Count > 0 ? $"{tess11.Count} HS+DS" : "").Where(s => s != ""))})" : "")
             + $", {new FileInfo(plan.FilePath).Length / 1024} KiB -> {plan.FilePath}");
+        if (unserializable != null)   // the stage sets within no_rs
+            log?.Report($"warning: {stats.GetValueOrDefault("rs_unserializable")} stage sets and {stats.GetValueOrDefault("rt_unserializable")} DXIL libraries left out: "
+                + $"the runtime won't serialize the root signature the rule builds for them ({unserializable})");
         if (stats.TryGetValue("rs_uncovered", out var nu))
             log?.Report($"warning: {nu} stage sets left out: their root signature doesn't cover a resource their shaders declare "
                 + $"({string.Join("; ", uncoveredExample.Take(5).Select(e => $"{e.Key}, e.g. {e.Value[..12]}"))}); this engine's rule doesn't know those ranges"

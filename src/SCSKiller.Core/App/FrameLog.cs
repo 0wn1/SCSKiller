@@ -1,5 +1,3 @@
-using System.Globalization;
-
 namespace SCSKiller.Core.App;
 
 /// <summary>Reads the recorder's scskiller_frames.bin (ARCHITECTURE.md "scskiller_frames.bin") with its
@@ -18,7 +16,6 @@ public static class FrameLog
     const double QuitMs = 10_000;        // measured: an Unreal game's quit freeze starts 6-7 s before its last frame
     const int BurstCreates = 100;        // a second with this many creates is a precompile or a load
     const double BurstGapMs = 10_000;    // measured: a title screen's second burst 5 s after the first; a level load 100 s and more
-    const double ContinueGapMs = 2000;   // a slow frame with no create this close after startup (loading a save) is startup too
     const double ColdCompileMs = 100;    // measured: a compiled run's load creates stay under 100 ms, cold compiles' median is 159 ms
 
     sealed record Launch(long UnixMs, List<double> Ends);
@@ -26,37 +23,68 @@ public static class FrameLog
 
     /// <summary>The report of the last launch with frames, or of the last whose csv launch names
     /// <paramref name="exeFileName"/>; null without frames. <paramref name="rayQuery"/>: RayQuery PSO keys, whose creates
-    /// up to <see cref="SessionLog.RayQueryFloorMs"/> are the driver's floor, never a stutter.</summary>
-    public static FrameReport? Read(string framesPath, string csvPath, string? exeFileName = null, IReadOnlySet<string>? rayQuery = null)
+    /// up to <see cref="SessionLog.RayQueryFloorMs"/> are the driver's floor, never a stutter. <paramref name="played"/>:
+    /// the game's last watched run, for the launch's end (<see cref="SessionEnd"/>).</summary>
+    public static FrameReport? Read(string framesPath, string csvPath, string? exeFileName = null, IReadOnlySet<string>? rayQuery = null,
+        PlayWindow? played = null)
     {
         if (!File.Exists(framesPath)) return null;
         var launches = ReadFrames(framesPath);
-        var sessions = ReadCreates(csvPath);
+        var sessions = SessionLog.Launches(csvPath).Where(x => x.Start != null).ToList();
         for (int i = launches.Count - 1; i >= 0; i--)
         {
             var l = launches[i];
             if (l.Ends.Count < 2) continue;
-            // the recorder stamps both in one D3D12CreateDevice call
-            var s = sessions.Where(x => Math.Abs(x.UnixMs - l.UnixMs) < 10_000).OrderBy(x => Math.Abs(x.UnixMs - l.UnixMs)).FirstOrDefault();
-            if (exeFileName != null && s != null && !s.Exe.Equals(exeFileName, StringComparison.OrdinalIgnoreCase)) continue;
-            return Report(l, s?.Creates ?? [], rayQuery);
+            var s = OwnerOf(sessions, l.UnixMs);
+            if (s != null && SessionLog.OtherExe(s.Exe, exeFileName)) continue;
+            return Report(l, s, rayQuery, played);
         }
         return null;
     }
 
-    static FrameReport Report(Launch l, List<Create> creates, IReadOnlySet<string>? rayQuery)
+    /// <summary>The end of a launch on the recorder's clock (t_ms, from the recorder's load), the same for both reports: the
+    /// latest of its last create, its last frame (0 = no frames) and its #end, or without an #end the watched exit of the
+    /// run it started in (a run can hold more than one launch). A unix time goes onto that clock from the #session
+    /// stamp's t_ms (#clock; 0 from an older proxy).</summary>
+    internal static double SessionEnd(SessionLog.CsvLaunch? l, double lastFrame, PlayWindow? played)
     {
+        double end = Math.Max(l is { Creates.Count: > 0 } ? l.Creates[^1].T : 0, lastFrame);
+        if (l?.Start is not { } s) return end;
+        double origin = l.StartT ?? 0;
+        if (l.EndT is { } et) return Math.Max(end, et);
+        if (l.End is { } e && e >= s) return Math.Max(end, e - s + origin);
+        if (played is { } p && p.From.ToUnixTimeMilliseconds() <= s && s <= p.To.ToUnixTimeMilliseconds())
+            end = Math.Max(end, p.To.ToUnixTimeMilliseconds() - s + origin);
+        return end;
+    }
+
+    /// <summary>The csv launch a frame log launch stamped at <paramref name="launchUnix"/> belongs to, the one rule both
+    /// reports use: a recorder that writes #clock writes the same stamp into both; an older one stamped each in its own
+    /// call, close together, so its launch is the only one within 10 s, or none.</summary>
+    internal static SessionLog.CsvLaunch? OwnerOf(IEnumerable<SessionLog.CsvLaunch> launches, long launchUnix)
+    {
+        var near = launches.Where(l => l.Start is { } s && Math.Abs(s - launchUnix) < 10_000).ToList();
+        return near.FirstOrDefault(l => l.StartT != null && l.Start == launchUnix) ?? (near is [{ StartT: null } only] ? only : null);
+    }
+
+    static FrameReport Report(Launch l, SessionLog.CsvLaunch? session, IReadOnlySet<string>? rayQuery, PlayWindow? played)
+    {
+        var creates = session?.Creates.Select(c => new Create(c.T, c.Ms, c.Kind, c.Key ?? "")).ToList() ?? [];
         creates.Sort((a, b) => a.End.CompareTo(b.End));
         double longest = creates.Count > 0 ? creates.Max(c => c.Ms) : 0;
-        double startup = StartupEnd(creates);
+        double end = SessionEnd(session, l.Ends[^1], played);
+        double startup = StartupEnd(creates.Select(c => (c.End, c.Kind, c.Ms, (string?)c.Key)), rayQuery, end, out var firstQuiet), shared = startup;
+        // the slow-frame extension below never moves startup over a compile the last session counts as play
+        double firstPlay = creates.Where(c => !InStartup(c.End, startup) && SessionLog.IsCompile(c.Kind, c.Ms, c.Key, rayQuery))
+            .Select(c => c.End).DefaultIfEmpty(double.PositiveInfinity).Min();
         var frames = l.Ends.Zip(l.Ends.Skip(1), (a, b) => (Start: a, Ms: b - a)).ToList();
         double quit = l.Ends[^1] - QuitMs;
         var ends = creates.Select(c => c.End).ToList();
-        var slow = new List<(double S, double Ms, int N, bool Shader, double Cold)>();
+        var slow = new List<(double S, double Ms, int N, bool Compile, bool Shader, double Cold)>();
         foreach (var (s, ms) in frames.Where(f => f.Ms >= HitchMs))
         {
             int n = 0;
-            bool shader = false;
+            bool compile = false, shader = false;
             double cold = 0;
             // creates ending inside the frame or up to the longest create after it; the ones that started by its end overlap
             for (int j = LowerBound(ends, s); j < creates.Count && creates[j].End <= s + ms + longest; j++)
@@ -64,56 +92,102 @@ public static class FrameLog
                 var c = creates[j];
                 if (c.End - c.Ms > s + ms) continue;
                 n++;
-                bool floor = c.Ms <= SessionLog.RayQueryFloorMs && rayQuery?.Contains(c.Key) == true;
-                shader |= c.Kind is 'R' or 'A' ? c.Ms >= SessionLog.StateObjectCompileMs : c.Ms >= BlockMs && !floor;
-                if (c.Ms >= ColdCompileMs && !floor) cold += c.Ms;
+                if (!SessionLog.IsCompile(c.Kind, c.Ms, c.Key, rayQuery)) continue;   // a library load, a cache hit or the RayQuery floor
+                compile = true;
+                shader |= c.Kind is 'R' or 'A' || c.Ms >= BlockMs;
+                if (c.Ms >= ColdCompileMs) cold += c.Ms;
             }
-            slow.Add((s, ms, n, shader, cold));
+            slow.Add((s, ms, n, compile, shader, cold));
         }
+        // a slow frame with no create that the shared boundary falls inside is startup's to its end, within the 10 s after
+        // the first quiet point that bursts get too, and never over a compile in play; any other slow frame is play
         foreach (var f in slow)
-            if (f.N == 0 && f.S <= startup + ContinueGapMs && f.S + f.Ms > startup) startup = f.S + f.Ms;
+            if (f.N == 0 && f.S < shared && !InStartup(f.S + f.Ms, shared) && InStartup(f.S + f.Ms, Allowance(firstQuiet)) && f.S + f.Ms < firstPlay)
+                startup = Math.Max(startup, f.S + f.Ms);
         var hitches = new List<Hitch>();
-        foreach (var (s, ms, n, shader, cold) in slow)
+        var paused = new HashSet<double>();
+        foreach (var (s, ms, n, compile, shader, cold) in slow)
         {
             bool compiles = cold >= ms / 2;   // summed over threads
-            var cause = s + ms <= startup ? compiles ? HitchCause.LoadingShaders : HitchCause.Loading
+            var cause = InStartup(s + ms, startup) ? compiles ? HitchCause.LoadingShaders : HitchCause.Loading
                 : s >= quit ? HitchCause.Quitting
                 : compiles ? HitchCause.Shader   // a load in play that compiles: the shader cost the player feels
                 : n >= LoadCreates ? HitchCause.Loading : shader ? HitchCause.Shader : HitchCause.Other;
-            if (cause == HitchCause.Other && ms >= PauseMs) continue;
+            if (cause == HitchCause.Other && ms >= PauseMs && !compile) { paused.Add(s); continue; }   // a pause: nothing compiled
             hitches.Add(new Hitch(TimeSpan.FromMilliseconds(s), ms, cause));
         }
-        var play = frames.Where(f => f.Start >= startup && f.Start < quit && f.Ms < PauseMs).Select(f => f.Ms).OrderDescending().ToList();
+        // a pause isn't play; a long shader freeze is
+        var play = frames.Where(f => InPlay(f.Start, f.Ms, startup) && f.Start < quit && !paused.Contains(f.Start)).Select(f => f.Ms).OrderDescending().ToList();
         var slowest = play.Take(Math.Max(1, play.Count / 100)).ToList();
         double low = slowest.Count > 0 ? 1000 * slowest.Count / slowest.Sum() : 0;
         var peaks = new float[GraphColumns];
         foreach (var (s, ms) in frames)
         {
-            int c = Math.Clamp((int)(s / l.Ends[^1] * GraphColumns), 0, GraphColumns - 1);
+            int c = Math.Clamp((int)(s / end * GraphColumns), 0, GraphColumns - 1);
             peaks[c] = Math.Max(peaks[c], (float)ms);
         }
-        return new FrameReport(TimeSpan.FromMilliseconds(l.Ends[^1]), TimeSpan.FromMilliseconds(Math.Min(startup, l.Ends[^1])),
-            frames.Count, low, hitches, peaks);
+        return new FrameReport(TimeSpan.FromMilliseconds(end), TimeSpan.FromMilliseconds(Math.Min(startup, end)),
+            frames.Count, low, hitches, peaks, l.UnixMs);
     }
 
-    /// <summary>The end of the startup: from the first create, the first 3 s with fewer than <see cref="StartupQuietCreates"/>
-    /// creates; a burst (a second of <see cref="BurstCreates"/>) within <see cref="BurstGapMs"/> after that is startup too.</summary>
-    static double StartupEnd(List<Create> creates)
+    /// <summary>A create or frame ending at <paramref name="end"/> is startup's: the one comparison both reports use.</summary>
+    internal static bool InStartup(double end, double startup) => end <= startup;
+
+    /// <summary>A frame from <paramref name="start"/> lasting <paramref name="ms"/> is play's (not startup's), by its end
+    /// as <see cref="InStartup"/>: the hitch causes, the play counts and the 1% low all use it.</summary>
+    public static bool InPlay(double start, double ms, double startup) => !InStartup(start + ms, startup);
+
+    /// <summary>Startup ends by this, however its bursts and slow frames run on: 10 s after the first quiet point.</summary>
+    static double Allowance(double firstQuiet) => firstQuiet + BurstGapMs;
+
+    /// <summary>The end of the startup, from the csv's creates (end time, kind as written, ms, key) and whether each
+    /// compiled (<see cref="SessionLog.IsCompile"/>): from the first create, the first 3 s that are quiet: fewer than
+    /// <see cref="StartupQuietCreates"/> creates, or none that compiled and no second of <see cref="BurstCreates"/>.
+    /// A burst (a second of <see cref="BurstCreates"/>) whose first create ends within <see cref="BurstGapMs"/> of that
+    /// first quiet point is startup too, up to its own quiet point but never past those 10 s (<see cref="Allowance"/>),
+    /// unless a compile in play came before it. A window that runs past <paramref name="sessionEnd"/> counts as quiet
+    /// only when it is the first (nothing came before it): a launch that ends while still busy is all startup (infinity).</summary>
+    internal static double StartupEnd(IEnumerable<(double End, char Kind, double Ms, string? Key)> creates, IReadOnlySet<string>? rayQuery,
+        double sessionEnd) => StartupEnd(creates, rayQuery, sessionEnd, out _);
+
+    /// <summary><paramref name="firstQuiet"/>: the first quiet point, which the bursts' 10 s count from.</summary>
+    internal static double StartupEnd(IEnumerable<(double End, char Kind, double Ms, string? Key)> creates, IReadOnlySet<string>? rayQuery,
+        double sessionEnd, out double firstQuiet)
     {
-        var perSecond = new Dictionary<long, int>();
-        foreach (var c in creates) perSecond[(long)(c.End / 1000)] = perSecond.GetValueOrDefault((long)(c.End / 1000)) + 1;
-        if (perSecond.Count == 0) return 0;
-        long last = perSecond.Keys.Max();
-        long Quiet(long from)
+        firstQuiet = double.PositiveInfinity;
+        var perSecond = new Dictionary<long, (int Creates, int Compiles, double First)>();
+        var compiled = new List<double>();
+        foreach (var (e, kind, ms, key) in creates)
         {
-            for (long s = from; s <= last; s++)
-                if (perSecond.GetValueOrDefault(s) + perSecond.GetValueOrDefault(s + 1) + perSecond.GetValueOrDefault(s + 2) < StartupQuietCreates) return s;
-            return last;
+            bool compile = SessionLog.IsCompile(kind, ms, key, rayQuery);
+            if (compile) compiled.Add(e);
+            var (n, c, f) = perSecond.GetValueOrDefault((long)(e / 1000), (0, 0, double.PositiveInfinity));
+            perSecond[(long)(e / 1000)] = (n + 1, c + (compile ? 1 : 0), Math.Min(f, e));
         }
-        long end = Quiet(perSecond.Keys.Min());
-        for (long b; (b = perSecond.Keys.Where(k => k > end && k <= end + (long)(BurstGapMs / 1000) && perSecond[k] >= BurstCreates).DefaultIfEmpty(-1).Min()) >= 0;)
-            end = Quiet(b);
-        return end * 1000.0;
+        if (perSecond.Count == 0) return firstQuiet = 0;
+        // a steady trickle of cache hits in play doesn't hold startup open; a warmed run's precompile, all hits, does
+        bool Busy(long s)
+        {
+            var w = new[] { s, s + 1, s + 2 }.Select(k => perSecond.GetValueOrDefault(k)).ToList();
+            return w.Sum(x => x.Creates) >= StartupQuietCreates && (w.Any(x => x.Compiles > 0) || w.Any(x => x.Creates >= BurstCreates));
+        }
+        long? Quiet(long from)   // a window cut off by the session's end is quiet only as the first
+        {
+            for (long s = from; s == from || s * 1000 < sessionEnd; s++)
+                if (!Busy(s) && (s == from || (s + 3) * 1000 <= sessionEnd)) return s;
+            return null;
+        }
+        if (Quiet(perSecond.Keys.Min()) is not { } first) return double.PositiveInfinity;
+        firstQuiet = first * 1000.0;
+        double end = firstQuiet, cap = Allowance(firstQuiet);
+        foreach (var b in perSecond.Keys.Where(k => k > first && perSecond[k].First <= cap && perSecond[k].Creates >= BurstCreates).Order())
+        {
+            var start = perSecond[b].First;
+            if (InStartup(start, end)) continue;   // inside the startup already
+            if (compiled.Any(e => !InStartup(e, end) && e < start)) break;   // a compile in play before it: what follows is play
+            end = Quiet(b) is { } q ? q * 1000.0 : cap;
+        }
+        return Math.Min(end, cap);
     }
 
     static int LowerBound(List<double> v, double x)
@@ -124,7 +198,7 @@ public static class FrameLog
         return i;
     }
 
-    /// <summary>u32 records: 0xFFFFFFFF + u64 unix_ms, u64 us since the recorder loaded, u64 QPC, u64 QPC frequency opens a
+    /// <summary>u32 records: 0xFFFFFFFF + u64 unix_ms (the csv's #session stamp), u64 us since the recorder loaded, u64 QPC, u64 QPC frequency opens a
     /// launch; top 4 bits 0-14 = a frame of that swap chain, the low 28 bits the microseconds since the previous record;
     /// top 4 bits 15 = no frame for the low 28 bits' milliseconds. Frames of the launch's busiest swap chain only.</summary>
     static List<Launch> ReadFrames(string path)
@@ -163,27 +237,5 @@ public static class FrameLog
         }
         Close();
         return launches;
-    }
-
-    sealed record CsvSession(long UnixMs, string Exe, List<Create> Creates);
-
-    static List<CsvSession> ReadCreates(string path)
-    {
-        var sessions = new List<CsvSession>();
-        if (!File.Exists(path)) return sessions;
-        using var reader = new StreamReader(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
-        while (reader.ReadLine() is { } line)
-        {
-            var f = line.Split(',');
-            if (f[0] == "#session")
-            {
-                long.TryParse(f.Length > 1 ? f[1] : "", CultureInfo.InvariantCulture, out var ms);
-                sessions.Add(new CsvSession(ms, f.Length > 2 ? string.Join(',', f[2..]).Trim() : "", []));
-            }
-            else if (!line.StartsWith('#') && sessions.Count > 0 && f.Length >= 5 && f[1].Length == 1
-                     && double.TryParse(f[0], CultureInfo.InvariantCulture, out var end) && double.TryParse(f[4], CultureInfo.InvariantCulture, out var cms))
-                sessions[^1].Creates.Add(new Create(end, cms, char.ToUpperInvariant(f[1][0]), f.Length > 5 ? f[5] : ""));
-        }
-        return sessions;
     }
 }

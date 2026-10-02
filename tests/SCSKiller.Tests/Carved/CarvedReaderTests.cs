@@ -185,6 +185,7 @@ public class CarvedReaderTests
 
         var work = Path.Combine(dir, "work");
         planner.Materialize(plan, d.Game, engine, reader, null, work, CancellationToken.None);
+        Assert.Equal("605500aca5e115987aa01fcdb37aa13377bd700f18275629ed9535cdb3ffe18c", MaterializeOutputTests.Digest(work));
         Ff7.CheckWarmReady(work);
     }
 }

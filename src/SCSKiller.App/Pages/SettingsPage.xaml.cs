@@ -25,11 +25,12 @@ public sealed partial class SettingsPage : Page
     void OnSignIn(object _, RoutedEventArgs __) => _ = App.Account.SignInAsync();
     void OnCancelSignIn(object _, RoutedEventArgs __) => App.Account.CancelSignIn();
     void OnRefreshAccount(object _, RoutedEventArgs __) => _ = App.Account.RefreshAsync();
-    void OnSignOut(object _, RoutedEventArgs __) => _ = App.Account.SignOutAsync();
+    void OnSignOut(object _, RoutedEventArgs __) { if (!Updater.Restarting) _ = App.Account.SignOutAsync(); }
 
     // The latest stable, even though it's older than this pre-release (a downgrade, allowed this once).
     void OnBackToStable(object _, RoutedEventArgs __)
     {
+        if (Updater.Restarting) return;   // the restart applies the update it waited for, or none
         App.Core.Settings = App.Core.Settings with { UpdateChannel = UpdateChannels.Stable };
         _ = Updater.CheckAsync(backToStable: true);
     }

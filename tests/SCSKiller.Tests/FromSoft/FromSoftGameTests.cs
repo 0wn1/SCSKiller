@@ -134,13 +134,13 @@ public class FromSoftGameTests(ITestOutputHelper output)
             Ff7.CheckWarmReady(work);
 
             var psi = new ProcessStartInfo(warm, [work, $"scsk_fromsoft_warp_{Random.Shared.Next(100000, 999999)}.exe", "--threads", "8", "--adapter-luid", WarpLuid().ToString("x")])
-                { RedirectStandardOutput = true, UseShellExecute = false };
+                { StandardOutputEncoding = System.Text.Encoding.UTF8, RedirectStandardOutput = true, UseShellExecute = false };
             string o;
             using (var p = Process.Start(psi)!) { o = p.StandardOutput.ReadToEnd(); p.WaitForExit(); }
             var done = o.Split('\n').Select(l => l.Trim()).Where(l => l.StartsWith('{')).Select(l => System.Text.Json.JsonDocument.Parse(l).RootElement)
                 .LastOrDefault(e => e.GetProperty("event").GetString() == "done");
             Assert.True(done.ValueKind == System.Text.Json.JsonValueKind.Object, o);
-            var log = Path.Combine(work, "stage", "scskiller.log");
+            var log = Path.Combine(TestEnv.WarmStage(o, work), "scskiller.log");
             var start = o.Split('\n').FirstOrDefault(l => l.Contains("\"start\""))?.Trim();
             Assert.Contains("Basic Render", start);
             output.WriteLine($"{game.Name}: {items.Count} of {all.Count} plan items: {start} {done}\n"

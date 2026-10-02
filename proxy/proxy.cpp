@@ -28,6 +28,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <psapi.h>
+#include <share.h>
 #include <d3d12.h>
 #include <dxgi1_2.h>
 #include <bcrypt.h>
@@ -35,6 +36,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -111,6 +113,8 @@ static std::atomic<int> g_state;                                 // set by scski
 static HANDLE g_warm_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 static bool g_staged;         // SCSKiller_WarmOptions was called: this is scskiller_warm's staged child, not a play session
 static bool g_wrote_session;  // a "#session" line was written to the csv, so DLL_PROCESS_DETACH owes it a matching "#end"
+static HANDLE g_csv_h;        // the csv's file handle, for that "#end"
+static long long g_session_unix;  // that line's stamp, also the frames file's launch stamp: the two name one launch
 static uint64_t g_db_bytes, g_db_cap;  // scskiller.db's size; max_db_bytes
 static bool g_db_capped, g_db_full;
 
@@ -794,7 +798,7 @@ static void map_blobs(const std::wstring& path, const std::vector<std::pair<Hash
 static void load_file(const std::wstring& path, bool main, bool with_bytes) {
     FILE* f = _wfopen(path.c_str(), L"rb");
     if (!f) return;
-    long long good = 0;
+    long long good = 0, flen = _filelengthi64(_fileno(f));
     std::vector<std::pair<Hash, std::pair<long long, uint32_t>>> blobs;  // with_bytes: each blob's offset and size
     for (;;) {
         int tag = fgetc(f);
@@ -804,10 +808,11 @@ static void load_file(const std::wstring& path, bool main, bool with_bytes) {
             Hash h;
             if (len < 20 || fread(h.data(), 1, 20, f) != 20) break;
             long long at = _ftelli64(f);
-            if (_fseeki64(f, len - 20, SEEK_CUR) || _ftelli64(f) > (long long)_filelengthi64(_fileno(f))) break;
+            if (_fseeki64(f, len - 20, SEEK_CUR) || _ftelli64(f) > flen) break;
             if (with_bytes) blobs.push_back({h, {at, len - 20}});
             if (main) g_blobs_on_disk.insert(h);  // gen blobs aren't in the main db; its records must stay self-contained
         } else {
+            if (len > flen - good - 5) break;  // a torn or corrupt length: never allocate past the file
             std::string p(len, '\0');
             if (fread(p.data(), 1, len, f) != len) break;
             if (tag == 'N') {
@@ -839,10 +844,8 @@ static void load_file(const std::wstring& path, bool main, bool with_bytes) {
     }
     long long size = (_fseeki64(f, 0, SEEK_END), _ftelli64(f));
     fclose(f);
-    if (main && size > good) {  // torn tail from a crash mid-write: cut it so appends stay parseable
-        logf("db: truncating torn tail (%lld -> %lld bytes)", size, good);
-        if (FILE* t = _wfopen(path.c_str(), L"r+b")) _chsize_s(_fileno(t), good), fclose(t);
-    }
+    // torn tail from a crash mid-write: cut it so appends stay parseable; only while this process holds the db (load_db)
+    if (main && size > good && g_db && !_chsize_s(_fileno(g_db), good)) logf("db: truncated a torn tail (%lld -> %lld bytes)", size, good);
     while (!blobs.empty() && blobs.back().second.first + blobs.back().second.second > good) blobs.pop_back();  // in the torn tail
     map_blobs(path, blobs);  // after the truncation: a mapped file can't be shortened
 }
@@ -869,13 +872,16 @@ static size_t load_keys(const std::wstring& path) {
 }
 
 static void load_db(bool with_bytes) {
+    // deny-write, before the load: what is read and repaired can't change under it, and a second process of the folder
+    // (another instance, a launcher) records and repairs nothing rather than interleaving with or cutting this one's records
+    g_db = _wfsopen((g_dir + L"scskiller.db").c_str(), L"ab", _SH_DENYWR);
+    if (!g_db) logf("db: scskiller.db is open in another process: nothing is recorded in this one");
     load_file(g_dir + L"scskiller.db", true, with_bytes);
     if (size_t n = with_bytes ? 0 : load_keys(g_dir + L"scskiller.keys")) logf("db: %zu keys of records and blobs imported earlier or shipped with the game", n);
     g_db_records_at_start = g_keys.size();
     size_t rec_tuples = g_known_tuples.size();
     load_file(g_dir + L"scskiller_gen.db", false, with_bytes);
     g_total = g_recs.size() + g_plan.size() + g_items11.size();
-    g_db = _wfopen((g_dir + L"scskiller.db").c_str(), L"ab");
     WIN32_FILE_ATTRIBUTE_DATA fa;
     if (GetFileAttributesExW((g_dir + L"scskiller.db").c_str(), GetFileExInfoStandard, &fa)) g_db_bytes = (uint64_t)fa.nFileSizeHigh << 32 | fa.nFileSizeLow;
     wchar_t cap[32];  // not cfg(): a staged warm child may inherit SCSKILLER_* variables
@@ -884,6 +890,13 @@ static void load_db(bool with_bytes) {
     if (g_db_capped) logf("db: %llu bytes, limit %llu", g_db_bytes, g_db_cap);
     logf("db: %llu PSOs / %zu shader tuples recorded, +%zu tuples generated, %zu blobs (mode=%s)", g_db_records_at_start,
          rec_tuples, g_known_tuples.size() - rec_tuples, g_blobs_on_disk.size(), g_warm ? "warm" : "record");
+}
+
+// A failed write (a full disk) may leave part of a record: nothing more is appended, so it stays the tail the next launch cuts.
+static void db_flush() {
+    if (!fflush(g_db) && !ferror(g_db)) return;
+    logf("db: writing scskiller.db failed (disk full?): nothing more is recorded in this launch");
+    fclose(g_db), g_db = nullptr;
 }
 
 // Under g_mx: the record, the blobs it names and its NVAPI state, each written once. At the limit none of them is: a
@@ -899,12 +912,12 @@ static void store(const Writer& w, const Hash& k) {
         for (auto& h : w.rsigs)
             if (fresh(g_blobs_on_disk, h)) put('B', h.data(), 20, g_rs_bytes[h].data(), g_rs_bytes[h].size());
         put(w.tag, w.s.data(), w.s.size());
-        fflush(g_db);
+        db_flush();
     }
     if (w.nv.slot != ~0u || w.nv.opts) {
         std::string n(36, '\0');
         memcpy(n.data(), k.data(), 20), memcpy(n.data() + 20, &w.nv, 16);
-        if (fresh(g_keys, key_of('N', n)) && g_db) put('N', n.data(), n.size()), fflush(g_db);
+        if (fresh(g_keys, key_of('N', n)) && g_db) put('N', n.data(), n.size()), db_flush();
     }
 }
 
@@ -1541,7 +1554,7 @@ static void warm_main() {
     std::atomic<bool> d12done{false};
     std::thread t11([&] {  // D3D11 items after the PSOs: done stays "every item below it was compiled"
         while (!d12done) Sleep(20);
-        if ((g_rt_off || g_removed) && g_state != STOP) {  // the retry takes over from the first item not done (D3D11 items after it)
+        if (g_rt_off || g_removed) {  // the retry (or a stopped run's resume) takes over from the first item not done (D3D11 items after it)
             size_t from = first;
             while (from < n12 && (g_item_state[from] == 1 || g_item_state[from] == 2)) ++from;
             if (from < n12) {
@@ -1791,9 +1804,12 @@ static void install_hooks(IUnknown* unk) {
         load_db(g_warm);
         g_csv = _wfopen((g_dir + L"scskiller_creates.csv").c_str(), L"a");
         if (g_csv && !g_staged) {  // a staged scskiller_warm run is a warm-up, not a play session: no marker
-            fprintf(g_csv, "#session,%lld,%ls\n", unix_ms(), exe_name().c_str());
+            g_session_unix = unix_ms();
+            double t = now_ms();  // #clock: the stamp on the t_ms clock, which starts when the recorder loads
+            fprintf(g_csv, "#session,%lld,%ls\n#clock,%.1f\n", g_session_unix, exe_name().c_str(), t);
             fflush(g_csv);
             g_wrote_session = true;
+            g_csv_h = (HANDLE)_get_osfhandle(_fileno(g_csv));
         }
     });
     std::lock_guard l(g_mx);
@@ -1832,7 +1848,7 @@ static size_t insn_len(const uint8_t* p) {
     return n + (mod == 1 ? 1 : mod == 2 ? 4 : 0) + imm;
 }
 
-static void* hook_fn(void* target, void* hook) {
+static void* hook_fn(void* target, void* hook, void** orig) {
     static uint8_t *page, *end;
     auto t = (uint8_t*)target;
     size_t n = 0;
@@ -1863,6 +1879,7 @@ static void* hook_fn(void* target, void* hook) {
     b[0] = 0xE9, memcpy(b + 1, &r32, 4);
     DWORD old;
     if (!VirtualProtect(t, 8, PAGE_EXECUTE_READWRITE, &old)) return nullptr;
+    *orig = tramp;  // before the jmp: a call through it may run at once
     InterlockedExchange64((volatile LONG64*)t, (LONG64)v);
     VirtualProtect(t, 8, old, &old);
     FlushInstructionCache(GetCurrentProcess(), t, 8);
@@ -1942,8 +1959,7 @@ static void nv_hooks() {
     std::string missed;
     for (auto& f : fns) {
         void* p = f.id ? qi(f.id) : (void*)qi;
-        if (void* tr = p ? hook_fn(p, f.hook) : nullptr) *f.orig = tr;
-        else missed += std::string(missed.empty() ? "" : ", ") + f.name + (p ? " (prologue not recognized)" : " (not in this driver)");
+        if (!p || !hook_fn(p, f.hook, f.orig)) missed += std::string(missed.empty() ? "" : ", ") + f.name + (p ? " (prologue not recognized)" : " (not in this driver)");
     }
     logf("nvapi: hooks installed%s%s", missed.empty() ? "" : "; not hooked: ", missed.c_str());
 }
@@ -2022,7 +2038,7 @@ static void hook_below(IUnknown* adapter, D3D_FEATURE_LEVEL fl) {
 // returns, so a wrapper's swap chain (a mod, an overlay, Streamline) calling the real one counts once; PresentMon's
 // FrameTime is the same return-to-return interval. The hook only queues the timestamp; frame_writer writes the file.
 // scskiller_frames.bin, the last launch that presented, u32 records (little-endian):
-//   0xFFFFFFFF + u64 unix_ms, u64 us since the recorder loaded (the csv's t_ms clock), u64 QPC, u64 QPC frequency:
+//   0xFFFFFFFF + u64 unix_ms (the csv's #session stamp), u64 us since the recorder loaded (the csv's t_ms clock), u64 QPC, u64 QPC frequency:
 //     a launch, taken together; the frames after it count from that instant.
 //   top 4 bits 0-14: a frame of that swap chain (0 = the first seen, 14 = the 15th and later), the low 28 bits the
 //     microseconds since the previous frame (or the launch record);
@@ -2099,6 +2115,8 @@ static void sc_patch(void** vt, int slot, void* hook, std::atomic<void*> ScVt::*
     if (vt[slot] == hook) return;
     int n = g_nscvt, i = 0;
     while (i < n && g_scvt[i].vt != vt) ++i;
+    // an overlay hooked the slot after us and calls our hook: taking it as the original would make Present call itself
+    if (i < n && g_scvt[i].*orig && g_scvt[i].*orig != vt[slot]) return;
     if (i == std::size(g_scvt)) return logf("frames: a %zuth swap chain vtable, not hooked", std::size(g_scvt) + 1);
     g_scvt[i].*orig = vt[slot];  // before the slot: a present may run as soon as it's patched
     g_scvt[i].vt = vt;
@@ -2211,13 +2229,10 @@ static void frame_hooks() {
     auto create = m ? (decltype(&CreateDXGIFactory1))GetProcAddress(m, "CreateDXGIFactory1") : nullptr;
     IDXGIFactory* f = nullptr;
     if (!create || FAILED(create(IID_PPV_ARGS(&f)))) return logf("frames: no DXGI factory, frame times not measured");
-    // the vtables stay patched for the life of the process: never unload the code they point at
-    HMODULE self;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)&frame_hooks, &self);
     LARGE_INTEGER q, fq;
     QueryPerformanceFrequency(&fq);
     QueryPerformanceCounter(&q);
-    uint64_t head[4] = {(uint64_t)unix_ms(), (uint64_t)(now_ms() * 1000), (uint64_t)q.QuadPart, (uint64_t)fq.QuadPart};
+    uint64_t head[4] = {(uint64_t)(g_session_unix ? g_session_unix : unix_ms()), (uint64_t)(now_ms() * 1000), (uint64_t)q.QuadPart, (uint64_t)fq.QuadPart};
     memcpy(g_fhead, head, sizeof head);
     g_fenc.qpc0 = q.QuadPart, g_fenc.freq = fq.QuadPart;
     {
@@ -2269,6 +2284,9 @@ extern "C" HRESULT WINAPI Proxy_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE
         logf("d3d12 debug: %s (hr=0x%08x)", SUCCEEDED(dhr) ? "debug layer enabled" : "debug layer unavailable: install the Graphics Tools optional feature", (unsigned)dhr);
     });
     HRESULT hr = real_CreateDevice(adapter, fl, riid, pp);
+    // the hooks stay in the runtime's and nvapi64.dll's code for the life of the process: never unload what they point at
+    HMODULE self;
+    if (SUCCEEDED(hr) && pp && *pp) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)&Proxy_D3D12CreateDevice, &self);
     if (SUCCEEDED(hr) && pp && *pp) install_hooks((IUnknown*)*pp);
     if (SUCCEEDED(hr) && pp && *pp && g_next) hook_below(adapter, fl);
     static std::once_flag nv, frames;
@@ -2361,19 +2379,24 @@ static std::wstring cfg(const wchar_t* env, const wchar_t* key, const wchar_t* d
     return v;
 }
 
-// Split out of DllMain: __try can't share a function with locals that need C++ unwinding (cfg() below returns one).
+// Not through the CRT: at exit the other threads are gone, and one may have died holding the csv stream's lock.
 static void write_end_marker() {
-    __try {
-        fprintf(g_csv, "#end,%lld\n", unix_ms());
-        fflush(g_csv);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    char b[64] = "#end,";
+    char* e = std::to_chars(b + 5, b + sizeof b - 2, unix_ms()).ptr;
+    *e++ = ',';  // then the same instant on the t_ms clock
+    e = std::to_chars(e, b + sizeof b - 2, now_ms(), std::chars_format::fixed, 1).ptr;
+    memcpy(e, "\r\n", 2);  // the csv is a text-mode stream
+    OVERLAPPED at{};
+    at.Offset = at.OffsetHigh = 0xFFFFFFFF;  // append at the file's end
+    DWORD n;
+    WriteFile(g_csv_h, b, DWORD(e + 2 - b), &n, &at);
 }
 
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_DETACH) {
-        // reserved != nullptr: the process is terminating (not a plain FreeLibrary). Best effort, plain CRT calls only,
-        // no g_mx: the loader lock is held here and must never wait on anything.
-        if (reserved && g_wrote_session && g_csv) write_end_marker();
+        // reserved != nullptr: the process is terminating (not a plain FreeLibrary). Best effort, no lock: the loader lock
+        // is held here and must never wait on anything.
+        if (reserved && g_wrote_session) write_end_marker();
         return TRUE;
     }
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
@@ -2395,6 +2418,8 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
         next_why = "not a file name next to this dll";
     else if (*next && !(mod = LoadLibraryW((g_dir + next).c_str())))
         next_why = "failed to load";
+    else if (mod == self)  // its D3D12CreateDevice would call itself
+        next_why = "is this dll", mod = nullptr;
     else if (mod && !GetProcAddress(mod, "D3D12CreateDevice"))
         next_why = "has no D3D12CreateDevice", mod = nullptr;
     auto res = [mod](const char* n) { void* f = mod ? (void*)GetProcAddress(mod, n) : nullptr; return f ? f : (void*)GetProcAddress(g_real, n); };
@@ -2403,13 +2428,17 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
 #undef RES
     real_Ordinal99 = (void*)GetProcAddress(g_real, MAKEINTRESOURCEA(99));  // ordinals are per dll: a mod's 99 is something else
     real_CreateDevice = (PFN_CreateDevice)res("D3D12CreateDevice");
-    g_warm = cfg(L"SCSKILLER_MODE", L"mode", L"record") == L"warm";
+    // Only scskiller_warm (and selftest) export SCSKiller_WarmHost; its staged child runs under the game's exe name, so the
+    // name can't tell. A game given mode=warm records instead.
+    const bool warm_asked = cfg(L"SCSKILLER_MODE", L"mode", L"record") == L"warm";
+    g_warm = warm_asked && GetProcAddress(GetModuleHandleW(nullptr), "SCSKiller_WarmHost");
     g_threads = _wtoi(cfg(L"SCSKILLER_THREADS", L"threads", L"0").c_str());
     if (g_threads <= 0) g_threads = std::max(1, (int)std::thread::hardware_concurrency() - 2);
     if (!g_warm) SetEvent(g_warm_done);
     g_log = _wfopen((g_dir + L"scskiller.log").c_str(), L"a");
     GetModuleFileNameW(nullptr, p, MAX_PATH);
     logf("loaded into %ls", p);
+    if (warm_asked && !g_warm) logf("mode warm ignored: this process isn't scskiller_warm, it records");
     g_next = mod;
     if (mod) logf("next: %ls (the device and every export it has come from it)", next);
     else if (next_why) logf("next: %ls %s: the system d3d12.dll is used without it", next, next_why);

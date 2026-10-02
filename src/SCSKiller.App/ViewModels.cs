@@ -249,7 +249,7 @@ public sealed class GameRow(GameState s, bool queued = false, bool compiling = f
         : [.. m.Take(MaxTags).Select(t => new TagChip(t.Label, Fmt.TagTip(t))),
            .. m.Count > MaxTags ? [new TagChip($"+{m.Count - MaxTags}", string.Join("\n", m.Skip(MaxTags).Select(Fmt.TagTip)))] : Array.Empty<TagChip>()];
     public string Shaders => Fmt.N(s.ShaderCount);
-    public string Pipelines => s.Plan is { } p ? Fmt.N(p.Recorded + p.Generated) : Format.Dash;
+    public string Pipelines => s.Plan is { } p ? Fmt.N(p.Recorded + p.Generated + p.MiddlewareItems) : Format.Dash;
     public string Cache => Fmt.Cache(s);
     public string? CacheTip => Fmt.CacheTip(s);
     public Style CacheStyle => Fmt.Style(CacheTip != null ? "Secondary" : "BodyTextBlockStyle");
@@ -317,6 +317,12 @@ public sealed class StoreGroup(string store, IEnumerable<GameRow> rows) : Observ
     public const string Recommended = "Recommended to compile";
     public string Store => store;
     public string CountText => $"{Count} game{(Count == 1 ? "" : "s")}" + (store == Recommended ? RecommendedNote() : "");
+    // a row replaced in place (compiled, cleared) changes the count of compiled ones
+    protected override void OnCollectionChanged(System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        base.OnCollectionChanged(e);
+        OnPropertyChanged(new System.ComponentModel.PropertyChangedEventArgs(nameof(CountText)));
+    }
     string RecommendedNote() => this.Count(r => r.State.Status == GameStatus.Warmed) is var done and > 0
         ? $" · known to stutter · {done} compiled" : " · known to stutter";
 }
@@ -324,9 +330,9 @@ public sealed class StoreGroup(string store, IEnumerable<GameRow> rows) : Observ
 public sealed class LibraryVm : Bindable
 {
     static bool scanned;
-    readonly BackgroundRead<(CacheUsage Usage, CacheLimit? Limit)> cache;
+    readonly BackgroundRead<(CacheUsage Usage, CacheLimit? Limit, long? Capped)> cache;
 
-    public LibraryVm() => cache = new(() => (App.Core.Vendor.GetCacheUsage(), App.Core.Vendor.GetCacheLimit()), ShowCache);
+    public LibraryVm() => cache = new(() => (App.Core.Vendor.GetCacheUsage(), App.Core.Vendor.GetCacheLimit(), (App.Core.Vendor as AmdBackend)?.AppCache.DxcBytes()), ShowCache);
 
     public ObservableCollection<GameRow> Games { get; } = [];   // every game, sorted; the list shows Groups
     /// <summary>The list: rows matching <see cref="Filter"/> per store, empty stores left out. Filtering reuses the rows
@@ -468,12 +474,13 @@ public sealed class LibraryVm : Bindable
         foreach (var (store, rows) in groups) Groups.Add(new StoreGroup(store, rows));
     }
 
-    void ShowCache((CacheUsage Usage, CacheLimit? Limit) c)
+    // Capped: AMD's limit is of its DirectX 12 cache alone, which the usage counts with the DirectX 11 one
+    void ShowCache((CacheUsage Usage, CacheLimit? Limit, long? Capped) c)
     {
-        var (usage, limit) = c;
+        var (usage, limit, capped) = c;
         CacheUsed = (usage.UpperBound ? "≤ " : "") + Format.Bytes(usage.BytesOnDisk);
-        CacheLimitText = limit is null ? "limit unknown" : limit.Bytes is { } lb ? $"of {Format.Bytes(lb)} limit" : "no limit";
-        CachePercent = limit?.Bytes is { } max && max > 0 ? Math.Min(100, 100.0 * usage.BytesOnDisk / max) : 0;
+        CacheLimitText = limit is null ? "limit unknown" : limit.Bytes is { } lb ? capped is { } cb ? $"· DirectX 12 {Format.Bytes(cb)} of {Format.Bytes(lb)} limit" : $"of {Format.Bytes(lb)} limit" : "no limit";
+        CachePercent = limit?.Bytes is { } max && max > 0 ? Math.Min(100, 100.0 * (capped ?? usage.BytesOnDisk) / max) : 0;
         CacheWarn = limit?.Bytes is not null && (limit.IsDriverDefault || CachePercent > 75);
         CacheWarnText = limit?.IsDriverDefault == true ? "Driver default limit may evict games" : "The cache is nearly full";
         Changed();
@@ -614,6 +621,7 @@ public sealed class DetailVm(string id) : Bindable
             .Concat(Mw.Any(t => t.Label == "DLSS") ? ["DLSS (by the driver)"] : []).ToList() is { Count: > 0 } also
         ? "Also compiles: " + string.Join(" · ", also) : "Detected: " + string.Join(" · ", Mw.Select(t => t.Label));
     public string MiddlewareTip => "Upscaler DLLs next to the game. Their pipelines are compiled with it once a recording of any game has seen that DLL version"
+        + ": on this PC, or for FSR and XeSS on any PC that shares them"
         + (s.Plan is { MiddlewareItems: > 0 } p ? $" (this plan: {Fmt.N(p.MiddlewareItems)} of theirs)" : "") + ".\n\n"
         + string.Join("\n", Mw.Select(Fmt.TagTip));
 
@@ -656,7 +664,8 @@ public sealed class DetailVm(string id) : Bindable
             _ => "The community database",
         }, Fmt.N(p.Recorded), CommunityLine) : null,
         s.Community == null && s.InCommunityDb is { } inDb && !HasDbTeaser ? new("The community database", inDb ? "has a recording for this version" : "not in it yet") : null,
-        p.MiddlewareItems > 0 ? new("Its upscalers, learned from recordings", Fmt.N(p.MiddlewareItems)) : null,
+        p.MiddlewareItems > 0 ? new(p.MiddlewareSharedItems == 0 ? "Its upscalers, learned from recordings"
+            : p.MiddlewareSharedItems == p.MiddlewareItems ? "Its upscalers, from shared packs" : "Its upscalers, from recordings and shared packs", Fmt.N(p.MiddlewareItems)) : null,
         p.D3D11Shaders > 0 ? new("DirectX 11 shaders", Fmt.N(p.D3D11Shaders)) : null,
         p.RtLibraries > 0 ? new("Ray-traced effects", p.RtUncovered == 0 ? "covered" : !Rt ? "mostly covered" : NoAntiCheat ? "need a recording" : "not compiled") : null,
     }.OfType<DetailRow>().ToList();
@@ -674,7 +683,7 @@ public sealed class DetailVm(string id) : Bindable
     Left LeftCase => !NoAntiCheat ? Left.AntiCheat
         : Missing > 0 ? P!.Uncovered * 2 >= Missing ? P.Recorded == 0 ? Left.EngineSlots : Left.UnknownSlots : Left.NotSeen
         : RecordOn ? Left.Recording
-        : L is { } l ? l.Compiles == 0 ? Left.PlayedClean : Left.PlayedCompiles   // what was measured beats what's likely
+        : L is { } l ? PlayCompiles(l) == 0 ? Left.PlayedClean : Left.PlayedCompiles   // what was measured beats what's likely
         : P is { Recorded: > 0 } ? Left.NothingKnown
         : Left.PlayOnly;
     public string LeftText => LeftSentences(tipAsks: false);
@@ -690,7 +699,7 @@ public sealed class DetailVm(string id) : Bindable
             Left.UnknownSlots => "The rest use shader slots SCSKiller can't rebuild yet, so they still compile while you play.",
             Left.NotSeen => "SCSKiller hasn't seen how the game sets the rest up yet." + (tipAsks ? "" : " Playing longer with recording on teaches it."),
             Left.Recording => "Recording is on: anything new you play is added the next time it compiles.",
-            Left.PlayedCompiles => $"Last time you played, {L!.Compiles:N0} still had to compile." + (tipAsks ? "" : " Recording picks them up."),
+            Left.PlayedCompiles => $"Last time you played, {PlayCompiles(L!):N0} still had to compile." + (tipAsks ? "" : " Recording picks them up."),
             _ when Rt => null,   // ray tracing is what's left
             Left.PlayedClean => "Nothing was missing last time you played.",
             Left.NothingKnown => "Nothing SCSKiller knows of is missing.",
@@ -730,10 +739,12 @@ public sealed class DetailVm(string id) : Bindable
     public bool HasShaderCount => s.ShaderCount != null;
     public string ShaderCount => Fmt.N(s.ShaderCount);
     // measured frames when the recorder timed them, else the compile count
-    long? StutterCount => F != null ? ShaderHitches.Count : L?.Compiles;
+    long? StutterCount => F != null ? ShaderHitches.Count : L is { } l ? PlayCompiles(l) : null;
     public string StuttersValue => StutterCount is not { } n ? "" : n == 0 ? "None" : Fmt.N(n);
     public bool HasStutters => StutterCount > 0;
     public bool NoStutters => StutterCount == 0;
+    // without frame times the count is of compiles, which may or may not have stuttered
+    public string StuttersLabel => F != null ? "Stutters last time you played" : "Compiles while you played";
 
     /// <summary>Every count, for power users.</summary>
     public IReadOnlyList<DetailRow> Details => new DetailRow?[]
@@ -800,12 +811,26 @@ public sealed class DetailVm(string id) : Bindable
     public bool HasSession => L != null;
     public bool ShowSessionHint => L == null && NoAntiCheat;
     public string SessionHeader => L is { } l ? $"Last time you played · {Format.Duration(F?.Duration ?? l.Duration)}" : "";
-    public string SessionVerdict => L is not { } l ? ""
-        : (l.Compiles == 0 ? $"Nothing had to compile while you played: all {l.FromGameLibrary + l.CacheHits:N0} shader combinations the game used were ready."
-        : (l.Compiles == 1 ? $"1 had to compile while you played (a {l.WorstCompileMs:0} ms hitch)." : $"{l.Compiles:N0} had to compile while you played (hitches up to {l.WorstCompileMs:0} ms).")
-          + $" The other {l.FromGameLibrary + l.CacheHits:N0} were ready.");
-    public bool HasStateObjectLine => L is { } l && l.StateObjectsReady + l.StateObjectsCompiled > 0;
-    public string StateObjectLine => L is { } l ? $"Ray tracing pipelines: {l.StateObjectsReady:N0} ready, {l.StateObjectsCompiled:N0} compiled while you played." : "";
+    // ray tracing state objects included, so the headline agrees with the ray tracing line under it
+    static long PlayCompiles(SessionStats l) => l.Compiles + l.StateObjectsCompiled;
+    public string SessionVerdict
+    {
+        get
+        {
+            if (L is not { } l) return "";
+            long play = PlayCompiles(l), started = l.StartupCompiles + l.StateObjectsStartupCompiled, ready = l.FromGameLibrary + l.CacheHits + l.StateObjectsReady;
+            if (play + started == 0)
+                return ready > 0 ? $"Nothing had to compile while you played: all {ready:N0} shader combinations the game used were ready." : "Nothing had to compile while you played.";
+            // the longest compile call, of the PSOs only; whether a frame stuttered is the frame report's to say
+            string worst = l.StateObjectsCompiled > 0 ? "" : play == 1 ? $" (it took {l.WorstCompileMs:0} ms)" : $" (the longest took {l.WorstCompileMs:0} ms)";
+            return (play == 0 ? "Nothing had to compile while you played." : $"{play:N0} had to compile while you played{worst}.")
+                + (started > 0 ? $" {started:N0} compiled while the game started." : "")
+                + (ready > 0 ? $" The other {ready:N0} were ready." : "");
+        }
+    }
+    public bool HasStateObjectLine => L is { } l && l.StateObjectsReady + l.StateObjectsCompiled + l.StateObjectsStartupCompiled > 0;
+    public string StateObjectLine => L is { } l ? $"Ray tracing pipelines: {l.StateObjectsReady:N0} ready, {l.StateObjectsCompiled:N0} compiled while you played"
+        + (l.StateObjectsStartupCompiled > 0 ? $", {l.StateObjectsStartupCompiled:N0} while the game started." : ".") : "";
     public bool HasRayQueryLine => L?.RayQueryRecompiles > 0;
     public string RayQueryLine => L is { RayQueryRecompiles: > 0 and var n }
         ? $"{n:N0} ray-traced pipeline{(n == 1 ? "" : "s")} the driver partly recompiles every launch." : "";
@@ -824,7 +849,8 @@ public sealed class DetailVm(string id) : Bindable
     static string Clock(TimeSpan t) => $"{(int)t.TotalMinutes}:{t.Seconds:00}";
     public bool HasHitchRows => F?.Hitches.Count > 0;
 
-    static IEnumerable<Hitch> InPlay(FrameReport f) => f.Hitches.Where(h => h.Cause is HitchCause.Shader or HitchCause.Other);
+    // the frames of play, between startup and quitting, whatever slowed them (a load in play too)
+    static IEnumerable<Hitch> InPlay(FrameReport f) => f.Hitches.Where(h => FrameLog.InPlay(h.At.TotalMilliseconds, h.Ms, f.Startup.TotalMilliseconds) && h.Cause != HitchCause.Quitting);
     static string Ms(double ms) => ms >= 1000 ? $"{ms / 1000:0.0} s" : $"{ms:0} ms";
     static string Cause(HitchCause c) => c switch { HitchCause.Shader => "shader compile", HitchCause.Other => "other hitch", HitchCause.Quitting => "quitting",
         HitchCause.LoadingShaders => "loading, compiling shaders", _ => "loading" };
@@ -855,7 +881,10 @@ public sealed class DetailVm(string id) : Bindable
     public string Compiles => Fmt.N(L?.Compiles);
     public string SessionLabel => L is { } l
         ? $"{l.Requests:N0} requests: {l.FromGameLibrary:N0} from the game's own library, {l.CacheHits:N0} already in the driver cache, {l.Compiles:N0} compiled during play"
-          + (l.StateObjectsReady + l.StateObjectsCompiled > 0 ? $"; ray tracing pipelines {l.StateObjectsReady:N0} ready, {l.StateObjectsCompiled:N0} compiled" : "")
+          + (l.StartupCompiles > 0 ? $", {l.StartupCompiles:N0} while the game started" : "")
+          + (l.RayQueryRecompiles > 0 ? $", {l.RayQueryRecompiles:N0} ray-traced pipelines the driver partly recompiles every launch" : "")
+          + (l.StateObjectsReady + l.StateObjectsCompiled + l.StateObjectsStartupCompiled > 0 ? $"; ray tracing pipelines {l.StateObjectsReady:N0} ready, {l.StateObjectsCompiled:N0} compiled during play" : "")
+          + (l.StateObjectsStartupCompiled > 0 ? $", {l.StateObjectsStartupCompiled:N0} while the game started" : "")
         : "";
 
     public bool? RecordPending { get; set; }   // the state a recorder change that is running (off the UI thread) asked for
@@ -948,6 +977,7 @@ public sealed class QueueVm : Bindable
     public bool Empty => cur == null && Waiting.Count == 0;
     public bool HasFinished => Finished.Count > 0;
     public bool CanStart => !App.Core.QueueRunning && Waiting.Count > 0;
+    public bool CanRaiseLimit => App.Core.Vendor is not AmdBackend;   // AMD's limit is fixed (AmdAppCache.DxcCacheCap)
     public string Summary { get; private set; } = "";
     public string? PlanChecks { get; private set; }   // ScsKiller.PlanCheckLine
     public bool HasPlanChecks => PlanChecks != null;
@@ -1156,7 +1186,7 @@ public sealed class SettingsVm : Bindable
     public string BackgroundThreadsText => $"{S.BackgroundThreads} of {Environment.ProcessorCount}";
     public double MaxThreads => Environment.ProcessorCount;
     public bool HasLastRebuilt => LastRebuilt != "";
-    public string LastRebuilt => App.Core.Games.Select(g => g.WarmedDriverVersion).Where(v => v != null).Max() is { } v ? $"Last rebuilt for driver {v}" : "";
+    public string LastRebuilt => App.Core.Games.Where(g => g.WarmedDriverVersion != null).MaxBy(g => g.WarmedAt)?.WarmedDriverVersion is { } v ? $"Last rebuilt for driver {v}" : "";
 
     public bool? MaximumPlans { get => S.MaximumPlans; set { if (value is { } v && v != S.MaximumPlans) S = S with { MaximumPlans = v }; } }
     public bool? ShareRecordings { get => S.ShareRecordings; set { if (value is { } v && v != S.ShareRecordings) S = S with { ShareRecordings = v }; } }
@@ -1279,12 +1309,14 @@ public sealed class AccountVm : Bindable
     List<string> labels = [];
     public List<string> ChannelLabels => labels.SequenceEqual(Offered.Select(c => ChannelNames[c])) ? labels : labels = Offered.Select(c => ChannelNames[c]).ToList();   // same list: the ComboBox keeps its selection
     public bool ShowsChannels => A.SignedIn && Offered.Count > 1;
+    public bool CanPickChannel => !Updater.Restarting;
+    public bool CanSignOut => Idle && !Updater.Restarting;   // signing out can change the channel a restart applies
     public int ChannelIndex
     {
         get => Math.Max(0, Offered.ToList().IndexOf(Chosen));
         set
         {
-            if (value < 0 || value >= Offered.Count || Offered[value] == Chosen) return;   // -1: the list was replaced
+            if (value < 0 || value >= Offered.Count || Offered[value] == Chosen || Updater.Restarting) return;   // -1: the list was replaced
             App.Core.Settings = App.Core.Settings with { UpdateChannel = Offered[value] };
             _ = Updater.CheckAsync();
             Changed();

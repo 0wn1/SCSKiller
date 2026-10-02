@@ -180,10 +180,11 @@ public class TessellationTests
         }
         double[] Times(string work, string exe)
         {
-            var psi = new System.Diagnostics.ProcessStartInfo(Path.Combine(Bin, "scskiller_warm.exe"), [work, exe, "--threads", "1"]) { RedirectStandardOutput = true, UseShellExecute = false };
+            var psi = new System.Diagnostics.ProcessStartInfo(Path.Combine(Bin, "scskiller_warm.exe"), [work, exe, "--threads", "1"]) { StandardOutputEncoding = System.Text.Encoding.UTF8, RedirectStandardOutput = true, UseShellExecute = false };
             psi.Environment["SCSKILLER_WARM_TIMES"] = "1";
-            using (var pr = System.Diagnostics.Process.Start(psi)!) { pr.StandardOutput.ReadToEnd(); pr.WaitForExit(); }
-            var rows = File.ReadAllLines(Path.Combine(work, "stage", "scskiller_warm_times.csv")).Select(l => l.Split(',')).OrderBy(x => int.Parse(x[0])).ToList();
+            string o;
+            using (var pr = System.Diagnostics.Process.Start(psi)!) { o = pr.StandardOutput.ReadToEnd(); pr.WaitForExit(); }
+            var rows = File.ReadAllLines(Path.Combine(TestEnv.WarmStage(o, work), "scskiller_warm_times.csv")).Select(l => l.Split(',')).OrderBy(x => int.Parse(x[0])).ToList();
             Assert.All(rows, x => Assert.Equal("1", x[2])); // created
             return rows.Select(x => double.Parse(x[1], System.Globalization.CultureInfo.InvariantCulture)).ToArray();
         }

@@ -24,6 +24,12 @@ static partial class TestEnv
     /// <summary>Another tool's GPU lock exists: measure nothing.</summary>
     public static bool GpuBusyElsewhere => BusyFile != null && File.Exists(BusyFile);
 
+    /// <summary>A scskiller_warm run's own staging folder (its log and outputs), from the stage event in its stdout; an older
+    /// warmer's is <paramref name="work"/>\stage, as the app takes it.</summary>
+    public static string WarmStage(string stdout, string work) =>
+        stdout.Split('\n').Select(l => SCSKiller.Core.Warming.WarmEvent.Parse(l.Trim())).FirstOrDefault(e => e?.Event == "stage")?.Stage
+        ?? Path.Combine(work, "stage");
+
     static TestEnv()
     {
         string? dev = Env("SCSKILLER_DEV_DIR"), busy = Env("SCSKILLER_GPU_BUSY_FILE");

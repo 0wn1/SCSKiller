@@ -11,7 +11,7 @@ public class FrameLogTests(ITestOutputHelper output) : IDisposable
 
     /// <summary>A launch record (unix ms, us since the recorder loaded) and frames that return at <paramref name="endsMs"/>,
     /// as the proxy writes them: microsecond deltas, a skip record for a gap past 28 bits.</summary>
-    static byte[] Launch(long unixMs, long loadedUs, IEnumerable<double> endsMs, uint chain = 0)
+    internal static byte[] Launch(long unixMs, long loadedUs, IEnumerable<double> endsMs, uint chain = 0)
     {
         var b = new List<byte>();
         void U32(uint v) => b.AddRange(BitConverter.GetBytes(v));
@@ -32,7 +32,7 @@ public class FrameLogTests(ITestOutputHelper output) : IDisposable
 
     /// <summary>Slow frames get their cause from the creates that overlap them on the recorder's clock: a compile of 10 ms or
     /// more (not a RayQuery PSO at the driver's floor, not a ray tracing state object under SessionLog.StateObjectCompileMs) is a shader stutter,
-    /// none is another hitch, the startup (with a burst following it closely and a slow frame with no create right after it) or
+    /// none is another hitch, the startup (with a burst following it closely; a slow frame with no create after it is play) or
     /// a load in play of 100 fast creates or more is loading; cold compiles filling a frame make it "loading, compiling
     /// shaders" in startup and a shader stutter in play, one in
     /// the last 10 s is quitting, and a frame of 5 s or more
@@ -50,8 +50,9 @@ public class FrameLogTests(ITestOutputHelper output) : IDisposable
         for (int i = 0; i < 120; i++) csv.Add($"{24100 + i:0.0},S,1,1,1.000,{i + 1000:x40},0.010,9,0");   // a load
         for (int i = 0; i < 110; i++) csv.Add($"{25100 + i:0.0},S,1,1,150.000,{i + 3000:x40},0.010,9,0");   // a load in play that compiles
         for (int i = 0; i < 150; i++) csv.Add($"{7100 + i * 0.5:0.0},S,1,1,1.000,{i + 2000:x40},0.010,9,0");   // a second startup burst
-        csv.Add("#session,1000000000,Other.exe");
-        File.WriteAllLines(Path.Combine(_dir, "scskiller_creates.csv"), csv);
+        // the recorder writes rows in time order (one lock around the clock and the write)
+        File.WriteAllLines(Path.Combine(_dir, "scskiller_creates.csv"),
+            [csv[0], .. csv.Skip(1).OrderBy(r => double.Parse(r.Split(',')[0], System.Globalization.CultureInfo.InvariantCulture)), "#session,1000000000,Other.exe"]);
 
         var ends = new List<double>();
         void Frame(double ms) => ends.Add(ends[^1] + ms);
@@ -69,20 +70,381 @@ public class FrameLogTests(ITestOutputHelper output) : IDisposable
             .. Launch(1_000_000_010, 0, [1, 2, 3])]);
 
         var r = FrameLog.Read(bin, Path.Combine(_dir, "scskiller_creates.csv"), "game.exe", new HashSet<string> { "bb" })!;
-        Assert.Equal(TimeSpan.FromMilliseconds(9200), r.Startup);   // the burst 5 s after the first quiet second, then a frame with no create
+        Assert.Equal(TimeSpan.FromMilliseconds(8000), r.Startup);   // the burst 5 s after the first quiet second; the frame with no create after it is play
         Assert.Equal(ends.Count - 1, r.Frames);
         Assert.Equal(TimeSpan.FromMilliseconds(ends[^1]), r.Duration);
-        Assert.Equal([(500.0, 500.0, HitchCause.LoadingShaders), (8500, 700, HitchCause.Loading), (15000, 80, HitchCause.Shader), (18000, 70, HitchCause.Other),
+        Assert.Equal([(500.0, 500.0, HitchCause.LoadingShaders), (8500, 700, HitchCause.Other), (15000, 80, HitchCause.Shader), (18000, 70, HitchCause.Other),
             (21000, 120, HitchCause.Other), (23000, 90, HitchCause.Shader), (24000, 300, HitchCause.Loading), (25000, 400, HitchCause.Shader), (27000, 60, HitchCause.Other),
             (429_500, 80, HitchCause.Quitting)],
             r.Hitches.Select(h => (Math.Round(h.At.TotalMilliseconds, 3), Math.Round(h.Ms, 3), h.Cause)));
-        var play = ends.Zip(ends.Skip(1), (a, b) => (a, ms: b - a)).Where(f => f.a >= 9200 && f.a < ends[^1] - 10_000 && f.ms < 5000).Select(f => f.ms).OrderDescending().ToList();
+        var play = ends.Zip(ends.Skip(1), (a, b) => (a, ms: b - a)).Where(f => f.a >= 8000 && f.a < ends[^1] - 10_000 && f.ms < 5000).Select(f => f.ms).OrderDescending().ToList();
         var slow = play.Take(play.Count / 100).ToList();
         Assert.Equal(1000 * slow.Count / slow.Sum(), r.Low1PctFps, 6);
         Assert.Equal(FrameLog.GraphColumns, r.Peaks.Count);
         Assert.Equal(300, r.Peaks[(int)(24000 / ends[^1] * FrameLog.GraphColumns)], 3);   // each slice keeps its longest frame
 
         Assert.Null(FrameLog.Read(Path.Combine(_dir, "none.bin"), Path.Combine(_dir, "scskiller_creates.csv")));
+    }
+
+    /// <summary>A startup burst that never goes quiet before its creates end is startup through its last second: a slow
+    /// frame there that cold compiles fill is loading, not a shader stutter.</summary>
+    [Fact]
+    public void A_burst_that_runs_to_the_last_create_is_startup_to_its_end()
+    {
+        var csv = new List<string> { "#session,1000000,Game.exe" };
+        for (int i = 0; i < 200; i++) csv.Add($"{10 * i:0.0},S,0,0,{(i % 2 == 0 ? "900.000" : "0.500")}");
+        File.WriteAllLines(Path.Combine(_dir, "scskiller_creates.csv"), csv);
+        var ends = Every10Ms(0, 1500).Append(1800).Concat(Every10Ms(1810, 20_000)).ToList();
+        var bin = Path.Combine(_dir, FrameLog.FileName);
+        File.WriteAllBytes(bin, Launch(1_000_050, 0, ends));
+
+        var r = FrameLog.Read(bin, Path.Combine(_dir, "scskiller_creates.csv"))!;
+        Assert.Equal(TimeSpan.FromSeconds(2), r.Startup);
+        Assert.Equal([(1490.0, 310.0, HitchCause.LoadingShaders)], r.Hitches.Select(h => (Math.Round(h.At.TotalMilliseconds, 3), Math.Round(h.Ms, 3), h.Cause)));
+    }
+
+    /// <summary>Cache hits in play at a steady 30 a second don't hold startup open: it ends with the burst's compiles, and a
+    /// compile a minute later is in play, a shader stutter in the frame report and the session's one compile.</summary>
+    [Fact]
+    public void A_trickle_of_cache_hits_in_play_ends_the_startup()
+    {
+        var csv = new List<string> { "#session,1000000,Game.exe" };
+        for (int i = 0; i < 200; i++) csv.Add($"{10 * i:0.0},S,0,0,{(i % 2 == 0 ? "900.000" : "0.500")}");
+        for (int s = 2; s < 60; s++)
+            for (int j = 0; j < 30; j++) csv.Add($"{s * 1000 + j * 33:0.0},S,1,1,{(s == 59 && j == 21 ? "200.000" : "0.500")}");   // a compile ending at 59.7 s
+        csv.Add("#end,1080000");
+        var path = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(path, csv);
+        var ends = Every10Ms(0, 59_500).Append(59_500).Append(59_800).Concat(Every10Ms(59_810, 80_000)).ToList();
+        var bin = Path.Combine(_dir, FrameLog.FileName);
+        File.WriteAllBytes(bin, Launch(1_000_050, 0, ends));
+
+        var r = FrameLog.Read(bin, path)!;
+        Assert.Equal(TimeSpan.FromSeconds(2), r.Startup);
+        Assert.Equal([(59_500.0, 300.0, HitchCause.Shader)], r.Hitches.Select(h => (Math.Round(h.At.TotalMilliseconds, 3), Math.Round(h.Ms, 3), h.Cause)));
+        var l = SessionLog.Read(path).Last!;
+        Assert.Equal((1L, 200.0, 100L), (l.Compiles, l.WorstCompileMs, l.StartupCompiles));
+    }
+
+    /// <summary>A warmed run's precompile is all cache hits: its burst is startup, and the hits after it, with no compile,
+    /// aren't.</summary>
+    [Fact]
+    public void A_warmed_precompile_of_cache_hits_is_the_startup()
+    {
+        var csv = new List<string> { "#session,1000000,Game.exe" };
+        for (int i = 0; i < 600; i++) csv.Add($"{i * 10 / 3.0:0.0},S,1,1,0.500");   // 300 a second for 2 s
+        for (int s = 2; s < 20; s++)
+            for (int j = 0; j < 20; j++) csv.Add($"{s * 1000 + j * 50:0.0},S,1,1,0.500");
+        var path = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(path, csv);
+        var bin = Path.Combine(_dir, FrameLog.FileName);
+        File.WriteAllBytes(bin, Launch(1_000_050, 0, Every10Ms(0, 40_000)));
+        Assert.Equal(TimeSpan.FromSeconds(2), FrameLog.Read(bin, path)!.Startup);
+    }
+
+    /// <summary>A launch's creates as the recorder writes them, in time order: a warmed precompile of 300 cache hits a second
+    /// for 2 s, then <paramref name="rest"/> (t_ms, "kind,known,tuple_known,ms").</summary>
+    string WarmedLaunch(IEnumerable<(double T, string Row)> rest)
+    {
+        var rows = Enumerable.Range(0, 600).Select(i => (T: i * 10 / 3.0, Row: "S,1,1,0.500")).Concat(rest).OrderBy(r => r.T);
+        var path = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(path, ["#session,1000000,Game.exe", .. rows.Select(r => $"{r.T:0.0},{r.Row}")]);
+        return path;
+    }
+
+    /// <summary>Frames of 10 ms to <paramref name="to"/> ms, but one of <paramref name="ms"/> from <paramref name="at"/>.</summary>
+    string FramesWithOneSlow(double at, double ms, double to)
+    {
+        var bin = Path.Combine(_dir, FrameLog.FileName);
+        File.WriteAllBytes(bin, Launch(1_000_050, 0, Every10Ms(0, at).Append(at).Append(at + ms).Concat(Every10Ms(at + ms + 10, to))));
+        return bin;
+    }
+
+    static IEnumerable<(double, string)> PerSecond(int from, int to, int n, string row) =>
+        Enumerable.Range(from, to - from).SelectMany(s => Enumerable.Range(0, n).Select(j => (s * 1000 + j * 1000.0 / n, row)));
+
+    /// <summary>Loads from the game's pipeline library aren't compiles, in the frame report as in the last session: 30 a
+    /// second at 4 ms after the startup don't hold it open, so both put a compile a minute later in play.</summary>
+    [Fact]
+    public void Library_loads_hold_neither_reports_startup_open()
+    {
+        var csv = WarmedLaunch([.. PerSecond(2, 60, 30, "s,1,1,4.000"), (59_693, "S,0,0,200.000")]);
+        var r = FrameLog.Read(FramesWithOneSlow(59_500, 300, 80_000), csv)!;
+        Assert.Equal(TimeSpan.FromSeconds(2), r.Startup);
+        Assert.Equal([HitchCause.Shader], r.Hitches.Select(h => h.Cause));
+        var l = SessionLog.Read(csv).Last!;
+        Assert.Equal((1L, 200.0, 0L), (l.Compiles, l.WorstCompileMs, l.StartupCompiles));
+    }
+
+    /// <summary>A burst extends startup only when it starts within 10 s of the first quiet window, never chained from one
+    /// burst to the next: traversal bursts every 10 s in play leave a compile in one of them in play.</summary>
+    [Fact]
+    public void Bursts_extend_startup_only_from_its_first_quiet_window()
+    {
+        var bursts = new[] { 10, 20, 30, 40, 50, 60 }.SelectMany(s => Enumerable.Range(0, 120)
+            .Select(m => (s * 1000 + m * 8.0, s == 50 && m == 87 ? "S,0,0,200.000" : "S,1,1,0.500")));   // a compile ending at 50.696 s
+        var csv = WarmedLaunch([.. PerSecond(2, 70, 30, "S,1,1,0.500"), .. bursts]);
+        var r = FrameLog.Read(FramesWithOneSlow(50_500, 300, 80_000), csv)!;
+        Assert.Equal(TimeSpan.FromSeconds(11), r.Startup);
+        Assert.Equal([HitchCause.Shader], r.Hitches.Select(h => h.Cause));
+        var l = SessionLog.Read(csv).Last!;
+        Assert.Equal((1L, 200.0, 0L), (l.Compiles, l.WorstCompileMs, l.StartupCompiles));
+    }
+
+    /// <summary>Create timing alone can't tell a menu's background compiles from play: in doubt they count as play. A
+    /// launch that compiles without a quiet window is all startup.</summary>
+    [Fact]
+    public void Background_compiles_after_the_startup_count_as_play_and_nonstop_compiling_is_all_startup()
+    {
+        var menu = PerSecond(2, 20, 30, "S,1,1,0.500").Concat(new[] { 6693.0, 10_693, 14_693, 18_693 }.Select(t => (t, "S,0,0,200.000")));
+        var l = SessionLog.Read(WarmedLaunch([.. menu, (30_700, "S,0,0,200.000")])).Last!;
+        Assert.Equal((5L, 0L), (l.Compiles, l.StartupCompiles));
+
+        var csv = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(csv, ["#session,1000000,Game.exe", .. Enumerable.Range(0, 200).Select(i => $"{10 * i:0.0},S,0,0,{(i % 2 == 0 ? "900.000" : "0.500")}"),
+            .. PerSecond(2, 60, 30, "S,0,0,25.000").Select(c => $"{c.Item1:0.0},{c.Item2}"), "59990.0,S,0,0,200.000"]);
+        l = SessionLog.Read(csv).Last!;
+        Assert.Equal((0L, 1841L), (l.Compiles, l.StartupCompiles));
+    }
+
+    /// <summary>The slow-frame extension (a frame with no create right after startup) never moves startup over a compile
+    /// the last session counts as play.</summary>
+    [Fact]
+    public void The_slow_frame_extension_stops_at_a_compile_in_play()
+    {
+        var csv = WarmedLaunch([(2300, "S,0,0,200.000"), (15_000, "S,1,1,0.500")]);
+        var ends = Every10Ms(0, 2100).Append(2100).Append(2400).Concat(Every10Ms(2410, 3000)).Append(3000).Append(6000).Concat(Every10Ms(6010, 20_000));
+        var bin = Path.Combine(_dir, FrameLog.FileName);
+        File.WriteAllBytes(bin, Launch(1_000_050, 0, ends));
+        var r = FrameLog.Read(bin, csv)!;
+        Assert.Equal(TimeSpan.FromSeconds(2), r.Startup);
+        Assert.Equal([(2100.0, HitchCause.Shader), (3000, HitchCause.Other)], r.Hitches.Select(h => (Math.Round(h.At.TotalMilliseconds, 3), h.Cause)));
+        Assert.Equal((1L, 0L), (SessionLog.Read(csv).Last!.Compiles, SessionLog.Read(csv).Last!.StartupCompiles));
+    }
+
+    /// <summary>The 10 s for a burst to extend startup count from the first quiet point in real time: a burst starting
+    /// 10.5 s after it is play.</summary>
+    [Fact]
+    public void A_burst_starting_past_the_10_s_is_play()
+    {
+        var csv = WarmedLaunch(Enumerable.Range(0, 100).Select(i => (12_500 + i * 0.1, "S,0,0,100.000")));
+        Assert.Equal((100L, 0L), (SessionLog.Read(csv).Last!.Compiles, SessionLog.Read(csv).Last!.StartupCompiles));
+    }
+
+    /// <summary>A launch that quits while still busy has no quiet window: the seconds after its end aren't quiet ones, so
+    /// it is all startup.</summary>
+    [Fact]
+    public void A_launch_that_ends_while_busy_is_all_startup()
+    {
+        var csv = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(csv, ["#session,2000,Game.exe", .. PerSecond(0, 60, 30, "S,0,0,25.000").Select(c => $"{c.Item1:0.0},{c.Item2}"),
+            "60000.0,S,0,0,25.000", "60033.3,S,0,0,25.000", "#end,62050"]);
+        var l = SessionLog.Read(csv).Last!;
+        Assert.Equal((0L, 1802L), (l.Compiles, l.StartupCompiles));
+    }
+
+    /// <summary>One convention for both reports: a compile ending exactly at the end of startup, and the frame it fills,
+    /// are startup's.</summary>
+    [Fact]
+    public void A_compile_ending_at_the_startup_boundary_is_startup_in_both_reports()
+    {
+        var csv = WarmedLaunch([(2000, "S,0,0,200.000"), (15_000, "S,1,1,0.500")]);
+        var r = FrameLog.Read(FramesWithOneSlow(1800, 200, 20_000), csv)!;
+        Assert.Equal(TimeSpan.FromSeconds(2), r.Startup);
+        Assert.Equal([HitchCause.LoadingShaders], r.Hitches.Select(h => h.Cause));
+        Assert.Equal((0L, 1L), (SessionLog.Read(csv).Last!.Compiles, SessionLog.Read(csv).Last!.StartupCompiles));
+    }
+
+    /// <summary>Both reports split the csv into launches the same way: rows after a launch's #end are another process's, a
+    /// launch without a stamp, which the frame report doesn't match and the last session reads on its own.</summary>
+    [Fact]
+    public void Rows_after_an_end_marker_are_a_launch_of_their_own_in_both_reports()
+    {
+        var csv = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(csv, ["#session,1000000,Game.exe", .. Enumerable.Range(0, 200).Select(i => $"{10 * i:0.0},S,0,0,{(i % 2 == 0 ? "900.000" : "0.500")}"),
+            "#end,1060000", "61000.0,S,0,0,200.000"]);
+        var r = FrameLog.Read(FramesWithOneSlow(60_900, 300, 80_000), csv)!;
+        Assert.Equal(TimeSpan.FromSeconds(2), r.Startup);
+        Assert.Equal([HitchCause.Other], r.Hitches.Select(h => h.Cause));   // the compile after #end isn't this launch's
+        var (last, exe, _) = SessionLog.Read(csv);
+        Assert.Equal(1, last!.Requests);
+        Assert.Equal("Game.exe", exe!.Name);
+    }
+
+    /// <summary>The csv's times count from the recorder's load, its stamps from the first device: #clock puts the stamps on
+    /// the csv's clock, so an #end 6 s after a #session taken at t_ms 20 s ends the launch at 26 s.</summary>
+    [Fact]
+    public void Unix_stamps_go_onto_the_recorders_clock()
+    {
+        var csv = Path.Combine(_dir, "scskiller_creates.csv");
+        string[] rows = [.. PerSecond(20, 22, 30, "S,0,0,25.000").Select(c => $"{c.Item1:0.0},{c.Item2}"), "22000.0,S,0,0,25.000", "22033.0,S,0,0,25.000"];
+        File.WriteAllLines(csv, ["#session,1020000,Game.exe", "#clock,20000.0", .. rows, "#end,1026000,26000.0"]);
+        Assert.Equal((1L, TimeSpan.FromSeconds(26)), (SessionLog.Read(csv).Last!.Compiles, SessionLog.Read(csv).Last!.Duration));
+        File.WriteAllLines(csv, ["#session,1020000,Game.exe", "#clock,20000.0", .. rows, "#end,1026000"]);   // #end's stamp alone
+        Assert.Equal(1, SessionLog.Read(csv).Last!.Compiles);
+        var played = new PlayWindow(DateTimeOffset.FromUnixTimeMilliseconds(1_019_000), DateTimeOffset.FromUnixTimeMilliseconds(1_026_000));
+        File.WriteAllLines(csv, ["#session,1020000,Game.exe", "#clock,20000.0", .. rows]);   // no #end: the watched exit
+        Assert.Equal(1, SessionLog.Read(csv, played: played).Last!.Compiles);
+    }
+
+    /// <summary>A recorder that writes #clock stamps the csv launch and the frames file alike: a frames file of an earlier
+    /// launch, 6 s before, isn't this launch's, so its frames don't lend this one a quiet window it never had.</summary>
+    [Fact]
+    public void A_launch_never_borrows_another_launchs_frames()
+    {
+        var csv = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(csv, ["#session,1000000,Game.exe", "#clock,10.0", .. Every10Ms(10, 5000).Select(t => $"{t:0.0},S,1,1,0.500"), "#end,1005000,5000.0",
+            "#session,1006000,Game.exe", "#clock,10.0", .. Enumerable.Range(0, 600).Select(i => $"{10 + i * 10 / 3.0:0.0},S,1,1,0.500"),
+            "2033.0,S,0,0,200.000", "#end,1008050,2050.0"]);
+        var bin = Path.Combine(_dir, FrameLog.FileName);
+        File.WriteAllBytes(bin, Launch(1_000_000, 10_000, Every10Ms(10, 5600)));   // the first launch's, past the second's 2-5 s window
+        var frames = FrameLog.Read(bin, csv);
+        var l = SessionLog.Read(csv, frames: frames).Last!;
+        Assert.Equal((0L, 1L), (l.Compiles, l.StartupCompiles));   // it quit busy: all startup
+    }
+
+    /// <summary>Another exe's launch after the game's isn't the game's last session, as it isn't its frame report.</summary>
+    [Fact]
+    public void The_last_session_is_the_exes_own()
+    {
+        var csv = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(csv, ["#session,1000000,Game.exe", "1.0,S,1,1,0.500", "#end,1060000", "#session,2000000,Other.exe", "1.0,S,0,0,25.000", "#end,2060000"]);
+        var l = SessionLog.Read(csv, "game.exe").Last!;
+        Assert.Equal((1L, 0L), (l.Requests, l.Compiles));
+        Assert.Equal(1, SessionLog.Read(csv).Last!.Compiles);   // no exe given: the last launch, whoever's
+    }
+
+    /// <summary>A slow load from the game's own pipeline library isn't a compile, in the frame report as in the session.</summary>
+    [Fact]
+    public void A_library_load_is_no_shader_stutter()
+    {
+        var csv = WarmedLaunch([(30_100, "s,1,1,200.000"), (50_000, "S,1,1,0.500")]);
+        var r = FrameLog.Read(FramesWithOneSlow(29_900, 300, 60_000), csv)!;
+        Assert.Equal([HitchCause.Other], r.Hitches.Select(h => h.Cause));
+        Assert.Equal((1L, 0L), (SessionLog.Read(csv).Last!.FromGameLibrary, SessionLog.Read(csv).Last!.Compiles));
+    }
+
+    /// <summary>A shader freeze of 5 s or more is play, in the 1% low; only a frame of 5 s with no compile (a pause) is
+    /// left out.</summary>
+    [Fact]
+    public void A_long_shader_freeze_counts_in_the_1_percent_low()
+    {
+        var csv = WarmedLaunch([(36_000, "S,0,0,6000.000"), (60_000, "S,1,1,0.500")]);
+        var r = FrameLog.Read(FramesWithOneSlow(30_000, 6000, 80_000), csv)!;
+        Assert.Equal([HitchCause.Shader], r.Hitches.Select(h => h.Cause));
+        Assert.True(r.Low1PctFps < 20, $"1% low {r.Low1PctFps}");
+        var paused = FrameLog.Read(FramesWithOneSlow(30_000, 6000, 80_000), WarmedLaunch([(60_000, "S,1,1,0.500")]))!;
+        Assert.Empty(paused.Hitches);
+        Assert.True(paused.Low1PctFps > 90, $"1% low {paused.Low1PctFps}");
+    }
+
+    /// <summary>An ordinary hitch after the startup is play, however close: a hitch every second leaves the startup at the
+    /// shared boundary, and never chains it on.</summary>
+    [Fact]
+    public void Hitches_after_the_startup_never_chain_into_it()
+    {
+        var csv = WarmedLaunch([]);
+        var ends = new List<double>();
+        for (double t = 0; t < 80_000; t += 10)
+            if (t % 1000 != 0 || t < 3000 || t > 59_000) ends.Add(t);
+            else { ends.Add(t); ends.Add(t + 100); t += 100; }   // a 100 ms frame starting at every second from 3 s to 59 s
+        var bin = Path.Combine(_dir, FrameLog.FileName);
+        File.WriteAllBytes(bin, Launch(1_000_050, 0, ends));
+        var r = FrameLog.Read(bin, csv)!;
+        Assert.Equal(TimeSpan.FromSeconds(2), r.Startup);
+        Assert.Equal(57, r.Hitches.Count(h => h.Cause == HitchCause.Other));
+        Assert.True(r.Low1PctFps > 0);
+    }
+
+    /// <summary>A slow frame with no create that the startup boundary falls inside is startup's to its end, within the 10 s
+    /// after the first quiet point that bursts get; one past it, or one after the boundary, is play.</summary>
+    [Theory]
+    [InlineData(1998, 1000, 2998, "Loading")]     // after the precompile's last create, across the 2 s boundary: startup to its end
+    [InlineData(1998, 11_000, 2000, "")]          // would end past 2 s + 10 s: play (a pause, so no hitch)
+    [InlineData(3000, 100, 2000, "Other")]        // a hitch at 3 s: play
+    [InlineData(4000, 26_000, 2000, "")]          // 4-30 s: play (a pause)
+    public void A_slow_frame_extends_the_startup_only_across_its_boundary_and_within_the_allowance(double at, double ms, double startup, string cause)
+    {
+        var csv = WarmedLaunch([(70_000, "S,1,1,0.500")]);
+        var r = FrameLog.Read(FramesWithOneSlow(at, ms, 90_000), csv)!;
+        Assert.Equal(TimeSpan.FromMilliseconds(startup), r.Startup);
+        Assert.Equal(cause == "" ? [] : [Enum.Parse<HitchCause>(cause)], r.Hitches.Select(h => h.Cause));
+    }
+
+    /// <summary>A burst within the 10 s after the first quiet point extends startup no further than those 10 s, and not
+    /// at all when a compile in play came before it.</summary>
+    [Fact]
+    public void Bursts_stay_inside_the_allowance_and_after_no_play_compile()
+    {
+        var late = WarmedLaunch([.. PerSecond(11, 20, 100, "S,0,0,25.000"), (90_000, "S,1,1,0.500")]);
+        var l = SessionLog.Read(late).Last!;
+        Assert.Equal((101L, 799L), (l.StartupCompiles, l.Compiles));   // the 11 s burst to 12 s (the one ending at 12.000 s too), the rest play
+        var toExit = WarmedLaunch([.. PerSecond(11, 30, 100, "S,0,0,25.000")]);
+        Assert.Equal(101, SessionLog.Read(toExit).Last!.StartupCompiles);   // runs to the exit: still 12 s, not infinity
+
+        var after = WarmedLaunch([(3300, "S,0,0,200.000"), .. PerSecond(8, 9, 100, "S,1,1,0.500"), (60_000, "S,1,1,0.500")]);
+        Assert.Equal((1L, 0L), (SessionLog.Read(after).Last!.Compiles, SessionLog.Read(after).Last!.StartupCompiles));
+        var r = FrameLog.Read(FramesWithOneSlow(3100, 300, 70_000), after)!;
+        Assert.Equal(TimeSpan.FromSeconds(2), r.Startup);
+        Assert.Equal([HitchCause.Shader], r.Hitches.Select(h => h.Cause));
+    }
+
+    /// <summary>A frame is play's by its end, in its cause, the play counts and the 1% low alike: one across the startup
+    /// boundary that a compile fills is a shader stutter in play and the 1% low.</summary>
+    [Fact]
+    public void A_frame_across_the_boundary_is_plays_everywhere()
+    {
+        var csv = WarmedLaunch([(2100, "S,0,0,200.000"), (60_000, "S,1,1,0.500")]);
+        var r = FrameLog.Read(FramesWithOneSlow(1998, 202, 70_000), csv)!;
+        Assert.Equal(TimeSpan.FromSeconds(2), r.Startup);
+        var h = Assert.Single(r.Hitches);
+        Assert.Equal(HitchCause.Shader, h.Cause);
+        Assert.True(FrameLog.InPlay(h.At.TotalMilliseconds, h.Ms, r.Startup.TotalMilliseconds));
+        Assert.True(r.Low1PctFps < 90, $"1% low {r.Low1PctFps}");   // the 202 ms frame is in it (100 fps without it)
+    }
+
+    /// <summary>An older recorder's frames (no #clock) belong to a launch only when it is the only one stamped within 10 s:
+    /// two launches 6 s apart show no frames next to either.</summary>
+    [Fact]
+    public void Legacy_frames_near_two_launches_belong_to_neither()
+    {
+        var csv = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(csv, ["#session,1000000,Game.exe", "10.0,S,1,1,0.500", "#end,1005000", "#session,1006000,Game.exe", "20.0,S,0,0,25.000", "#end,1008050"]);
+        var bin = Path.Combine(_dir, FrameLog.FileName);
+        File.WriteAllBytes(bin, Launch(1_000_050, 0, Every10Ms(0, 5000)));
+        var frames = FrameLog.Read(bin, csv);
+        SessionLog.Read(csv, out var match, frames: frames);
+        Assert.False(match);
+        File.WriteAllLines(csv, ["#session,1000000,Game.exe", "10.0,S,1,1,0.500", "#end,1005000", "#session,1020000,Game.exe", "20.0,S,0,0,25.000", "#end,1022050"]);
+        SessionLog.Read(csv, out match, frames: FrameLog.Read(bin, csv));
+        Assert.False(match);   // the frames are the first launch's, the session the second's
+        File.WriteAllLines(csv, ["#session,1000000,Game.exe", "10.0,S,1,1,0.500", "#end,1005000"]);
+        SessionLog.Read(csv, out match, frames: FrameLog.Read(bin, csv));
+        Assert.True(match);
+    }
+
+    /// <summary>A frame of 5 s is a pause only when nothing compiled under it: a short compile keeps it in play.</summary>
+    [Fact]
+    public void A_long_frame_with_any_compile_is_no_pause()
+    {
+        var csv = WarmedLaunch([(31_000, "S,0,0,5.000"), (60_000, "S,1,1,0.500")]);
+        var r = FrameLog.Read(FramesWithOneSlow(30_000, 6000, 80_000), csv)!;
+        Assert.Equal([HitchCause.Other], r.Hitches.Select(h => h.Cause));
+        Assert.True(r.Low1PctFps < 20, $"1% low {r.Low1PctFps}");
+    }
+
+    /// <summary>The frame report's length is the launch's shared end, as the last session's play time: an #end after the
+    /// last frame counts.</summary>
+    [Fact]
+    public void The_frame_reports_length_is_the_launchs_end()
+    {
+        var csv = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(csv, ["#session,1000000,Game.exe", "#clock,0.0", "10.0,S,1,1,0.500", "#end,1090000,90000.0"]);
+        var bin = Path.Combine(_dir, FrameLog.FileName);
+        File.WriteAllBytes(bin, Launch(1_000_000, 0, Every10Ms(0, 80_000)));
+        var r = FrameLog.Read(bin, csv)!;
+        Assert.Equal(TimeSpan.FromSeconds(90), r.Duration);
+        Assert.Equal(r.Duration, SessionLog.Read(csv, frames: r).Last!.Duration);
     }
 
     /// <summary>SILENT HILL: Townfall's recorder files, read only: the last launch has frames and at least one hitch.</summary>

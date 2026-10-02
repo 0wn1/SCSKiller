@@ -8,6 +8,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="SCSKiller.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="CUE4Parse" Version="1.2.2.202609" />
     <!-- CUE4Parse pulls 9.0.0, which has GHSA-73j8-2gch-69rq -->
     <PackageReference Include="Microsoft.Bcl.Memory" Version="10.0.12" />

@@ -23,6 +23,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi.h>
 #include "probe_util.h"
 #include <cstring>
 #include <vector>
@@ -30,6 +31,7 @@
 #include <functional>
 
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 
 // Shaders "heavy" enough (unrolled transcendental loops, 4 textures) that a cold driver compile
 // is clearly measurable. `seed` changes embedded constants so bytecode is fresh; two calls with
@@ -196,10 +198,21 @@ static Common make_common(ID3D11Device* dev) {
     dev->CreateBuffer(&cbd, &cbi, &c.cb);
     return c;
 }
+// scskiller_warm's default adapter: the hardware one with the most dedicated VRAM
 static ID3D11Device* make_device(ID3D11DeviceContext** ctx) {
+    IDXGIFactory1* f = nullptr;
+    IDXGIAdapter1 *best = nullptr, *a;
+    DXGI_ADAPTER_DESC1 bd{}, d;
+    CreateDXGIFactory1(IID_PPV_ARGS(&f));
+    for (UINT i = 0; f && f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
+        a->GetDesc1(&d);
+        if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && (!best || d.DedicatedVideoMemory > bd.DedicatedVideoMemory)) std::swap(best, a), bd = d;
+        if (a) a->Release();
+    }
     ID3D11Device* dev = nullptr;
     D3D_FEATURE_LEVEL fl[] = {D3D_FEATURE_LEVEL_11_0}, got;
-    D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, fl, 1, D3D11_SDK_VERSION, &dev, &got, ctx);
+    if (best) D3D11CreateDevice(best, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, fl, 1, D3D11_SDK_VERSION, &dev, &got, ctx), best->Release();
+    if (f) f->Release();
     return dev;
 }
 static ID3D11VertexShader* make_vs(ID3D11Device* dev, ID3DBlob* b) {
@@ -466,28 +479,32 @@ static void parse_pair(const std::string& out, std::vector<std::pair<std::string
 }
 
 int wmain(int argc, wchar_t** argv) {
+    std::wstring mode = argc > 1 ? argv[1] : L"";
+    if (mode == L"pair1") return argc == 4 ? child_pair1((unsigned)_wtoi(argv[2]), (unsigned)_wtoi(argv[3])) : 1;
+    if (mode == L"pair2")
+        return argc == 6 ? child_pair2((unsigned)_wtoi(argv[2]), (unsigned)_wtoi(argv[3]), (unsigned)_wtoi(argv[4]), (unsigned)_wtoi(argv[5])) : 1;
     if (argc > 2) {
-        std::wstring mode = argv[1];
         if (mode == L"compile" && argc == 5) return child_compile(argv[2], argv[3], argv[4]);
         if (mode == L"first" && argc == 4) return child_first(argv[2], argv[3]);
         if (mode == L"firsttess" && argc == 6) return child_firsttess(argv[2], argv[3], argv[4], argv[5]);
-        if (mode == L"pair1") return child_pair1((unsigned)_wtoi(argv[2]), (unsigned)_wtoi(argv[3]));
-        if (mode == L"pair2")
-            return child_pair2((unsigned)_wtoi(argv[2]), (unsigned)_wtoi(argv[3]), (unsigned)_wtoi(argv[4]), (unsigned)_wtoi(argv[5]));
         unsigned seed = (unsigned)_wtoi(argv[2]);
         return mode == L"state" ? child_state(seed) : child_cold(seed);
     }
 
     wchar_t p[MAX_PATH];
     GetModuleFileNameW(nullptr, p, MAX_PATH);
-    std::wstring self = p, dir = self.substr(0, self.find_last_of(L'\\') + 1);
-    std::wstring exeA = self;                          // original name, original folder
+    std::wstring self = p;
+    // every copy goes into a new folder of this run's, removed with all in it at the end
+    std::wstring dir = self.substr(0, self.find_last_of(L'\\') + 1) + L"probe11-" + std::to_wstring(GetCurrentProcessId()) + L"\\";
+    if (!CreateDirectoryW(dir.c_str(), nullptr)) return printf("can't create a new folder %ls\n", dir.c_str()), 1;
+    std::wstring exeA = dir + L"probe11.exe";          // the original name
     std::wstring exeC = dir + L"probe11_altname.exe";  // different name, same folder
     std::wstring subdir = dir + L"probe11_sub\\";
     CreateDirectoryW(subdir.c_str(), nullptr);
     std::wstring exeB = subdir + L"probe11.exe";        // same name, different folder
-    CopyFileW(self.c_str(), exeC.c_str(), FALSE);
-    CopyFileW(self.c_str(), exeB.c_str(), FALSE);
+    CopyFileW(self.c_str(), exeA.c_str(), TRUE);
+    CopyFileW(self.c_str(), exeC.c_str(), TRUE);
+    CopyFileW(self.c_str(), exeB.c_str(), TRUE);
 
     unsigned base = GetTickCount() % 1000000;
 
@@ -577,8 +594,7 @@ int wmain(int argc, wchar_t** argv) {
     for (size_t k = 0; k < ptags.size(); ++k)
         printf("  MEDIAN %-18s draw=%.2fms\n", ptags[k].c_str(), median(ptimes[k]));
 
-    DeleteFileW(exeB.c_str());
-    RemoveDirectoryW(subdir.c_str());
-    DeleteFileW(exeC.c_str());
+    for (auto& f : {exeB, exeC, exeA}) DeleteFileW(f.c_str());
+    RemoveDirectoryW(subdir.c_str()), RemoveDirectoryW(dir.c_str());
     return 0;
 }

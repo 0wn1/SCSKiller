@@ -137,6 +137,26 @@ public class UpdateTests : IDisposable
         Assert.False(Busy.IsHeld(name));
     }
 
+    /// <summary>The worker's side of the handshake: it holds Busy before it reads the marker, and lets go while an update
+    /// is handed over; the updater marks first, then reads Busy. Either order of the two sees the other.</summary>
+    [Fact]
+    public void A_compile_worker_holds_first_then_backs_off_while_an_update_is_handed_over()
+    {
+        var name = @"Local\SCSKiller.Busy.test-" + Guid.NewGuid().ToString("N");
+        using (var hold = Busy.TryHold(_dir, T, name))
+        {
+            Assert.NotNull(hold);
+            Busy.MarkApplying(_dir, T);    // the updater, after the worker's hold
+            Assert.True(Busy.IsHeld(name));   // ...sees the compile, and doesn't apply
+            Busy.ClearApplying(_dir);
+        }
+        Busy.MarkApplying(_dir, T);        // the updater first
+        Assert.Null(Busy.TryHold(_dir, T, name));   // the worker doesn't start
+        Assert.False(Busy.IsHeld(name));   // ...and holds nothing, so the apply goes ahead
+        using (var late = Busy.TryHold(_dir, T.AddMinutes(3), name)) Assert.NotNull(late);   // a crashed apply's marker no longer stops it
+        Busy.ClearApplying(_dir);
+    }
+
     [Fact]
     public void ApplyingMarker_StopsTheCliForTwoMinutes()
     {
@@ -181,5 +201,38 @@ public class UpdateTests : IDisposable
         if (Environment.GetEnvironmentVariable("SCSKILLER_API") is not { Length: > 0 })
             Assert.Equal("https://dl.scskiller.io/v1/updates/beta/SCSKiller.App-1.5.0-beta.2-delta.nupkg",
                 UpdateFeeds.Package(AppVersion.Parse("1.5.0-beta.2")!, "SCSKiller.App-1.5.0-beta.2-delta.nupkg").AbsoluteUri);
+    }
+
+    /// <summary>A package host can't fill the disk past the signed feed's size, nor hold the update check forever.</summary>
+    [Fact]
+    public async Task Download_StopsAtTheFeedsSize_AndOnAStall()
+    {
+        var to = new MemoryStream();
+        await UpdateFeeds.Download(new MemoryStream(new byte[1000]), to, 1000, TimeSpan.FromSeconds(5), default);
+        Assert.Equal(1000, to.Length);
+        await Assert.ThrowsAsync<FeedRejectedException>(() => UpdateFeeds.Download(new MemoryStream(new byte[1001]), new MemoryStream(), 1000, TimeSpan.FromSeconds(5), default));
+        await Assert.ThrowsAsync<TimeoutException>(() => UpdateFeeds.Download(new Stalling(), new MemoryStream(), 1000, TimeSpan.FromMilliseconds(200), default));
+    }
+
+    /// <summary>Some bytes, then nothing until cancelled.</summary>
+    sealed class Stalling : Stream
+    {
+        bool sent;
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            if (!sent) { sent = true; buffer.Span[0] = 1; return 1; }
+            await Task.Delay(Timeout.Infinite, ct);
+            return 0;
+        }
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 }

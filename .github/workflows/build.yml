@@ -89,8 +89,18 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      # A persistent runner's global packages folder and HTTP cache hold whatever earlier jobs (PRs included) put there,
+      # and restore uses them as they are: a release tag restores into folders of its own, from nuget.org only.
+      - name: Package folders of this run (release tags)
+        if: github.ref_type == 'tag'
+        shell: powershell
+        run: |
+          $d = Join-Path $env:RUNNER_TEMP "nuget-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "NUGET_PACKAGES=$d\packages`nNUGET_HTTP_CACHE_PATH=$d\http`n")   # UTF-8, no BOM
+
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
-        if: github.ref_type != 'tag'   # release builds restore from nuget.org only
+        if: github.ref_type != 'tag'
         with:
           path: ~\.nuget\packages
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}

@@ -187,7 +187,7 @@
                                     <TextBlock Text="{x:Bind Vm.DiskValue, Mode=OneWay}" Style="{StaticResource StatValue}" />
                                 </StackPanel>
                                 <StackPanel Spacing="2" Visibility="{x:Bind Vm.HasSession, Mode=OneWay}">
-                                    <TextBlock Text="Stutters last time you played" Style="{StaticResource Secondary}" />
+                                    <TextBlock Text="{x:Bind Vm.StuttersLabel, Mode=OneWay}" Style="{StaticResource Secondary}" />
                                     <TextBlock Text="{x:Bind Vm.StuttersValue, Mode=OneWay}" Style="{StaticResource StatValue}" Visibility="{x:Bind Vm.NoStutters, Mode=OneWay}" />
                                     <TextBlock Text="{x:Bind Vm.StuttersValue, Mode=OneWay}" Style="{StaticResource StatValue}" Foreground="{ThemeResource WarnBrush}" Visibility="{x:Bind Vm.HasStutters, Mode=OneWay}" />
                                 </StackPanel>
@@ -383,7 +383,7 @@
                                 <TextBlock Grid.Row="1" Grid.Column="1" Text="Ready in the driver cache" Style="{StaticResource Secondary}" TextWrapping="Wrap" />
                                 <TextBlock Grid.Row="1" Grid.Column="2" Text="{x:Bind Vm.CacheHits, Mode=OneWay}" Style="{StaticResource Secondary}" />
                                 <Rectangle Grid.Row="2" Width="10" Height="10" RadiusX="2" RadiusY="2" Fill="{ThemeResource WarnBrush}" />
-                                <TextBlock Grid.Row="2" Grid.Column="1" Text="Compiled during play (a stutter each)" Style="{StaticResource Secondary}" TextWrapping="Wrap" />
+                                <TextBlock Grid.Row="2" Grid.Column="1" Text="Compiled during play" Style="{StaticResource Secondary}" TextWrapping="Wrap" />
                                 <TextBlock Grid.Row="2" Grid.Column="2" Text="{x:Bind Vm.Compiles, Mode=OneWay}" Style="{StaticResource Secondary}" />
                             </Grid>
                         </StackPanel>

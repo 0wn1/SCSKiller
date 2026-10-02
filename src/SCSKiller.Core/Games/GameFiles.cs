@@ -50,21 +50,68 @@ public static class GameFiles
         ("randgrid.sys", AntiCheat.Other),   // Ricochet (Call of Duty)
     ];
 
-    /// <summary>Looks for anti-cheat folders/files in the install root and the exe's folder (and one level below each).
-    /// Battle.net titles are marked conservatively: Blizzard's Warden is server-side, not a file the install carries.</summary>
-    public static AntiCheat DetectAntiCheat(Game game)
+    /// <summary>Looks for anti-cheat folders/files by name anywhere under the install, under the exe's folder when it is
+    /// outside it, and in the names of the folders from the exe's up to the install root. A tree that can't be read whole
+    /// (a folder it may not list, the root included; more than <see cref="MaxEntries"/> entries) is <see cref="AntiCheat.Other"/>:
+    /// not known to be clean. A junction or symlink is a name, not followed: a folder it points into inside the tree is
+    /// read where it is, and one outside is another folder's; one on the way from the install root to the exe is Other. <paramref name="quick"/>: the install root's and the exe
+    /// folder's own entries only, for a recheck right after a full one. Battle.net titles are marked conservatively:
+    /// Blizzard's Warden is server-side, not a file the install carries. The only anti-cheat detector: engine readers and
+    /// middleware detection call it to skip their own work; the app's evaluation acts on its verdict.</summary>
+    public static AntiCheat DetectAntiCheat(Game game, bool quick = false)
     {
         if (game.Id.StartsWith("battlenet:", StringComparison.Ordinal)) return AntiCheat.Other;
-        var dirs = new[] { game.InstallDir, Path.GetDirectoryName(game.ExePath)! }.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase);
-        var opts = new EnumerationOptions { RecurseSubdirectories = true, MaxRecursionDepth = 1, IgnoreInaccessible = true };
-        foreach (var dir in dirs)
-            foreach (var entry in Directory.EnumerateFileSystemEntries(dir, "*", opts))
+        var install = Path.TrimEndingDirectorySeparator(Path.GetFullPath(game.InstallDir));
+        var exeDir = Path.GetDirectoryName(Path.GetFullPath(game.ExePath))!;
+        bool Inside(string d) => d.Equals(install, StringComparison.OrdinalIgnoreCase) || d.StartsWith(install + '\\', StringComparison.OrdinalIgnoreCase);
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seen = 0;
+
+        AntiCheat Walk(string root)
+        {
+            var dirs = new Stack<string>([root]);
+            while (dirs.TryPop(out var dir))
             {
-                var name = Path.GetFileName(entry);
-                foreach (var (marker, kind) in Markers)
-                    if (name.Equals(marker, StringComparison.OrdinalIgnoreCase)) return kind;
-                if (name.EndsWith("_BE.exe", StringComparison.OrdinalIgnoreCase)) return AntiCheat.BattlEye;
+                if (!visited.Add(dir)) continue;
+                List<FileSystemInfo> entries;
+                try { entries = new DirectoryInfo(dir).EnumerateFileSystemInfos("*", AllNames).ToList(); }
+                catch (DirectoryNotFoundException) when (dir == root) { continue; }   // nothing installed there (access denied throws otherwise)
+                foreach (var e in entries)
+                {
+                    if (++seen > MaxEntries) return AntiCheat.Other;
+                    if (Marker(e.Name) is var kind and not AntiCheat.None) return kind;
+                    if (!quick && e is DirectoryInfo d && ((d.Attributes & FileAttributes.ReparsePoint) == 0 || d.LinkTarget == null)) dirs.Push(d.FullName);
+                }
             }
+            return AntiCheat.None;
+        }
+
+        try
+        {
+            // the walk doesn't follow links: one between the install root and the exe would hide the exe's own folders.
+            // The root itself may be one (a game folder moved to another drive): it is walked, so nothing is hidden.
+            for (var d = exeDir; d != null && Inside(d) && d.Length > install.Length; d = Path.GetDirectoryName(d))
+                if (new DirectoryInfo(d) is { Exists: true } info && (info.Attributes & FileAttributes.ReparsePoint) != 0 && info.LinkTarget != null)
+                    return AntiCheat.Other;
+            foreach (var root in quick || !Inside(exeDir) ? new[] { install, exeDir } : new[] { install })
+                if (Walk(root) is var kind and not AntiCheat.None) return kind;
+            for (var d = exeDir; d != null && Inside(d); d = Path.GetDirectoryName(d))
+                if (Marker(Path.GetFileName(d)) is var kind and not AntiCheat.None) return kind;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException) { return AntiCheat.Other; }
         return AntiCheat.None;
+    }
+
+    // AttributesToSkip defaults to Hidden | System: a hidden EasyAntiCheat folder or a system randgrid.sys still counts
+    static readonly EnumerationOptions AllNames = new() { IgnoreInaccessible = false, AttributesToSkip = 0 };
+
+    /// <summary>Entries one detection reads at most (names only: an install of 170,000 entries reads in about 0.1 s warm).</summary>
+    public const int MaxEntries = 2_000_000;
+
+    static AntiCheat Marker(string name)
+    {
+        foreach (var (marker, kind) in Markers)
+            if (name.Equals(marker, StringComparison.OrdinalIgnoreCase)) return kind;
+        return name.EndsWith("_BE.exe", StringComparison.OrdinalIgnoreCase) ? AntiCheat.BattlEye : AntiCheat.None;
     }
 }

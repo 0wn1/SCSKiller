@@ -24,7 +24,7 @@ public sealed partial class QueuePage : Page
     // Every action refreshes itself: the Core doesn't raise QueueChanged for every change (e.g. Remove).
     void Act(Action action) { action(); Vm.Refresh(); }
 
-    void OnStart(object _, RoutedEventArgs __) => Act(App.Core.StartQueue);
+    void OnStart(object _, RoutedEventArgs __) => Act(App.CompileQueue);
     void OnPause(object _, RoutedEventArgs __) => Act(Vm.PauseOrResume);
     void OnStop(object _, RoutedEventArgs __) => Act(App.Core.StopQueue);
     void OnRemove(object sender, RoutedEventArgs _) => Act(() => App.Core.Remove(RowOf(sender).Id));

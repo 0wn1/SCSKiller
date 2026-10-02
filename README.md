@@ -102,7 +102,7 @@ Measured with SCSKiller's pipeline recorder. Your numbers will vary by game, GPU
 Intel GPUs aren't supported yet: I don't have one to test on. If you'd like to sponsor an Intel Arc GPU, get in touch at
 [contact@scskiller.com](mailto:contact@scskiller.com).
 
-Download `SCSKiller-<version>-Setup.exe` from [Releases](https://github.com/BlueHeisenberg/SCSKiller/releases/latest)
+Download `SCSKiller-Setup.exe` from [Releases](https://github.com/BlueHeisenberg/SCSKiller/releases/latest)
 and run it. It installs for your user only, needs no admin rights, and keeps itself up to date.
 
 Or take `SCSKiller-<version>-Portable.zip`, unzip it to any folder you can write to and run `SCSKiller.exe`: it updates

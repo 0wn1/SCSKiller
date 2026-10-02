@@ -166,7 +166,7 @@ public class SynthesizedTemplateTests(ITestOutputHelper output)
     // ARCHITECTURE.md protocol: scskiller_warm <workdir> <exe name> --threads N; stdout ends with the "done" event
     static WarmRun Run(string folder, string exe)
     {
-        var psi = new ProcessStartInfo(Warm, [folder, exe, "--threads", "4"]) { RedirectStandardOutput = true, UseShellExecute = false }; // light: the PC may be in use
+        var psi = new ProcessStartInfo(Warm, [folder, exe, "--threads", "4"]) { StandardOutputEncoding = System.Text.Encoding.UTF8, RedirectStandardOutput = true, UseShellExecute = false }; // light: the PC may be in use
         string o;
         using (var p = Process.Start(psi)!) { o = p.StandardOutput.ReadToEnd(); p.WaitForExit(); }
         var done = o.Split('\n').Select(l => l.Trim()).Where(l => l.StartsWith('{')).Select(l => System.Text.Json.JsonDocument.Parse(l).RootElement)

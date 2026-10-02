@@ -18,28 +18,122 @@ public static class Updater
     static readonly FeedTrust Trust = new(new AppStore(DataDir), FeedTrust.ReleaseKeys);
     static string ResumeFile => Path.Combine(DataDir, "resume-queue.txt");
 
-    static UpdateManager? manager;   // the one that downloaded `ready`
-    static VelopackAsset? ready;
+    /// <summary>A finished download: the manager that downloaded it and the channel it came from.</summary>
+    sealed record Download(Velo M, VelopackAsset R, string Channel);
+    static volatile Download? ready;   // one reference: the UI reads it whole while a check replaces it
     static Timer? timer;
     static int failures;   // consecutive checks that couldn't reach the feed
 
     /// <summary>Raised on any thread after <see cref="Ready"/>, <see cref="Checking"/> or <see cref="Problem"/> changed.</summary>
     public static event Action? Changed;
-    public static string? Ready => ready?.Version.ToString();
+    public static string? Ready => Usable(ready) is { } d ? d.R.Version.ToString() : null;
+
+    static string Chosen() => UpdateChannels.Effective(App.Core.Settings.UpdateChannel, AppVersion.Current.Channel, App.Account.Status?.Ent);
+
+    /// <summary>A download is installed only while its channel is still the chosen one.</summary>
+    static Download? Usable(Download? d) => d != null && d.Channel == Chosen() ? d : null;
     public static bool Checking { get; private set; }
     public static string? Problem { get; private set; }
+    /// <summary>"Restart to update" waits for the compile: the channel stays as it is meanwhile.</summary>
+    public static bool Restarting { get; private set; }
 
-    static UpdateManager Manager(string channel, bool downgrade) =>
-        new(new SignedFeedSource(), new UpdateOptions { ExplicitChannel = channel, AllowVersionDowngrade = downgrade || UpdateChannels.AllowsDowngrade(channel) });
+    static Velo Manager(string channel, bool downgrade) =>
+        new(new SignedFeedSource(), new UpdateOptions
+        {
+            ExplicitChannel = channel, AllowVersionDowngrade = downgrade || UpdateChannels.AllowsDowngrade(channel),
+            MaximumDeltasBeforeFallback = -1,   // full packages only: a package rebuilt from deltas fails the feed's checksum
+        });
+
+    /// <summary>Velopack's apply passes the package to Update.exe only while its file exists, else Update.exe takes the
+    /// newest package on disk, whatever it is (<see cref="ApplyAsync"/>).</summary>
+    sealed class Velo(IUpdateSource source, UpdateOptions options) : UpdateManager(source, options)
+    {
+        string PathOf(VelopackAsset a) => Path.Combine(Locator.PackagesDir ?? "", a.FileName);
+
+        /// <summary>The asset's file, its size and Velopack's own checksum.</summary>
+        public async Task<bool> OnDisk(VelopackAsset asset)
+        {
+            var file = new FileInfo(PathOf(asset));
+            if (!file.Exists || file.Length != asset.Size) return false;
+            try { await VerifyPackageChecksumAsync(asset, file.FullName); return true; }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or Velopack.Exceptions.ChecksumFailedException) { return false; }
+        }
+
+        /// <summary>A download that failed <see cref="OnDisk"/>: gone, so the next check downloads it again.</summary>
+        public void Delete(VelopackAsset asset)
+        {
+            try { File.Delete(PathOf(asset)); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+
+        /// <summary>Every package but <paramref name="keep"/> and the installed version's: true once none other is left.</summary>
+        public bool OnlyThis(VelopackAsset keep)
+        {
+            bool Other(VelopackAsset p) => p.FileName != keep.FileName && p.Version != CurrentVersion;
+            foreach (var p in Locator.GetLocalPackages().Where(Other)) Delete(p);
+            return !Locator.GetLocalPackages().Any(Other);
+        }
+    }
+
+    /// <summary>The one way an update is applied (Quit, "Restart to update"), in order: the check's lock (a check may be
+    /// replacing the download; <paramref name="wait"/> at most); the ready download read again; its file whole on disk,
+    /// else deleted so the next check downloads it again; every other package deleted, so Update.exe has nothing else to
+    /// fall back on; then, last, no compile running anywhere and the channel still the chosen one; then
+    /// <paramref name="apply"/>.</summary>
+    static async Task<bool> ApplyAsync(TimeSpan wait, Action<Velo, VelopackAsset> apply)
+    {
+        if (!await One.WaitAsync(wait)) return false;
+        try
+        {
+            if (Usable(ready) is not var (m, r, _))
+                return Fail("The update changed meanwhile. Restart to update again once it is ready.");
+            if (!await m.OnDisk(r))
+            {
+                m.Delete(r);
+                ready = null;
+                return Fail("The downloaded update is no longer whole on disk. It downloads again at the next check.");
+            }
+            if (!m.OnlyThis(r)) return Fail("An older downloaded update couldn't be removed. The update installs at a later quit.");
+            // the marker first, then Busy: a compile worker holds Busy first, then reads the marker (ScsKiller.Work), so
+            // one of the two always sees the other
+            Busy.MarkApplying(DataDir, DateTimeOffset.UtcNow);
+            if (Busy.IsHeld()) return Undo("A compile started meanwhile. The update installs when SCSKiller quits after it has finished.");
+            if (Usable(ready) is null) return Undo("The update channel changed meanwhile. Restart to update again once it is ready.");
+            apply(m, r);   // its preparation too (the resume file): a failure anywhere is undone below
+            return true;
+        }
+        catch (Exception e) { return Undo("Couldn't hand the update to the installer: " + e.Message); }
+        finally
+        {
+            One.Release();
+            Changed?.Invoke();
+        }
+
+        static bool Fail(string why)
+        {
+            Problem = why;
+            return false;
+        }
+
+        // this process goes on: no marker stops the compiles, no resume file replays a queue that is still here
+        static bool Undo(string why)
+        {
+            try { Busy.ClearApplying(DataDir); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }   // it expires (Busy.ApplyingFor)
+            try { File.Delete(ResumeFile); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            return Fail(why);
+        }
+    }
 
     public static bool Installed { get; } = Manager(UpdateChannels.Stable, false).IsInstalled;
 
-    /// <summary>At app start (real data only): a package downloaded earlier is ready at once; then check now and every 6 h.</summary>
+    /// <summary>At app start (real data only): check soon and every 6 h. A package downloaded before isn't ready by itself:
+    /// Velopack keeps the newest one whatever its channel, so only the chosen channel's feed makes it ready, when it offers
+    /// that version (its download then finds the package on disk and fetches nothing).</summary>
     public static void Start()
     {
         if (!Installed) return;
-        var m = Manager(AppVersion.Current.Channel, false);
-        if (m.UpdatePendingRestart is { } pending) (manager, ready) = (m, pending);
         timer = new Timer(_ => _ = CheckAsync(), null, TimeSpan.FromSeconds(30), Every);   // not in the start's busy first seconds
     }
 
@@ -53,15 +147,15 @@ public static class Updater
         try
         {
             await App.Account.GetAccessTokenAsync();   // reads the entitlements
-            var channel = backToStable ? UpdateChannels.Stable
-                : UpdateChannels.Effective(App.Core.Settings.UpdateChannel, AppVersion.Current.Channel, App.Account.Status?.Ent);
+            var channel = backToStable ? UpdateChannels.Stable : Chosen();
+            if (ready?.Channel != channel) ready = null;   // another channel's download, even if this check fails
             var m = Manager(channel, backToStable);
             var found = await m.CheckForUpdatesAsync();
             failures = 0;
             if (found is { } info)
             {
                 await m.DownloadUpdatesAsync(info);
-                (manager, ready) = (m, info.TargetFullRelease);
+                if (channel == Chosen()) ready = new(m, info.TargetFullRelease, channel);   // the choice may have changed meanwhile
             }
         }
         catch (FeedRejectedException e) { Problem = "The update feed failed its signature check: " + e.Message; }
@@ -81,12 +175,12 @@ public static class Updater
     }
 
     /// <summary>App exit (the tray's Quit): hands a downloaded update to Update.exe, which swaps it in once this process
-    /// has exited. Not while a queue item runs (here or in the CLI): then at a later exit.</summary>
-    public static void ApplyOnExit()
+    /// has exited. Not while a queue item runs (here or in the CLI), nor while a check still downloads after 30 s: then at
+    /// a later exit.</summary>
+    public static async Task ApplyOnExitAsync()
     {
-        if (ready == null || manager == null || Busy.IsHeld()) return;
-        Busy.MarkApplying(DataDir, DateTimeOffset.UtcNow);
-        manager.WaitExitThenApplyUpdates(ready, silent: true, restart: false);
+        if (Usable(ready) is null || Busy.IsHeld()) return;
+        await ApplyAsync(TimeSpan.FromSeconds(30), (m, r) => m.WaitExitThenApplyUpdates(r, silent: true, restart: false));
     }
 
     /// <summary>"Restart to update": stops the queue gracefully (in-flight compiles finish, the driver writes its cache),
@@ -94,23 +188,32 @@ public static class Updater
     /// stopped (each game's ResumeAt). False (and <see cref="Problem"/>) when the driver-update task's compile still runs.</summary>
     public static async Task<bool> RestartAsync()
     {
-        if (ready == null || manager == null) return false;
-        // plan checks aren't resumed: the next version's scan queues its own
-        var queued = App.Core.Queue.Where(q => q.Stage is not (Core.QueueStage.Done or Core.QueueStage.Failed) && !q.PlanCheck).Select(q => q.GameId).ToList();
-        App.Core.StopQueue();
-        while (App.Core.Queue.Any(Format.Running)) await Task.Delay(250);
-        for (var i = 0; i < 20 && Busy.IsHeld(); i++) await Task.Delay(100);   // our worker lets go just after the item ends
-        if (Busy.IsHeld())
+        if (Usable(ready) is null) return false;
+        (Restarting, Problem) = (true, null);
+        Changed?.Invoke();
+        try
         {
-            Problem = "The background rebuild after a driver update is compiling. The update installs when SCSKiller quits after it has finished.";
-            Changed?.Invoke();
-            return false;
+            // plan checks aren't resumed: the next version's scan queues its own
+            var queued = App.Core.Queue.Where(q => q.Stage is not (Core.QueueStage.Done or Core.QueueStage.Failed) && !q.PlanCheck).Select(q => q.GameId).ToList();
+            App.Core.StopQueue();
+            while (App.Core.Compiling) await Task.Delay(250);
+            for (var i = 0; i < 20 && Busy.IsHeld(); i++) await Task.Delay(100);   // our worker lets go just after the item ends
+            if (Busy.IsHeld())
+            {
+                Problem = "The background rebuild after a driver update is compiling. The update installs when SCSKiller quits after it has finished.";
+                return false;
+            }
+            return await ApplyAsync(Timeout.InfiniteTimeSpan, (m, r) =>
+            {
+                if (queued.Count > 0) File.WriteAllLines(ResumeFile, queued);
+                m.ApplyUpdatesAndRestart(r);   // exits this process
+            });
         }
-        if (queued.Count > 0) File.WriteAllLines(ResumeFile, queued);
-        Busy.MarkApplying(DataDir, DateTimeOffset.UtcNow);
-        App.DisposeTray();
-        manager.ApplyUpdatesAndRestart(ready);   // exits this process
-        return true;
+        finally
+        {
+            Restarting = false;
+            Changed?.Invoke();
+        }
     }
 
     public static bool HasResume => File.Exists(ResumeFile);
@@ -127,7 +230,7 @@ public static class Updater
 
     /// <summary>Velopack's lifecycle hooks (Program.Main, before anything else): run by Update.exe, fast, then exit.</summary>
     public static void RunHooks() => VelopackApp.Build()
-        .SetAutoApplyOnStartup(false)   // its apply force-stops every process under the install root: only ApplyOnExit/RestartAsync apply
+        .SetAutoApplyOnStartup(false)   // its apply force-stops every process under the install root: only ApplyOnExitAsync/RestartAsync apply
         .OnAfterInstallFastCallback(_ =>
         {
             // a zip install's driver-update task points at the zip's folder: move it here (current\ keeps its name across updates)
@@ -166,10 +269,14 @@ public static class Updater
         {
             var version = AppVersion.Parse(entry.Version.ToString()) ?? throw new FeedRejectedException($"version '{entry.Version}'");
             using var request = await RequestAsync(UpdateFeeds.Package(version, entry.FileName), version.Channel);
-            using var r = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            using var headers = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            headers.CancelAfter(TimeSpan.FromMinutes(1));
+            using var r = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, headers.Token);
+            headers.CancelAfter(Timeout.InfiniteTimeSpan);   // the body has its own stall limit
             r.EnsureSuccessStatusCode();
             await using var file = File.Create(localFile);
-            await r.Content.CopyToAsync(file, ct);
+            await using var body = await r.Content.ReadAsStreamAsync(ct);
+            await UpdateFeeds.Download(body, file, entry.Size, TimeSpan.FromMinutes(2), ct);
         }
 
         static async Task<byte[]> GetAsync(Uri url, string channel)

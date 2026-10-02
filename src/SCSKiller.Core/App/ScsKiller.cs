@@ -68,13 +68,20 @@ public sealed class ScsKiller : IScsKiller
         RunningGameExes = DiscoveredGamesRunning;
     }
 
+
     public static ScsKiller CreateDefault()
     {
         var vendor = GpuBackends.Detect();
         return new ScsKiller([new SteamSource(), new EpicSource(), new XboxSource(), new GogSource(), new UbisoftSource(), new BattleNetSource(), new EaSource()],
-            vendor, DefaultReaders(), new Planner(Path.Combine(AppStore.DefaultDir, "packs")), new Warmer(vendor),
+            vendor, DefaultReaders(), new Planner(Path.Combine(AppStore.DefaultDir, "packs"), SharedPackDir(AppStore.DefaultDir, vendor.Vendor)), new Warmer(vendor),
             AppStore.DefaultDir, NativeTools.Find("d3d12.dll"));
     }
+
+    /// <summary>The GPU vendor in a shared pack's key (<see cref="HashOnly.PackKey"/>); null = a vendor without shared packs.</summary>
+    public static string? PackGpu(GpuVendor v) => v switch { GpuVendor.Nvidia => "nvidia", GpuVendor.Amd => "amd", _ => null };
+
+    /// <summary>Where the shared packs downloaded for this GPU vendor live: community\packs\&lt;gpu&gt;\&lt;vendor&gt;\.</summary>
+    public static string? SharedPackDir(string dataDir, GpuVendor v) => PackGpu(v) is { } gpu ? Path.Combine(dataDir, "community", "packs", gpu) : null;
 
     /// <summary>Unreal first, then the engines whose archives the carver can't see into (FromSoftware, Unity, RE Engine), then
     /// the generic raw DXBC/DXIL carver.</summary>
@@ -280,7 +287,9 @@ public sealed class ScsKiller : IScsKiller
         foreach (var s in changed) GameChanged?.Invoke(s);
     }
 
-    GameState Evaluate(Game g, bool force, out bool fresh)
+    /// <summary><paramref name="ct"/> cancelled (a stopped compile's refresh), before or while the import or the keys write
+    /// waits for the recording lock: they're skipped, and the next refresh does them.</summary>
+    GameState Evaluate(Game g, bool force, out bool fresh, CancellationToken ct = default)
     {
         var rec = Store.LoadGame(g.Id);
         var exeDir = Path.GetDirectoryName(g.ExePath)!;
@@ -288,17 +297,33 @@ public sealed class ScsKiller : IScsKiller
         var judge = cap != null && rec.FirstLaunch == null ? rec.WarmedAt : null;
         // the RayQuery floor is measured on NVIDIA only
         var rayQuery = Vendor.Vendor == GpuVendor.Nvidia ? SessionLog.ReadRayQueryKeys(RayQueryKeysPath(g.Id)) : null;
-        var (session, marker, first) = SessionLog.Read(Path.Combine(exeDir, "scskiller_creates.csv"), Path.GetFileName(g.ExePath), judge, MinJudgedCreates, rayQuery, rec.LastPlay);
+        var frames = Frames(exeDir, Path.GetFileName(g.ExePath), rayQuery, rec.LastPlay);
+        var (session, marker, first) = SessionLog.Read(Path.Combine(exeDir, "scskiller_creates.csv"), out var framesMatch, Path.GetFileName(g.ExePath), judge, MinJudgedCreates, rayQuery, rec.LastPlay, frames);
+        if (session != null && !framesMatch) frames = null;   // another launch's frames: none shown next to this one's counts
         if (first != null) rec.FirstLaunch = first;
         if (first != null && AgsLaunchMissed(rec)) { rec.AgsMissed = true; Log?.Report($"{g.Name}: {AgsMissedReason(rec)}"); }
         var keysOf = rec.KeysIndexHash;
-        if (keysOf != null && !IndexIsInstalled(g, rec)) WriteKeys(g, rec);   // the game was updated: no longer this build's shaders
-        if (ImportRecording(g, rec) | MergeLaunched(g, rec, marker) | first != null | rec.KeysIndexHash != keysOf) Store.SaveGame(g.Id, rec);
+        var (imported, keysPending) = (false, rec.KeysPending);
+        try
+        {
+            // the game was updated (no longer this build's shaders), or a rewrite waited for it to exit
+            if (keysPending || keysOf != null && !IndexIsInstalled(g, rec)) WriteKeys(g, rec, ct);
+            imported = ImportRecording(g, rec, ct: ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        // the recording's upkeep never keeps the evaluation (and its anti-cheat check) from running: retried next time
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidDataException) { Log?.Report($"{g.Name}: the recording's upkeep failed: {e.Message}"); }
+        try
+        {
+            if (imported | MergeLaunched(g, rec, marker) | first != null | rec.KeysIndexHash != keysOf | rec.KeysPending != keysPending) Store.SaveGame(g.Id, rec);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log?.Report($"{g.Name}: couldn't save its record: {e.Message}"); }
         long? psos = rec.Plan is { } p ? p.Stats.Recorded + p.Stats.Generated + p.Stats.D3D11Shaders + p.Stats.MiddlewareItems : null;
         long? recorded = rec.Plan?.Stats.Recorded;
         TimeSpan? fast = psos is { } n ? TimeSpan.FromSeconds(n / (rec.PsoPerSecond ?? WarmRate)) : null;
         TimeSpan? careful = cap != null && psos is { } np && recorded is { } nr ? TimeSpan.FromSeconds(nr / DefaultCarefulPsoPerSecond + (np - nr) / (rec.PsoPerSecond ?? WarmRate)) : null;
         var (_, engine, antiCheat, check) = Evaluated(g, rec, force, out fresh);
+        var pending = PendingOf(g, rec);   // after the import and the scan's engine: derived from what they and any download left
         if (engine != null && check.Reason.Contains(Planner.Untested) && RootSig.Verified(engine))
             check = check with { Reason = check.Reason.Replace(Planner.Untested, Planner.NoRecording) };
         var manifest = LocalManifest();
@@ -306,7 +331,9 @@ public sealed class ScsKiller : IScsKiller
         bool? inDb = manifest != null ? entry != null : null;
         var rt = NeedsRtRecording(rec.Plan?.Stats);
         var dll = Path.Combine(exeDir, "d3d12.dll");
-        bool ours = IsOurProxy(dll);
+        bool ours;
+        try { ours = IsOurProxy(dll); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { ours = rec.RecorderFiles.ContainsKey("d3d12.dll"); }   // held by the game
         var (status, reason) = check.Readiness switch
         {
             Readiness.Unsupported => (GameStatus.Unsupported, check.Reason),
@@ -314,9 +341,9 @@ public sealed class ScsKiller : IScsKiller
                 (GameStatus.Unsupported, $"needs a recording, which {(antiCheat == AntiCheat.Other ? "its anti-cheat" : antiCheat)} blocks"),
             Readiness.NeedsRecording => (GameStatus.NeedsRecording, check.Reason + DbNote(inDb)),
             // the plan compiles the rest, but not the game's ray tracing: that needs a recording (compiling stays possible, partial)
-            _ when rt && antiCheat == AntiCheat.None && (rec.WarmedAt == null || StaleReason(g, rec) == null) => (GameStatus.NeedsRecording, RtNote(inDb)),
+            _ when rt && antiCheat == AntiCheat.None && (rec.WarmedAt == null || StaleReason(g, rec, pending) == null) => (GameStatus.NeedsRecording, RtNote(inDb)),
             _ when rec.WarmedAt == null => (GameStatus.Ready, RtBlocked(rt, antiCheat, PartialNote(rec.Plan?.Stats) ?? check.Reason)),
-            _ when StaleReason(g, rec) is { } why => (GameStatus.Stale, why),
+            _ when StaleReason(g, rec, pending) is { } why => (GameStatus.Stale, why),
             _ => (GameStatus.Warmed, RtBlocked(rt, antiCheat, (cap is { } t && PartlyWarmedNote(rec, t, careful) is { } partly
                     ? $"partly warmed for driver {rec.WarmedDriverVersion}: {partly}" : $"warmed for driver {rec.WarmedDriverVersion}")
                 + (PartialNote(rec.Plan?.Stats) is { } partial ? "; " + partial : ""))),
@@ -329,15 +356,15 @@ public sealed class ScsKiller : IScsKiller
             rec.CacheKeys.Count > 0 && AppCache != null ? AppCache.SizeOf(rec.CacheKeys) : null,
             rec.LaunchedExeName,
             // ponytail: re-detected on every evaluation (one directory listing); cache with the scan if listings get slow
-            antiCheat == AntiCheat.None ? Middleware.Tags(Middleware.Detect(exeDir), d => (_planner as Planner)?.Packs?.Pipelines(d) ?? 0) : null,
+            antiCheat == AntiCheat.None ? Middleware.Tags(Middleware.Detect(exeDir), d => SeedsPacks(g) ? (_planner as Planner)?.PackPipelines(d, OnAmd) ?? 0 : 0) : null,
             rec.LastWarmFailed, rec.LastWarmSkipped, StutterList.Current.Find(g),
             CommunityInUse(g.Id) is { } c ? new CommunityInfo(c.Psos, c.DownloadedAt, File.Exists(RecordingPath(g.Id))) : null,
             Sharing.Shared(Store.GameDir(g.Id))?.At, inDb,
-            rec.WarmedAt != null && rec.WarmedPlanVersion != Planner.Version && rec.PlanVersion == Planner.Version ? rec.PlanNewItems : null,
+            pending.Planned,
             IsPlaying(g.Id)) with { LastWarmNeedsRecording = rec.LastWarmNeedsRecording, LastWarmCrashed = rec.LastWarmCrashed,
                 Careful = cap != null ? new CarefulCompile(rec.Careful, rec.FirstLaunch?.Compiled, careful, recorded) : null,
-                RecordedSinceWarm = rec.WarmedAt != null ? rec.RecordedSinceWarm : 0, CommunityDbPsos = entry?.Psos ?? 0, PsoPerSecond = rec.PsoPerSecond,
-                LastFrames = Frames(exeDir, Path.GetFileName(g.ExePath), rayQuery) },
+                RecordedSinceWarm = pending.Recorded, CommunityDbPsos = entry?.Psos ?? 0, PsoPerSecond = rec.PsoPerSecond,
+                LastFrames = frames },
             rec, ours, exeDir);
     }
 
@@ -361,19 +388,20 @@ public sealed class ScsKiller : IScsKiller
 
     static readonly string[] RecorderDataFiles = ["scskiller.db", "scskiller_creates.csv", "scskiller.log", FrameLog.FileName];
 
-    readonly ConcurrentDictionary<string, (long Bin, DateTime Written, long Csv, FrameReport? Report)> _frames = new();
+    readonly ConcurrentDictionary<string, (long Bin, DateTime Written, long Csv, PlayWindow? Played, FrameReport? Report)> _frames = new();
 
-    /// <summary>The frame log's report, read again only when it or the creates csv changed: a scan evaluates every game.</summary>
-    FrameReport? Frames(string exeDir, string exe, IReadOnlySet<string>? rayQuery)
+    /// <summary>The frame log's report, read again only when it, the creates csv or the watched run changed: a scan
+    /// evaluates every game.</summary>
+    FrameReport? Frames(string exeDir, string exe, IReadOnlySet<string>? rayQuery, PlayWindow? played)
     {
         var (bin, csv) = (new FileInfo(Path.Combine(exeDir, FrameLog.FileName)), Path.Combine(exeDir, "scskiller_creates.csv"));
         if (!bin.Exists) return null;
-        var stamp = (bin.Length, bin.LastWriteTimeUtc, Length(csv));
-        if (_frames.TryGetValue(bin.FullName, out var c) && (c.Bin, c.Written, c.Csv) == stamp) return c.Report;
+        var stamp = (bin.Length, bin.LastWriteTimeUtc, Length(csv), played);
+        if (_frames.TryGetValue(bin.FullName, out var c) && (c.Bin, c.Written, c.Csv, c.Played) == stamp) return c.Report;
         FrameReport? r;
-        try { r = FrameLog.Read(bin.FullName, csv, exe, rayQuery); }
+        try { r = FrameLog.Read(bin.FullName, csv, exe, rayQuery, played); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
-        _frames[bin.FullName] = (stamp.Length, stamp.LastWriteTimeUtc, stamp.Item3, r);
+        _frames[bin.FullName] = (stamp.Length, stamp.LastWriteTimeUtc, stamp.Item3, played, r);
         return r;
     }
 
@@ -564,15 +592,27 @@ public sealed class ScsKiller : IScsKiller
         _warmRate = psoPerSecond;
     }
 
-    /// <summary>The expensive part of a game's state, cached in scan.json per game.</summary>
+    /// <summary>The expensive part of a game's state, cached in scan.json per game. A cached "no anti-cheat" is checked
+    /// again each time where an update puts one (the install root's and exe folder's own entries, names only): a patch
+    /// that adds it without changing the exe or the build is caught at the next refresh.</summary>
     Evaluation Evaluated(Game g, GameRecord rec, bool force, out bool fresh)
     {
         var key = string.Join('|', ExeStamp(g), g.Version, Vendor.Caps.Profile, rec.RecordingImportedAt?.UtcTicks, CoreBuild, CommunityInUse(g.Id)?.Object);
+        Evaluation? hit = null;
         lock (_scanLock)
         {
             _scan ??= Store.LoadScan();
-            fresh = force || !_scan.TryGetValue(g.Id, out var cached) || cached.Key != key;
-            if (!fresh) return _scan[g.Id];
+            fresh = force || !_scan.TryGetValue(g.Id, out hit) || hit.Key != key;
+        }
+        if (!fresh)
+        {
+            if (hit!.AntiCheat != AntiCheat.None) EnforceAntiCheat(g, hit.AntiCheat);
+            else if (GameFiles.DetectAntiCheat(g, quick: true) is not AntiCheat.None and var found)
+            {
+                AntiCheatFound(g, found);
+                return hit with { AntiCheat = found };
+            }
+            return hit;
         }
         EngineInfo? engine = null;
         PlanCheck check;
@@ -584,24 +624,37 @@ public sealed class ScsKiller : IScsKiller
         }
         catch (Exception e) { check = new(Readiness.Unsupported, e.Message); }
         var ev = new Evaluation(key, engine, GameFiles.DetectAntiCheat(g), check);
-        lock (_scanLock)
+        if (ev.AntiCheat != AntiCheat.None) AntiCheatFound(g, ev.AntiCheat, ev);
+        else
         {
-            _scan[g.Id] = ev;
-            Store.SaveScan(_scan);
+            _verdicts.TryRemove(g.Id, out _);   // a full scan found none: clean again
+            lock (_scanLock)
+            {
+                _scan[g.Id] = ev;
+                Store.SaveScan(_scan);
+            }
         }
         return ev;
     }
 
-    string? StaleReason(Game g, GameRecord r) => WarmChanged(g, r)
-        ?? (r.WarmedPlanVersion != Planner.Version ? PlannerChanged(r)
-            : Settings.MaximumPlans && r.WarmedPerStage ? "Maximum mode: every shader pairing is still to compile" : null)   // Maximum -> standard: nothing new
-        ?? (r.RecordedSinceWarm is > 0 and var n ? $"{n:N0} new pipeline{(n == 1 ? "" : "s")} recorded; compile again to include them" : null);
+    /// <param name="pending"><see cref="PendingOf"/>, when the caller has it</param>
+    string? StaleReason(Game g, GameRecord r, Pending? pending = null)
+    {
+        var p = pending ?? PendingOf(g, r);
+        return WarmChanged(g, r)
+            ?? (p.Unknown ? (p.Recorded + (p.Planned ?? 0) is > 0 and var u ? $"{u:N0} pipeline{(u == 1 ? "" : "s")} to compile again" : "compile again")
+                + ": what the last compile replayed is no longer known" : null)
+            ?? (r.WarmedPlanVersion != Planner.Version ? PlannerChanged(r, p.Planned)
+                : Settings.MaximumPlans && r.WarmedPerStage ? "Maximum mode: every shader pairing is still to compile" : null)   // Maximum -> standard: nothing new
+            ?? (p.Recorded + (r.WarmedPlanVersion == Planner.Version ? p.Planned ?? 0 : 0) is > 0 and var n
+                ? $"{n:N0} new pipeline{(n == 1 ? "" : "s")}{(n == p.Recorded ? " recorded" : "")}; compile again to include them" : null);
+    }
 
     /// <summary>A newer planner than the warmed plan's. Its rebuild (RunItem) counts the pipelines the warm didn't compile;
     /// none marks the warm current then, so a count here is more than 0. Not rebuilt yet, or not countable (no readable
     /// warmed plan): it may compile more.</summary>
-    static string? PlannerChanged(GameRecord r) =>
-        r.PlanVersion == Planner.Version && r.PlanNewItems is { } n ? n > 0 ? $"SCSKiller can now compile {n:N0} more pipeline{(n == 1 ? "" : "s")} for this game" : null
+    static string? PlannerChanged(GameRecord r, long? planned) =>
+        r.PlanVersion == Planner.Version && planned is { } n ? n > 0 ? $"SCSKiller can now compile {n:N0} more pipeline{(n == 1 ? "" : "s")} for this game" : null
         : "SCSKiller can now compile more of this game";
 
     /// <summary>Why the warm no longer matches what the game uses, whatever the plan: driver, exe name, game build, shaders.</summary>
@@ -648,18 +701,6 @@ public sealed class ScsKiller : IScsKiller
     /// <see cref="PlanKeys"/>.</summary>
     static string PlanFingerprint(IEnumerable<string> keys) =>
         Convert.ToHexStringLower(SHA256.HashData(System.Text.Encoding.ASCII.GetBytes(string.Concat(keys.Order(StringComparer.Ordinal)))));
-
-    /// <summary>The record keys of the plan the last complete warm replayed while plan.bin still is that plan, else null. An
-    /// older record without <see cref="GameRecord.WarmedPlanItems"/>: plan.bin is it when the warmed planner version built it
-    /// before the warm; its fingerprint goes into the record then.</summary>
-    static HashSet<string>? WarmedPlanKeys(GameRecord r)
-    {
-        if (r.WarmedAt == null || r.Plan is not { } p) return null;
-        bool warmed = r.WarmedPlanItems != null ? r.PlanItems == r.WarmedPlanItems : r.PlanVersion == r.WarmedPlanVersion && r.PlanBuiltAt <= r.WarmedAt;
-        if (!warmed || PlanKeys(p.FilePath) is not { } keys) return null;
-        r.WarmedPlanItems ??= PlanFingerprint(keys);
-        return keys;
-    }
 
     static string? IndexChanged(GameRecord r) => r.IndexContentHash != r.WarmedIndexHash ? "game shaders changed since the warm" : null;
 
@@ -835,8 +876,7 @@ public sealed class ScsKiller : IScsKiller
         var parts = new List<CachePart>();
         if (AppCache != null && DriverKeys(s.Game, rec).Keys is { Count: > 0 } keys) parts.Add(Part(DriverPart, AppCache.FilesOf(keys)));
         if (s.AntiCheat != AntiCheat.None) return parts;   // anti-cheat: nothing near the game, only the driver's cache
-        parts.Add(Part(WindowsPart, D3DSCache.FoldersOf(Path.Combine(LocalAppData, "D3DSCache"), s.Game)
-            .SelectMany(d => new DirectoryInfo(d).EnumerateFiles())));
+        parts.Add(Part(WindowsPart, D3DSCache.FoldersOf(Path.Combine(LocalAppData, "D3DSCache"), s.Game).SelectMany(D3DSCache.CacheFiles)));
         if (!gamePrecache) return parts.Where(p => p.Files.Count > 0).ToList();
         // two games with one project name share the file name: whose it is is unknown, skipped
         if (UnrealUserCache.Project(s.Game.ExePath) is { } project
@@ -856,7 +896,7 @@ public sealed class ScsKiller : IScsKiller
 
     /// <summary>An Xbox game's Saved may also be in its package's own %LOCALAPPDATA%.</summary>
     string[] SavedRoots(Game g) => g.Store == Core.Store.Xbox && g.Id.StartsWith("xbox:", StringComparison.Ordinal)
-        ? [LocalAppData, MyGames, Path.Combine(LocalAppData, "Packages", g.Id["xbox:".Length..], "LocalCache", "Local")]
+        ? [LocalAppData, MyGames, Path.Combine(LocalAppData, "Packages", AppStore.Segment(g.Id["xbox:".Length..]), "LocalCache", "Local")]
         : [LocalAppData, MyGames];
 
     /// <summary>True with driver keys attributed even if nothing is left on disk. Refuses while a process named like the exe
@@ -869,7 +909,7 @@ public sealed class ScsKiller : IScsKiller
         var exe = Path.GetFileName(s.Game.ExePath);
         lock (_lock)
             if (_current == gameId) throw new InvalidOperationException($"a compile of {s.Game.Name} is in progress");
-        if (ProcessNames().Contains(Path.GetFileNameWithoutExtension(exe))) throw new InvalidOperationException($"{s.Game.Name} is running");
+        if (GameRunning(s.Game)) throw new InvalidOperationException($"{s.Game.Name} is running");
         var keys = DriverKeys(s.Game, rec).Keys;
         var driver = AppCache != null && keys.Count > 0;
         if (driver && SharedWith(gameId, keys) is { Count: > 0 } shared)
@@ -911,13 +951,16 @@ public sealed class ScsKiller : IScsKiller
     List<(string Name, List<string> Keys)> SharedWith(string gameId, IReadOnlySet<string> keys)
     {
         var shared = new List<(string, List<string>)>();
+        var exe = Path.GetFileName(Find(gameId).Game.ExePath);
         foreach (var o in Games)
         {
             if (o.Game.Id == gameId) continue;
             var other = Store.LoadGame(o.Game.Id);
             var hint = AmdAppCache.HintKey(WarmExeName(o.Game, other));
             var ags = AgsFor(o.Game, other) != null ? AgsKey(o.Game) : null;
-            var both = keys.Where(k => other.CacheKeys.Contains(k) || k == hint || k == ags).Order().ToList();
+            // NVIDIA keys every file by the exe name, whatever its case
+            var sameName = AppCache is not AmdAppCache && Path.GetFileName(o.Game.ExePath).Equals(exe, StringComparison.OrdinalIgnoreCase);
+            var both = keys.Where(k => sameName || other.CacheKeys.Contains(k) || k == hint || k == ags).Order().ToList();
             if (both.Count > 0) shared.Add((o.Game.Name, both));
         }
         return shared;
@@ -973,19 +1016,27 @@ public sealed class ScsKiller : IScsKiller
         else ScheduledTask.Register(ScheduledTask.TaskExe() ?? throw new FileNotFoundException(@"the command-line tool (cli\scskiller.exe) is not next to the app"));
     }
 
-    void Refresh(Game g)
+    void Refresh(Game g, CancellationToken ct = default)
     {
         var ticket = Ticket();
-        var s = Evaluate(g, false, out _);
+        var s = Evaluate(g, false, out _, ct);
         lock (_lock)
         {
             if (_evaluatedAt.GetValueOrDefault(g.Id) > ticket) return;   // an evaluation started later is in place
             _evaluatedAt[g.Id] = ticket;
+            s = WithVerdict(s);
             var i = _games.FindIndex(x => x.Game.Id == g.Id);
             if (i >= 0) _games[i] = s; else _games.Add(s);
         }
         GameChanged?.Invoke(s);
     }
+
+    // game id -> the last anti-cheat verdict AntiCheatFound recorded, until a full evaluation finds none
+    readonly ConcurrentDictionary<string, AntiCheat> _verdicts = new();
+
+    /// <summary>An evaluation that read the game before a verdict was recorded never shows it clean.</summary>
+    GameState WithVerdict(GameState s) =>
+        s.AntiCheat == AntiCheat.None && _verdicts.TryGetValue(s.Game.Id, out var v) ? s with { AntiCheat = v } : s;
 
     // Evaluations overlap (a scan, a game's exit, a compile's end): each takes a ticket before it reads anything, and a
     // state is stored only over one from an older ticket, so a slow one never replaces what a later one read.
@@ -1003,7 +1054,7 @@ public sealed class ScsKiller : IScsKiller
             var id = states[i].Game.Id;
             if (_evaluatedAt.GetValueOrDefault(id) > tickets[i] && _games.Find(x => x.Game.Id == id) is { } newer) states[i] = newer;
             else _evaluatedAt[id] = tickets[i];
-            now.Add(states[i]);
+            now.Add(WithVerdict(states[i]));
         }
         return now;
     }
@@ -1067,19 +1118,140 @@ public sealed class ScsKiller : IScsKiller
     {
         var games = (states ?? Games).Where(s => s.Engine != null).Select(s => s.Game).ToList();
         lock (_scanLock)
-            if (CommunitySync.IsCompleted && Community != null && Settings.UseCommunityDb) CommunitySync = Task.Run(() => SyncCommunity(games));
+            if (CommunitySync.IsCompleted && Community != null) CommunitySync = Task.Run(() => SyncCommunity(games));
     }
 
-    /// <summary>The manifest, then a download for every game whose build has an entry other than the one it has; each game
+    /// <summary>The shared packs (<see cref="SyncPacks"/>, whatever the settings and the sign-in), then with
+    /// Settings.UseCommunityDb the manifest, then a download for every game whose build has an entry other than the one it has; each game
     /// that got one, or whose entry the manifest check changed (signed out nothing downloads), is re-evaluated. Never throws.</summary>
     async Task SyncCommunity(IReadOnlyList<Game> games)
     {
         try
         {
+            foreach (var g in await SyncPacks(games, CancellationToken.None)) Refresh(g);
+            if (!Settings.UseCommunityDb) return;
             foreach (var g in games)
                 if (await SyncCommunity(g, null, CancellationToken.None) || DbEntryChanged(g)) Refresh(g);
         }
         catch (Exception e) { Log?.Report($"community database: {e.Message}"); }
+    }
+
+    /// <summary>Downloads the shared pack of every upscaler DLL version (<see cref="Middleware.SharedVendors"/>) next to these
+    /// games' exes that the manifest lists for this GPU vendor and that isn't downloaded yet, matched locally by its pack key:
+    /// the requests name only packs this PC has a DLL for, and nothing about its games. Returns the games whose pack changed.</summary>
+    async Task<List<Game>> SyncPacks(IReadOnlyList<Game> games, CancellationToken ct)
+    {
+        var changed = new List<Game>();
+        if (Community is not { } community || (_planner as Planner)?.SharedPacks is not { } shared || PackGpu(Vendor.Vendor) is not { } gpu) return changed;
+        var dlls = games.SelectMany(g => Middleware.Detect(g).Where(d => d.Packable && Middleware.SharedVendors.Contains(d.Vendor)).Select(d => (Game: g, Dll: d))).ToList();
+        // no DLL is hashed unless the manifest lists a pack at all
+        if (dlls.Count == 0 || await community.ManifestAsync(ct) is not { HasPacks: true } manifest) return changed;
+        var keyed = dlls.Select(x => (x.Game, x.Dll, Image: Middleware.TryScan(x.Dll.Path))).Where(x => x.Image != null)
+            .Select(x => (x.Game, x.Dll, x.Image, Key: HashOnly.PackKey(gpu, x.Dll.Vendor, x.Dll.Name, x.Image!.ContentHash))).ToList();
+        foreach (var pack in keyed.GroupBy(x => x.Key))
+        {
+            var (_, d, image, key) = pack.First();
+            if (manifest.FindPack(key) is not { } e || shared.Load(d, image!)?.Header.Object == e.Object) continue;
+            var users = pack.Select(x => x.Game).DistinctBy(g => g.Id).ToList();
+            if (await community.DownloadPackAsync(e, d, image!, shared, gpu == "amd", ct) is not { } n)
+            {
+                if (community.Problem is { } why) Log?.Report($"{d.Name}: shared pack: {why}");
+                continue;
+            }
+            Log?.Report($"{d.Name} ({image!.ContentHash[..12]}): shared pack downloaded ({n:N0} pipelines, {e.Uploaders} contributor{(e.Uploaders == 1 ? "" : "s")})");
+            changed.AddRange(users.Where(g => !changed.Any(c => c.Id == g.Id)));
+        }
+        return changed;
+    }
+
+    bool OnAmd => Vendor.Caps.Profile.StartsWith("amd");
+
+    /// <summary>The game's plans take pack entries (<see cref="Planner.SeedsPacks"/>), by the engine the scan found.</summary>
+    bool SeedsPacks(Game g)
+    {
+        EngineInfo? engine;
+        lock (_scanLock) engine = _scan?.GetValueOrDefault(g.Id)?.Engine;
+        return engine != null && Planner.SeedsPacks(engine);
+    }
+
+    /// <summary>The entries of the pack of this DLL version that seed a plan on this GPU (<see cref="MiddlewarePacks.Runs"/>),
+    /// and the root signatures the pack keeps.</summary>
+    (List<PsoDb.Rec> Entries, List<string> RootSignatures) PackSeeds(MiddlewarePacks packs, MiddlewareDll d) =>
+        d.Packable && Directory.Exists(Path.Combine(packs.Dir, d.Vendor)) ? packs.Seeds(d, OnAmd) : ([], []);   // no pack of its vendor: not hashed
+
+    /// <summary>The inputs a compile would take now (<see cref="WarmInputs"/>): the recording, the community recording while
+    /// one is in use, the plan, and for a D3D12 game the entries of its DLLs' packs this GPU runs. Cached on all of them.</summary>
+    HashSet<string> InputsNow(Game g, GameRecord r)
+    {
+        var dir = Store.GameDir(g.Id);
+        var community = CommunityInUse(g.Id) != null ? Path.Combine(dir, "community.db") : null;
+        var dlls = Middleware.Detect(g).Where(d => d.Packable).ToList();
+        var packs = _planner is Planner p && SeedsPacks(g) ? new[] { p.Packs, p.SharedPacks }.OfType<MiddlewarePacks>().ToList() : [];
+        var packFiles = packs.SelectMany(x => dlls.Where(d => Directory.Exists(Path.Combine(x.Dir, d.Vendor)))
+            .Select(d => Middleware.TryScan(d.Path) is { } i ? x.PathOf(d.Vendor, d.Name, i.ContentHash) : null));
+        string?[] inputs = [RecordingPath(g.Id), community, r.Plan?.FilePath, Path.Combine(dir, Sharing.ShippedFile), .. dlls.Select(d => d.Path), .. packFiles];
+        return KeyFiles.Derived(dir, inputs, $"{IndexIsInstalled(g, r)}|{r.IndexContentHash}|{OnAmd}", () =>
+            WarmInputs.Of(RecordedNow(g, r), r.Plan?.FilePath, SeedsNow(g).SelectMany(s => s.Entries), Elsewhere(g, r)));
+    }
+
+    /// <summary>What the packs of the DLLs next to the game's exe seed on this GPU (<see cref="PackSeeds"/>).</summary>
+    List<(List<PsoDb.Rec> Entries, List<string> RootSignatures)> SeedsNow(Game g) =>
+        _planner is Planner p && SeedsPacks(g)
+            ? [.. new[] { p.Packs, p.SharedPacks }.OfType<MiddlewarePacks>().SelectMany(x => Middleware.Detect(g).Where(d => d.Packable).Select(d => PackSeeds(x, d)))]
+            : [];
+
+    /// <summary>The blobs on disk a warm of this game finds outside its recordings and plan, for the count and the warm's
+    /// snapshot alike: the build's shaders (index.shaders; unknown: taken as there), the DLLs next to its exe and the root
+    /// signatures of what their packs seed.</summary>
+    Func<string, bool> Elsewhere(Game g, GameRecord r)
+    {
+        var shipped = Shipped(g, r);
+        var images = Middleware.Detect(g).Where(d => d.Packable).Select(d => Middleware.TryScan(d.Path)).OfType<MiddlewareImage>().ToList();
+        var roots = SeedsNow(g).SelectMany(s => s.RootSignatures).ToHashSet();
+        return h => shipped?.Contains(h) != false || roots.Contains(h) || images.Any(i => i.Containers.ContainsKey(h));
+    }
+
+    /// <summary>The recordings' part of <see cref="InputsNow"/>, read now.</summary>
+    WarmInputs.Recorded RecordedNow(Game g, GameRecord r) =>
+        WarmInputs.Recorded.Read([RecordingPath(g.Id), .. CommunityInUse(g.Id) != null ? new[] { Path.Combine(Store.GameDir(g.Id), "community.db") } : []], Elsewhere(g, r));
+
+    /// <summary>The pipelines every warm on this driver skips: they crash it.</summary>
+    IReadOnlySet<string> CrashKeysNow(GameRecord r) => r.CrashKeysDriver == Vendor.Gpu.DriverVersion ? r.CrashKeys : new HashSet<string>();
+
+    /// <summary>New pipelines since the last complete warm, derived whenever the game is evaluated: the inputs a compile
+    /// would take now (<see cref="InputsNow"/>) that the warm didn't take when it started (its key file), less the
+    /// pipelines that crash this driver; split into what the planner made (<paramref name="Planned"/>, the plan's key file;
+    /// null without a readable one) and the rest (<paramref name="Recorded"/>). A warm key file missing or damaged is an
+    /// unknown baseline (<paramref name="Unknown"/>): everything counts, as for a warm from before warms kept one.</summary>
+    readonly record struct Pending(long Recorded, long? Planned, bool Unknown = false);
+
+    Pending PendingOf(Game g, GameRecord r)
+    {
+        if (r.WarmedAt == null) return new(0, null);
+        var dir = Store.GameDir(g.Id);
+        var warmed = r.WarmKeysFile is { } wf ? KeyFiles.Set(Path.Combine(dir, wf)) : null;
+        var made = r.PlanKeysFile is { } pf ? KeyFiles.Set(Path.Combine(dir, pf)) : null;
+        var crash = CrashKeysNow(r);
+        var fresh = InputsNow(g, r).Where(i => !crash.Contains(WarmInputs.Key(i)) && (warmed == null || !WarmInputs.Taken(warmed, i))).Select(WarmInputs.Key).ToList();
+        return new(fresh.Count(k => made?.Contains(k) != true), made == null ? null : fresh.Count(made.Contains), warmed == null);
+    }
+
+    /// <summary>The plan's records the planner made: neither a pack entry nor in the recording prepared for it in <paramref name="work"/>.</summary>
+    static HashSet<string> PlannerMade(Plan plan, string work)
+    {
+        var rec = Path.Combine(work, "recording.db");
+        var recorded = File.Exists(rec) ? PipelineKeys(rec) : [];
+        return [.. Planner.PlanBody(plan.FilePath).Where(r => r.Tag is not ('B' or 'M')).Select(r => r.Key).Where(k => !recorded.Contains(k))];
+    }
+
+    /// <summary>The keys of what a plan replays, the pack entries' own keys included (not their 'M' wrappers'); empty when unreadable.</summary>
+    static HashSet<string> PlanPipelineKeys(string path)
+    {
+        try
+        {
+            return PlanFile.Read(path).Records.Where(r => r.Tag != 'B').Select(r => r.Tag == 'M' ? MiddlewarePacks.Unwrap(r).Entry.Key : r.Key).ToHashSet();
+        }
+        catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException or System.Text.Json.JsonException) { return []; }
     }
 
     bool DbEntryChanged(Game g)
@@ -1091,8 +1263,7 @@ public sealed class ScsKiller : IScsKiller
     }
 
     /// <summary>One game: by its fresh index's content hash when given, else by its store build (no build id: its last
-    /// index). True when a new recording was downloaded. Without a content hash (not a compile), a warmed game's pipelines
-    /// the download adds and its plan lacks count in <see cref="GameRecord.RecordedSinceWarm"/>.</summary>
+    /// index). True when a new recording was downloaded.</summary>
     async Task<bool> SyncCommunity(Game g, string? contentHash, CancellationToken ct)
     {
         if (Community is not { } community || !Settings.UseCommunityDb || await community.ManifestAsync(ct) is not { } manifest) return false;
@@ -1100,21 +1271,12 @@ public sealed class ScsKiller : IScsKiller
         var dir = Store.GameDir(g.Id);
         if (entry == null || entry.Object == Community.Downloaded(dir)?.Object) return false;
         // a compile saves its own record after this, and plans and warms the download anyway
-        var before = contentHash == null && Store.LoadGame(g.Id).WarmedAt != null
-            ? new[] { Path.Combine(dir, "community.db"), RecordingPath(g.Id) }.Where(File.Exists).SelectMany(PipelineKeys).ToHashSet() : null;
         if (await community.DownloadAsync(entry, dir, ct) is not { } got)
         {
             if (community.Problem is { } why) Log?.Report($"{g.Name}: community database: {why}");
             return false;
         }
         Log?.Report($"{g.Name}: community recording downloaded ({got.Psos:N0} pipelines, {entry.Uploaders} contributor{(entry.Uploaders == 1 ? "" : "s")})");
-        if (before != null)
-        {
-            var rec = Store.LoadGame(g.Id);
-            var planned = rec.Plan is { } p ? PlanKeys(p.FilePath) : null;
-            rec.RecordedSinceWarm += PipelineKeys(Path.Combine(dir, "community.db")).Count(k => !before.Contains(k) && planned?.Contains(k) != true);
-            Store.SaveGame(g.Id, rec);
-        }
         return true;
     }
 
@@ -1130,6 +1292,7 @@ public sealed class ScsKiller : IScsKiller
 
     async Task Share(Sharing sharing, List<Game> games)
     {
+        await SharePacks(sharing);
         string? logged = null;   // a back-off's problem once per pass, not once per game
         foreach (var g in games)
             try
@@ -1149,6 +1312,19 @@ public sealed class ScsKiller : IScsKiller
             catch (Exception e) { Log?.Report($"{g.Name}: sharing the recording failed: {e.Message}"); }
     }
 
+    /// <summary>This PC's packs of the shared vendors that gained records since they were last uploaded (<see cref="Sharing.SharePacksAsync"/>).</summary>
+    async Task SharePacks(Sharing sharing)
+    {
+        if ((_planner as Planner)?.Packs is not { } packs || PackGpu(Vendor.Vendor) is not { } gpu) return;
+        try
+        {
+            foreach (var (dll, n) in await sharing.SharePacksAsync(packs.Dir, gpu, AppVersion.Current.ToString()))
+                Log?.Report($"{dll}: upscaler pack shared ({n:N0} pipelines)");
+            if (sharing.Problem is { } why) Log?.Report($"sharing upscaler packs: {why}");
+        }
+        catch (Exception e) { Log?.Report($"sharing upscaler packs failed: {e.Message}"); }
+    }
+
     UploadMeta UploadMetaOf(Game g, string version, string contentHash)
     {
         static string? Clip(string? s) => s is { Length: > 128 } ? s[..128] : s;
@@ -1163,52 +1339,55 @@ public sealed class ScsKiller : IScsKiller
     /// last import, then empties it once nothing has it open (<see cref="Recordings"/>). Whatever the inbox holds is merged
     /// by record key, so a recording that started over loses nothing. A copy stored before compact recordings (a proxy db,
     /// or its merge with the community's in recording.all.db) is left to <see cref="MigrateRecordings"/> unless
-    /// <paramref name="migrate"/>.</summary>
-    bool ImportRecording(Game g, GameRecord rec, bool migrate = false)
+    /// <paramref name="migrate"/>. Waits for the recording lock until <paramref name="ct"/> is cancelled (it then throws).</summary>
+    bool ImportRecording(Game g, GameRecord rec, bool migrate = false, CancellationToken ct = default)
     {
         var inbox = new FileInfo(Path.Combine(Path.GetDirectoryName(g.ExePath)!, "scskiller.db"));
         var store = RecordingPath(g.Id);
         var all = Path.Combine(Store.GameDir(g.Id), "recording.all.db");
         var keysFile = Path.Combine(inbox.DirectoryName!, Recordings.KeysFile);
         // keys naming more than the index's shaders with no recording (the data folder was deleted): the recorder would skip blobs nothing has
-        if (!File.Exists(store) && File.Exists(keysFile) && Length(keysFile) != 8 + Math.Max(0, Length(Path.Combine(Store.GameDir(g.Id), Sharing.ShippedFile)) - 20)) WriteKeys(g, rec);
+        if (!File.Exists(store) && File.Exists(keysFile) && Length(keysFile) != 8 + Math.Max(0, Length(Path.Combine(Store.GameDir(g.Id), Sharing.ShippedFile)) - 20)) WriteKeys(g, rec, ct);
         var legacy = Legacy(g.Id);
         if (legacy && !migrate) return false;
         var stamp = inbox.Exists ? $"{inbox.Length}:{inbox.LastWriteTimeUtc.Ticks}" : null;
         var pending = inbox is { Exists: true, Length: > 0 } && stamp != rec.RecordingInbox;
-        if (!pending && Length(store) == 0 && legacy)   // only a community merge (or an empty copy): nothing of this PC's to keep
-        {
-            try { foreach (var f in new[] { all, all + ".key", store }) File.Delete(f); }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log?.Report($"{g.Name}: could not delete {all}: {e.Message}"); return false; }
-            return true;
-        }
+        if (!pending && legacy)
+            using (Recordings.Lock(store, ct: ct))   // decided under it too: another process may have just imported into the copy
+                if (Length(store) == 0 && Legacy(g.Id))   // only a community merge (or an empty copy): nothing of this PC's to keep
+                {
+                    try { foreach (var f in new[] { all, all + ".key", store }) File.Delete(f); }
+                    catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log?.Report($"{g.Name}: could not delete {all}: {e.Message}"); return false; }
+                    return true;
+                }
         if (!pending && !legacy)
         {
-            if (inbox is not { Exists: true, Length: > 0 } || !Recordings.Rotate(inbox.FullName, inbox.Length)) return false;   // imported while the game held it
+            if (inbox is not { Exists: true, Length: > 0 }) return false;
+            // imported while the game held it: emptied once it's gone, and nothing in its folder while it runs
+            using (Recordings.Lock(store, ct: ct))
+            {
+                if (!GameFolderWrite(g) || !Recordings.Rotate(inbox.FullName, inbox.Length)) return false;
+                if (rec.KeysPending) WriteKeys(g, rec, ct);   // imported while the game ran: its keys waited too
+            }
             rec.RecordingInbox = null;
             return true;
         }
         int added;
         try
         {
-            lock (RecordingLock)
+            using (Recordings.Lock(store, ct: ct))
             {
                 Directory.CreateDirectory(Store.GameDir(g.Id));
                 var shipped = Shipped(g, rec);
                 var keys = Recordings.Merge(store, pending ? inbox.FullName : null, shipped == null ? null : shipped.Contains);
                 File.Delete(all);
                 File.Delete(all + ".key");
-                // only what the current plan doesn't compile: a session re-recording planned pipelines adds nothing to compile
-                var planned = keys.Count > 0 && rec.Plan is { } p ? PlanKeys(p.FilePath) : null;
-                // what a community download brought was counted when it came
-                var community = keys.Count > 0 && CommunityInUse(g.Id) != null ? PipelineKeys(Path.Combine(Store.GameDir(g.Id), "community.db")) : null;
-                added = keys.Count(k => planned?.Contains(k) != true && community?.Contains(k) != true);
+                added = keys.Count;
                 (rec.RecordingInbox, rec.RecordingIndexHash) = (stamp, shipped != null ? rec.IndexContentHash : null);
                 if (keys.Count > 0) rec.RecordingImportedAt = DateTimeOffset.Now;
-                rec.RecordedSinceWarm += added;
                 WriteKeys(g, rec);
                 // emptied: what it gets next is new, whatever its size and write time
-                if (pending && Recordings.Rotate(inbox.FullName, inbox.Length)) rec.RecordingInbox = null;
+                if (pending && GameFolderWrite(g) && Recordings.Rotate(inbox.FullName, inbox.Length)) rec.RecordingInbox = null;
             }
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidDataException)
@@ -1221,8 +1400,8 @@ public sealed class ScsKiller : IScsKiller
         return true;
     }
 
-    /// <summary>Recording store writes (imports, compaction, migration), one at a time.</summary>
-    static readonly Lock RecordingLock = new();
+    /// <summary>Tests: a compile has read its recordings and is about to prepare them (under the recording lock).</summary>
+    internal Action? RecordingsRead;
 
     /// <summary>The game's recording is stored as before compact recordings: <see cref="MigrateRecordings"/> converts it.</summary>
     bool Legacy(string gameId) => File.Exists(RecordingPath(gameId)) && !PsoDb.IsCompact(RecordingPath(gameId))
@@ -1242,37 +1421,60 @@ public sealed class ScsKiller : IScsKiller
     /// and the last index's shaders, which it names by hash only while the install is that build
     /// (<see cref="IndexIsInstalled"/>, noted in <see cref="GameRecord.KeysIndexHash"/>). Without the file the recorder
     /// records everything with its bytes, which the next import drops. Without the recorder the file is deleted. Returns
-    /// the records it leaves out (<see cref="Recordings.WriteKeys"/>).</summary>
-    int WriteKeys(Game g, GameRecord rec)
+    /// the records it leaves out (<see cref="Recordings.WriteKeys"/>). Nothing while the game runs (<see cref="GameFolderWrite"/>),
+    /// checked again once the lock is held: <see cref="GameRecord.KeysPending"/>, and the refresh or reconcile after it
+    /// exits writes it.</summary>
+    int WriteKeys(Game g, GameRecord rec, CancellationToken ct = default)
     {
         var dir = Path.GetDirectoryName(g.ExePath)!;
         var keys = Path.Combine(dir, Recordings.KeysFile);
+        if (!GameFolderWrite(g)) return KeysLater(rec);
+        using var gate = Recordings.Lock(RecordingPath(g.Id), ct: ct);   // the keys file's writers too: one temp name in the game folder
+        if (!GameFolderWrite(g)) return KeysLater(rec);   // the game may have started during the wait
         try
         {
-            if (IsOurProxy(Path.Combine(dir, "d3d12.dll")))
+            var dll = Path.Combine(dir, "d3d12.dll");
+            if (IsOurProxy(dll))
             {
                 var shipped = rec.IndexContentHash is { } h ? Sharing.Shipped(Store.GameDir(g.Id), h) : null;
                 var installed = shipped != null && IndexIsInstalled(g, rec);
-                var left = Recordings.WriteKeys(RecordingPath(g.Id), shipped, keys, installed);
-                rec.KeysIndexHash = installed ? rec.IndexContentHash : null;
+                var later = false;   // the game started before the publish
+                var left = Recordings.WriteKeys(RecordingPath(g.Id), shipped, keys, installed,
+                    () =>
+                    {
+                        if (GameFolderWrite(g)) return IsOurProxy(dll);
+                        later = true;
+                        return false;
+                    });
+                (rec.KeysIndexHash, rec.KeysPending) = (installed ? rec.IndexContentHash : null, later);   // cleared once written
                 return left;
             }
             File.Delete(keys);
-            rec.KeysIndexHash = null;
+            (rec.KeysIndexHash, rec.KeysPending) = (null, false);
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { RecorderLog($"{g.Name}: couldn't write {keys}: {e.Message}"); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            rec.KeysPending = true;   // the next refresh tries again
+            RecorderLog($"{g.Name}: couldn't write {keys}: {e.Message}");
+        }
+        return 0;
+    }
+
+    static int KeysLater(GameRecord rec)
+    {
+        rec.KeysPending = true;
         return 0;
     }
 
     /// <summary>After indexing a build the recording wasn't checked against: shader bytes the index now has are dropped, and
     /// the keys file names this build's shaders and stops naming records whose shaders it no longer has.</summary>
-    void CompactRecording(Game g, GameRecord rec, ShaderIndex index)
+    void CompactRecording(Game g, GameRecord rec, ShaderIndex index, CancellationToken ct = default)
     {
         var same = rec.RecordingIndexHash == index.ContentHash;
         if (same && rec.KeysIndexHash == index.ContentHash || Legacy(g.Id)) return;
         try
         {
-            lock (RecordingLock)
+            using (Recordings.Lock(RecordingPath(g.Id), ct: ct))
             {
                 if (!same && File.Exists(RecordingPath(g.Id))) Recordings.Merge(RecordingPath(g.Id), null, index.Shaders.ContainsKey);
                 rec.RecordingIndexHash = index.ContentHash;
@@ -1314,7 +1516,7 @@ public sealed class ScsKiller : IScsKiller
                 }
                 queue.ContinueWith(_ => { }).Wait(TimeSpan.FromSeconds(1));
             }
-            if (IsPlaying(g.Id) || ProcessNames().Contains(Path.GetFileNameWithoutExtension(g.ExePath))) continue;
+            if (GameRunning(g)) continue;
             try
             {
                 var rec = Store.LoadGame(g.Id);
@@ -1414,7 +1616,7 @@ public sealed class ScsKiller : IScsKiller
             var rec = Store.LoadGame(gameId);
             rec.RecordAlongsideMod = on;
             Store.SaveGame(gameId, rec);
-            if (!Reconcile(s, ProcessNames())) Refresh(s.Game);
+            if (!Reconcile(s)) Refresh(s.Game);
         }
     }
 
@@ -1439,15 +1641,16 @@ public sealed class ScsKiller : IScsKiller
         lock (_lock)
             if (_current == gameId) throw new InvalidOperationException($"a compile of {s.Game.Name} is in progress");
         lock (_recorderLock)
+        using (Recordings.Lock(RecordingPath(gameId)))   // a migration or import mid-write would put the recording back
         {
-            if (IsPlaying(gameId) || ProcessNames().Contains(Path.GetFileNameWithoutExtension(s.Game.ExePath)))
+            if (!GameFolderWrite(s.Game))
                 throw new InvalidOperationException($"{s.Game.Name} is running");
             var files = RecordingFiles(s.Game).Select(f => new FileInfo(f)).Where(f => f.Exists).ToList();
             if (files.Count == 0) return false;
             AppCacheFiles.DeleteAll(files);   // all or none; throws "files in use by <process>"
             var rec = Store.LoadGame(gameId);
             // a changed recording: the next compile re-plans, and the scan's planner check runs again without it
-            (rec.RecordingImportedAt, rec.RecordedSinceWarm, rec.RecordingInbox, rec.RecordingIndexHash) = (DateTimeOffset.Now, 0, null, null);
+            (rec.RecordingImportedAt, rec.RecordingInbox, rec.RecordingIndexHash) = (DateTimeOffset.Now, null, null);
             WriteKeys(s.Game, rec);   // it named the deleted copy's blobs and records
             Store.SaveGame(gameId, rec);
             RecorderLog($"{s.Game.Name}: recording cleared ({string.Join(", ", files.Select(f => f.FullName))})");
@@ -1472,37 +1675,42 @@ public sealed class ScsKiller : IScsKiller
             var rec = Store.LoadGame(gameId);
             rec.Recorder = value;
             Store.SaveGame(gameId, rec);
-            if (!Reconcile(s, ProcessNames())) Refresh(s.Game);   // the override shows either way
+            if (!Reconcile(s)) Refresh(s.Game);   // the override shows either way
         }
     }
 
     public void ReconcileRecorders(string? gameId = null)
     {
         lock (_recorderLock)
-        {
-            var running = ProcessNames();
             foreach (var s in Games.Where(s => gameId == null || s.Game.Id == gameId))
-                Reconcile(s, running);
-        }
+                Reconcile(s);
     }
 
     /// <summary>True when the game was re-evaluated; a running game's change waits for it to exit.</summary>
-    bool Reconcile(GameState s, IReadOnlySet<string> running)
+    bool Reconcile(GameState s)
     {
         var (g, id) = (s.Game, s.Game.Id);
         var dir = Path.GetDirectoryName(g.ExePath)!;
         var dll = Path.Combine(dir, "d3d12.dll");
         var rec = Store.LoadGame(id);
         bool ours = IsOurProxy(dll), changed = false;
+        if (rec.RecorderRollback || _rollbacks.ContainsKey(id))   // a failed install's leftovers go first, before any save, switch On or not
+        {
+            var left = GameRunning(g) ? "removed when the game exits"
+                : TakeOut(g, rec, "a failed install's recorder") ? null : "couldn't remove: the game holds it";
+            if (left == null) _recorderNotes.TryRemove(id, out _); else _recorderNotes[id] = left;
+            Refresh(g);
+            return true;
+        }
         if (rec.Recorder == null)   // not migrated: a recorder the user installed stays theirs
         {
             rec.Recorder = ours ? RecorderOverride.On : RecorderOverride.Default;
             Store.SaveGame(id, rec);
             changed = true;
         }
-        if ((ours || rec.RecorderFiles.Count > 0 || rec.RecorderChained != null) && rec.RecorderExe != g.ExePath)
+        if ((ours || rec.RecorderFiles.Count > 0 || rec.RecorderChained != null) && (rec.RecorderExe != g.ExePath || rec.RecorderInstallDir != g.InstallDir))
         {
-            rec.RecorderExe = g.ExePath;
+            (rec.RecorderExe, rec.RecorderInstallDir) = (g.ExePath, g.InstallDir);
             Store.SaveGame(id, rec);
         }
         bool want = RecorderEffective(rec.Recorder.Value, Settings.RecordAllGames, RecorderSkip(s, ModSkip(dir, rec, ours)));
@@ -1511,7 +1719,7 @@ public sealed class ScsKiller : IScsKiller
         string? note = null;
         if (want != ours || update || (!want && (rec.RecorderFiles.Count > 0 || rec.RecorderChained != null)))
         {
-            if (running.Contains(Path.GetFileNameWithoutExtension(g.ExePath)))
+            if (GameRunning(g))
                 note = update ? "updates when the game exits" : want ? "installs when the game exits" : "removed when the game exits";
             else
                 try
@@ -1541,8 +1749,29 @@ public sealed class ScsKiller : IScsKiller
                     RecorderLog($"{g.Name}: recorder {note}");
                 }
         }
-        else if (want && !running.Contains(Path.GetFileNameWithoutExtension(g.ExePath)))
+        else if (want && !GameRunning(g))
+        {
+            if (rec.KeysPending)   // a rewrite that waited for the game to exit
+                try
+                {
+                    WriteKeys(g, rec);
+                    Store.SaveGame(id, rec);
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { RecorderLog($"{g.Name}: couldn't write the keys file: {e.Message}"); }
             UpdateRecorderIni(g, rec);
+        }
+        // no recorder of ours here: what one left (an earlier version's recorder off, a file that was locked) goes
+        else if (!want && !ours && rec.RecorderExe == null && RecorderDataFiles.Append(Recordings.KeysFile).Any(f => File.Exists(Path.Combine(dir, f)))
+                 && !GameRunning(g))
+            try
+            {
+                if (RemoveRecorderData(dir, RecordingPath(id), rec.RecordingInbox, () => GameRunning(g)))
+                {
+                    RecorderLog($"{g.Name}: the recorder's data files removed ({dir})");
+                    changed = true;
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidDataException) { }   // the next scan tries again
         if (note != _recorderNotes.GetValueOrDefault(id))
         {
             if (note == null) _recorderNotes.TryRemove(id, out _); else _recorderNotes[id] = note;
@@ -1571,26 +1800,21 @@ public sealed class ScsKiller : IScsKiller
     static Version FileVersion(string path) =>
         FileVersionInfo.GetVersionInfo(path) is var v ? new(v.FileMajorPart, v.FileMinorPart, v.FileBuildPart, v.FilePrivatePart) : new();
 
-    static IReadOnlySet<string> RunningProcessNames()
-    {
-        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var p in Process.GetProcesses())
-            using (p) names.Add(p.ProcessName);
-        return names;
-    }
+    /// <summary>Running processes' names without the extension, from the snapshot: none opened.</summary>
+    static IReadOnlySet<string> RunningProcessNames() =>
+        ProcessTree.Snapshot().Select(p => Path.GetFileNameWithoutExtension(p.Exe)).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     void Install(Game g, GameRecord rec)
     {
-        var antiCheat = GameFiles.DetectAntiCheat(g);   // fresh, not the cached scan: a patch may have added one
-        if (antiCheat != AntiCheat.None)
-            throw new InvalidOperationException($"{g.Name} uses {antiCheat}: a d3d12.dll in its folder could get the account banned. Not installing.");
+        RefuseAntiCheat(g, rec);   // fresh, not the cached scan: a patch may have added one
+        if (!GameFolderWrite(g)) throw new InvalidOperationException($"{g.Name} is running");
         var src = _proxyDll ?? throw new FileNotFoundException("the proxy d3d12.dll was not found next to the app");
         var dir = Path.GetDirectoryName(g.ExePath)!;
         var dll = Path.Combine(dir, "d3d12.dll");
         var ini = Path.Combine(dir, "scskiller.ini");
         bool iniOurs = !File.Exists(ini) || (rec.RecorderFiles.TryGetValue("scskiller.ini", out var h) && h == Sha256(ini));
         bool chain = File.Exists(dll) && !IsOurProxy(dll);
-        rec.RecorderExe = g.ExePath;
+        (rec.RecorderExe, rec.RecorderInstallDir) = (g.ExePath, g.InstallDir);
         if (chain)
         {
             if (!rec.RecordAlongsideMod)
@@ -1600,8 +1824,25 @@ public sealed class ScsKiller : IScsKiller
             var to = Path.Combine(dir, ChainName);
             if (File.Exists(to)) throw new InvalidOperationException($"{to} already exists. Not renaming {dll} over it.");
             rec.RecorderChained = new ChainedDll(ChainName, Sha256(dll));
+            InstallStep?.Invoke("chain");
             Store.SaveGame(g.Id, rec);   // before the rename: no renamed file is ever missing from the manifest
+            if (!GameFolderWrite(g))   // it may have started while the save waited for the record's lock
+            {
+                rec.RecorderChained = null;
+                Store.SaveGame(g.Id, rec);
+                throw new InvalidOperationException($"{g.Name} is running");
+            }
             File.Move(dll, to);
+        }
+        InstallStep?.Invoke("copy");
+        if (!GameFolderWrite(g))
+        {
+            if (chain)   // this attempt's rename (an update keeps the chain it found): put back after the game exits
+            {
+                (rec.RecorderRollback, _rollbacks[g.Id]) = (true, true);
+                Store.SaveGame(g.Id, rec);
+            }
+            throw new InvalidOperationException($"{g.Name} is running");
         }
         try { File.Copy(src, dll, overwrite: true); }
         catch when (chain)
@@ -1611,15 +1852,185 @@ public sealed class ScsKiller : IScsKiller
             Store.SaveGame(g.Id, rec);
             throw;
         }
-        rec.RecorderFiles["d3d12.dll"] = Sha256(dll);
-        WriteKeys(g, rec);   // a recorder installed again records only what's new
-        if (iniOurs)
+        // from here on the proxy is in the game folder: whatever happens, the full check runs and the manifest is saved
+        var antiCheat = AntiCheat.None;
+        Exception? failed = null;
+        try
         {
-            File.WriteAllText(ini, IniText(g, rec));
-            rec.RecorderFiles["scskiller.ini"] = Sha256(ini);
-        }   // else: the user's own scskiller.ini, left alone and not tracked
-        Store.SaveGame(g.Id, rec);
+            rec.RecorderFiles["d3d12.dll"] = Sha256(dll);
+            InstallStep?.Invoke("copied");
+            antiCheat = GameFiles.DetectAntiCheat(g, quick: true);   // an update may have added one since the check, likely next to the exe
+            if (antiCheat == AntiCheat.None && !GameFolderWrite(g)) throw new InvalidOperationException($"{g.Name} started while the recorder was installed");
+            if (antiCheat == AntiCheat.None && iniOurs)
+            {
+                File.WriteAllText(ini, IniText(g, rec));
+                rec.RecorderFiles["scskiller.ini"] = Sha256(ini);
+            }   // else: the user's own scskiller.ini, left alone and not tracked
+        }
+        catch (Exception e) { failed = e; }
+        // the full check before anything that may wait for a lock (the keys file's, the record's)
+        if (antiCheat == AntiCheat.None) antiCheat = GameFiles.DetectAntiCheat(g);
+        if (antiCheat == AntiCheat.None && failed == null)
+            try
+            {
+                InstallStep?.Invoke("keys");
+                WriteKeys(g, rec);   // a recorder installed again records only what's new
+                Store.SaveGame(g.Id, rec);
+                // last, after every wait: an update may have added anti-cheat while this one waited for a lock
+                antiCheat = GameFiles.DetectAntiCheat(g);
+                if (antiCheat == AntiCheat.None)
+                {
+                    lock (_scanLock) _scan?.Remove(g.Id);   // the next refresh evaluates the game again, its anti-cheat too
+                    return;
+                }
+            }
+            catch (Exception e) { failed = e; }
+        if (antiCheat != AntiCheat.None)
+        {
+            AntiCheatFound(g, antiCheat, installing: rec);
+            throw AntiCheatRefusal(g, antiCheat);
+        }
+        TakeOut(g, rec, $"the recorder install failed ({failed!.Message})");
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(failed);
     }
+
+    /// <summary>Whether SCSKiller may write into the game's folder now: not while the game runs (<see cref="GameRunning"/>;
+    /// the staged warm runs under its name too). Every write there checks it: the proxy's copy (<see cref="Install"/>),
+    /// <see cref="TakeOut"/>, the keys file (<see cref="WriteKeys"/>), the ini (<see cref="UpdateRecorderIni"/>), the
+    /// inbox's rotation (<see cref="ImportRecording"/>), <see cref="ClearRecording"/> and the reconcile's install and
+    /// removal; the uninstall hook uses <see cref="Running"/>, the same check without the watcher.</summary>
+    bool GameFolderWrite(Game g) => !GameRunning(g);
+
+    /// <summary>The one answer to "is this game running" before touching it: the watcher sees it playing (which uses
+    /// <see cref="RunsFromItsFolder"/> too), or <see cref="Running"/> (the uninstall hook's check) with
+    /// <see cref="ProcessNames"/> (replaceable for tests). No process is opened.</summary>
+    bool GameRunning(Game g) => IsPlaying(g.Id) || Running(g.ExePath, g.InstallDir, ProcessNames());
+
+    /// <summary>The watcher's folder check: it only shows what plays, so a snapshot up to a second old will do, and a staged
+    /// warm (scskiller_warm.exe's child, named like the game) isn't the game playing. Write guards count it all the same.</summary>
+    static bool RunsFromItsFolder(Game g) => RunsFrom(false, [g.InstallDir, Path.GetDirectoryName(g.ExePath)], notWarms: true);
+
+    /// <summary>A process runs named like an exe in one of <paramref name="dirs"/> (a game a launcher started under another
+    /// exe name too). No process is opened, so another program with the same name counts as well: that only delays
+    /// SCSKiller's writes. <paramref name="fresh"/>: a snapshot taken now, as every check before a write takes; else one
+    /// up to a second old.</summary>
+    static bool RunsFrom(bool fresh, string?[] dirs, bool notWarms = false)
+    {
+        HashSet<string> names;
+        try
+        {
+            names = dirs.OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase).Where(Directory.Exists)
+                .SelectMany(d => Directory.EnumerateFiles(d, "*.exe")).Select(f => Path.GetFileName(f)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return true; }   // can't tell: as if it runs
+        if (names.Count == 0) return false;
+        var all = fresh ? ProcessTree.Snapshot() : ProcessTree.RecentSnapshot();
+        var warms = notWarms ? all.Where(p => p.Exe.Equals("scskiller_warm.exe", StringComparison.OrdinalIgnoreCase)).Select(p => p.Pid).ToHashSet() : [];
+        return all.Any(p => names.Contains(p.Exe) && !warms.Contains(p.Parent));
+    }
+
+    /// <summary>Takes out what a failed install placed or an anti-cheat game holds: our proxy (by its marker, whether the
+    /// manifest was saved or not), the files the manifest names, the keys file, and puts a chained mod back. False when it
+    /// can't go yet (the game runs, or holds the proxy): pending (<see cref="GameRecord.RecorderRollback"/>, and in memory in
+    /// case the record can't be saved), and the next reconcile does it first.</summary>
+    bool TakeOut(Game g, GameRecord rec, string cause)
+    {
+        var dir = Path.GetDirectoryName(g.ExePath)!;
+        bool done;
+        if (!GameFolderWrite(g))
+        {
+            (rec.RecorderRollback, _rollbacks[g.Id], done) = (true, true, false);
+            RecorderLog($"{g.Name}: {cause}: the recorder is removed when the game exits");
+        }
+        else try
+        {
+            RemoveRecorder(dir, rec, g.Name, RecorderLog);
+            // not through WriteKeys: no wait for the recording lock with a proxy maybe still in place
+            try { File.Delete(Path.Combine(dir, Recordings.KeysFile)); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            (rec.KeysIndexHash, rec.RecorderRollback, done) = (null, false, true);
+            _rollbacks.TryRemove(g.Id, out _);
+            RecorderLog($"{g.Name}: {cause}: recorder removed ({dir})");
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            (rec.RecorderRollback, _rollbacks[g.Id], done) = (true, true, false);
+            RecorderLog($"{g.Name}: {cause}; removing the recorder failed ({e.Message}): removed when the game exits");
+        }
+        try { Store.SaveGame(g.Id, rec); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { RecorderLog($"{g.Name}: couldn't save the recorder's record: {e.Message}"); }
+        return done;
+    }
+
+    /// <summary>The one place an anti-cheat verdict lands (the full scan, a cached verdict, the refresh's name probe, the
+    /// install's checks): the verdict in memory first (the scan's cache and the live game state; it can't fail), then the
+    /// recorder out (<see cref="EnforceAntiCheat"/>), whatever comes after (a stop, a cancelled scan, a scan cache that
+    /// can't be written), then the verdict saved; a failed save is logged. <paramref name="installing"/>: Install's own
+    /// record, not saved yet; else the record is read under the recorder lock.</summary>
+    void AntiCheatFound(Game g, AntiCheat found, Evaluation? fresh = null, GameRecord? installing = null)
+    {
+        bool changed;
+        lock (_scanLock)
+        {
+            _scan ??= Store.LoadScan();
+            changed = fresh != null || _scan.GetValueOrDefault(g.Id) is { } ev && ev.AntiCheat != found;
+            if (fresh != null) _scan[g.Id] = fresh;
+            else if (changed) _scan[g.Id] = _scan[g.Id] with { AntiCheat = found };
+        }
+        _verdicts[g.Id] = found;   // an older evaluation's state published later keeps it (WithVerdict)
+        lock (_lock)
+            if (_games.FindIndex(x => x.Game.Id == g.Id) is var i and >= 0 && _games[i].AntiCheat != found) _games[i] = _games[i] with { AntiCheat = found };
+        EnforceAntiCheat(g, found, installing);
+        if (!changed) return;
+        lock (_scanLock)
+            try { Store.SaveScan(_scan); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { RecorderLog($"{g.Name}: couldn't save that it uses {found}: {e.Message}"); }
+    }
+
+    /// <summary>Our recorder out of a game with anti-cheat, now (<see cref="TakeOut"/>: no wait for the recording lock, the
+    /// inbox kept for the next import), or, while the game runs or holds the proxy, as soon as it exits. Under the recorder
+    /// lock, with the record read there (or Install's, which holds the lock). Any failure, the check of what's ours
+    /// included (a dll locked against reading), leaves the removal pending.</summary>
+    void EnforceAntiCheat(Game g, AntiCheat found, GameRecord? installing = null)
+    {
+        lock (_recorderLock)
+        {
+            var rec = installing ?? Store.LoadGame(g.Id);
+            try
+            {
+                if (!IsOurProxy(Path.Combine(Path.GetDirectoryName(g.ExePath)!, "d3d12.dll")) && rec.RecorderFiles.Count == 0 && rec.RecorderChained == null) return;
+                TakeOut(g, rec, $"{found} found");
+            }
+            catch (Exception e)
+            {
+                (rec.RecorderRollback, _rollbacks[g.Id]) = (true, true);
+                RecorderLog($"{g.Name}: {found} found; removing the recorder failed ({e.Message}): it's tried again at the next reconcile");
+                try { Store.SaveGame(g.Id, rec); }
+                catch (Exception x) when (x is IOException or UnauthorizedAccessException) { }   // in memory
+            }
+        }
+    }
+
+    /// <summary>Games whose failed install left the proxy in place (<see cref="GameRecord.RecorderRollback"/>), in case
+    /// the record couldn't be saved.</summary>
+    readonly ConcurrentDictionary<string, bool> _rollbacks = new();
+
+    /// <summary>Called by Install with "chain" (before it saves a mod's rename), "copy" (after its anti-cheat check, before
+    /// it copies the proxy), "copied" and "keys" (after its full checks, before the keys file and the record) (tests).</summary>
+    public Action<string>? InstallStep { get; set; }
+
+    /// <summary>Throws when a fresh scan finds anti-cheat (or can't read the whole install), after <see cref="AntiCheatFound"/>:
+    /// an older recorder already there (an update) goes too.</summary>
+    void RefuseAntiCheat(Game g, GameRecord rec)
+    {
+        var antiCheat = GameFiles.DetectAntiCheat(g);
+        if (antiCheat == AntiCheat.None) return;
+        AntiCheatFound(g, antiCheat, installing: rec);
+        throw AntiCheatRefusal(g, antiCheat);
+    }
+
+    static InvalidOperationException AntiCheatRefusal(Game g, AntiCheat antiCheat) =>
+        new($"{g.Name} uses {antiCheat}: a d3d12.dll in its folder could get the account banned. Not installing.");
 
     string IniText(Game g, GameRecord rec)
     {
@@ -1635,6 +2046,7 @@ public sealed class ScsKiller : IScsKiller
     /// grew the copy, a clear); a user's own ini is left alone. The proxy reads it when the game starts.</summary>
     void UpdateRecorderIni(Game g, GameRecord rec)
     {
+        if (!GameFolderWrite(g)) return;   // the next refresh after it exits
         try
         {
             var ini = Path.Combine(Path.GetDirectoryName(g.ExePath)!, "scskiller.ini");
@@ -1648,12 +2060,19 @@ public sealed class ScsKiller : IScsKiller
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { RecorderLog($"{g.Name}: couldn't update the recording limit: {e.Message}"); }
     }
 
-    /// <summary>The recorder's data files stay: the recording is imported.</summary>
+    /// <summary>The recording is imported, then the recorder's data files are deleted.</summary>
     void Uninstall(Game g, GameRecord rec)
     {
-        RemoveRecorder(Path.GetDirectoryName(g.ExePath)!, rec, g.Name, RecorderLog);
+        var dir = Path.GetDirectoryName(g.ExePath)!;
+        RemoveRecorder(dir, rec, g.Name, RecorderLog);
         ImportRecording(g, rec, migrate: true);
         Store.SaveGame(g.Id, rec);
+        try
+        {
+            if (!RemoveRecorderData(dir, RecordingPath(g.Id), rec.RecordingInbox, () => GameRunning(g)))
+                RecorderLog($"{g.Name}: the game started: the recorder's data files left in {dir} for the next reconcile");
+        }
+        catch (InvalidDataException e) { RecorderLog($"{g.Name}: left the recorder's data files in {dir}: {e.Message}"); }
     }
 
     /// <summary>Deletes the files Install wrote whose hash still matches (a dll only if it is our proxy) and any proxy of
@@ -1682,59 +2101,85 @@ public sealed class ScsKiller : IScsKiller
             }
             rec.RecorderChained = null;
         }
-        rec.RecorderExe = null;
+        (rec.RecorderExe, rec.RecorderInstallDir) = (null, null);
     }
 
     static readonly TimeSpan UninstallBudget = TimeSpan.FromSeconds(20);   // Velopack kills its uninstall hook at 30 s
 
     /// <summary>SCSKiller's own uninstall (installer.md §5): takes the recorder out of every game folder the data folder
     /// records one in (<see cref="GameRecord.RecorderExe"/>, no scan), then its data files once the data folder's
-    /// recording holds the game's scskiller.db. A running game's folder is left. What it did goes to recorders.log.</summary>
-    public static void RemoveAllRecorders(AppStore store, IReadOnlySet<string>? running = null)
+    /// recording holds the game's scskiller.db. A running game's folder is left. What it did goes to recorders.log. No step
+    /// waits for a lock past <paramref name="budget"/> (<see cref="UninstallBudget"/> when not given).</summary>
+    public static void RemoveAllRecorders(AppStore store, IReadOnlySet<string>? running = null, TimeSpan? budget = null)
     {
         var clock = Stopwatch.StartNew();
+        var limit = budget ?? UninstallBudget;
+        TimeSpan Left() => limit - clock.Elapsed is var left && left > TimeSpan.Zero ? left : TimeSpan.Zero;
         running ??= RunningProcessNames();
         void Log(string line) => RecordersLog(store.DataDir, "uninstall: " + line);
         var games = Path.Combine(store.DataDir, "games");
-        var removed = new List<(string Id, string Dir)>();
-        foreach (var id in (Directory.Exists(games) ? Directory.GetDirectories(games) : []).Select(d => Path.GetFileName(d)).Order())
+        var removed = new List<(string Id, string Dir, Func<bool> Runs)>();
+        foreach (var id in (Directory.Exists(games) ? Directory.GetDirectories(games) : []).Select(d => AppStore.GameId(Path.GetFileName(d))).Order())
             try
             {
-                var rec = store.LoadGame(id);   // the folder name is the id with ':' replaced, which GameDir leaves as it is
+                var rec = store.LoadGame(id);
                 if (rec.RecorderExe is not { } exe) continue;
                 var dir = Path.GetDirectoryName(exe)!;
-                if (clock.Elapsed > UninstallBudget) Log($"out of time: recorder left in {dir}");
-                else if (running.Contains(Path.GetFileNameWithoutExtension(exe))) Log($"{exe} is running: recorder left in {dir}");
+                var installDir = rec.RecorderInstallDir;
+                bool Runs() => Running(exe, installDir, running);
+                if (clock.Elapsed > limit) Log($"out of time: recorder left in {dir}");
+                else if (Runs()) Log($"{exe} is running: recorder left in {dir}");
                 else
                 {
                     RemoveRecorder(dir, rec, dir, Log);
-                    store.SaveGame(id, rec);
-                    removed.Add((id, dir));
+                    store.SaveGame(id, rec, Left());
+                    removed.Add((id, dir, Runs));
                     Log($"recorder removed from {dir}");
                 }
             }
             catch (Exception e) { Log($"{id}: {e.Message}"); }
-        foreach (var (id, dir) in removed)
+        foreach (var (id, dir, runs) in removed)
             try
             {
-                if (clock.Elapsed > UninstallBudget) Log($"out of time: the recorder's data files left in {dir}");
-                else RemoveRecorderData(dir, Path.Combine(store.GameDir(id), "recording.db"), store.LoadGame(id).RecordingInbox);
+                if (clock.Elapsed > limit) Log($"out of time: the recorder's data files left in {dir}");
+                else if (!RemoveRecorderData(dir, Path.Combine(store.GameDir(id), "recording.db"), store.LoadGame(id).RecordingInbox, runs, Left()))
+                    Log($"the game started: the recorder's data files left in {dir}");
             }
             catch (Exception e) { Log($"{dir}: {e.Message}"); }
     }
 
     /// <summary>The files the proxy writes, and its keys file. scskiller.db goes once <paramref name="recording"/> holds it:
-    /// merged into it first unless it was imported as it is (<paramref name="imported"/>: its size and write time then).</summary>
-    static void RemoveRecorderData(string dir, string recording, string? imported)
+    /// merged into it first unless it was imported as it is (<paramref name="imported"/>: its size and write time then).
+    /// False, nothing deleted, when the game <paramref name="runs"/> once the merge is done.</summary>
+    static bool RemoveRecorderData(string dir, string recording, string? imported, Func<bool> runs, TimeSpan? wait = null)
     {
-        if (!Directory.Exists(dir)) return;
+        if (!Directory.Exists(dir)) return true;
         var src = new FileInfo(Path.Combine(dir, "scskiller.db"));
         if (src is { Exists: true, Length: > 0 } && $"{src.Length}:{src.LastWriteTimeUtc.Ticks}" != imported)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(recording)!);
-            lock (RecordingLock) Recordings.Merge(recording, src.FullName, null);
+            using (Recordings.Lock(recording, wait)) Recordings.Merge(recording, src.FullName, null);
         }
-        foreach (var f in RecorderDataFiles.Append(Recordings.KeysFile)) File.Delete(Path.Combine(dir, f));
+        if (runs()) return false;   // it may have started while the merge waited for the lock
+        Exception? first = null;
+        foreach (var f in RecorderDataFiles.Append(Recordings.KeysFile))   // a locked file doesn't keep the others
+            try { File.Delete(Path.Combine(dir, f)); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { first ??= e; }
+        if (first != null) throw first;
+        return true;
+    }
+
+    /// <summary>The running check of <see cref="GameRunning"/> without the watcher: a process named like the exe
+    /// (<paramref name="names"/>, without extensions), or like an exe of the install root or the exe's folder. Without a
+    /// recorded install root (a record from an older build), the exe's folder and the three above it: Unreal's
+    /// Binaries\Win64 sits three below the root.</summary>
+    static bool Running(string exe, string? installDir, IReadOnlySet<string> names)
+    {
+        var dir = Path.GetDirectoryName(exe)!;
+        var roots = installDir != null ? [installDir, dir]
+            : new[] { dir, Path.GetDirectoryName(dir), Path.GetDirectoryName(Path.GetDirectoryName(dir)),
+                      Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(dir))) };
+        return names.Contains(Path.GetFileNameWithoutExtension(exe)) || RunsFrom(true, roots);
     }
 
     // _queue is kept in run order: the running item first, then the waiting ones, then the finished ones (Done, Failed,
@@ -1742,6 +2187,8 @@ public sealed class ScsKiller : IScsKiller
     // whenever the PC is idle, after any normal item that is waiting while the queue runs (one item at a time).
 
     public bool QueueRunning { get { lock (_lock) return _running; } }
+
+    public bool Compiling { get { lock (_lock) return _current != null; } }
 
     /// <summary>Adds the game at the end of the waiting items. Runs when the queue is started (or right away if it is
     /// running). On a queued "when idle" item: it becomes a normal item (runs with the queue, in the foreground).</summary>
@@ -1941,7 +2388,11 @@ public sealed class ScsKiller : IScsKiller
             if (id == null) { await Task.Delay(Poll); continue; }   // only "when idle" items left and the user is here
             try
             {
-                using (Busy.Hold()) await RunItem(id, ct);   // no update applies under a running item (Updates.cs)
+                // no update applies under a running item, and no item starts while one is handed over (Busy.TryHold)
+                IDisposable? hold;
+                while ((hold = Busy.TryHold(Store.DataDir, Clock())) == null && !ct.IsCancellationRequested) await Task.Delay(Poll);
+                if (hold == null) Set(new QueueItem(id, QueueStage.Stopped, null, null, null));   // stopped while it waited
+                else using (hold) await RunItem(id, ct);
             }
             finally { lock (_lock) (_current, _run, _itemCts) = (null, null, null); }
         }
@@ -2001,7 +2452,7 @@ public sealed class ScsKiller : IScsKiller
             var index = _reader.Index(game, engine, Log, ct);
             (rec.IndexContentHash, rec.ShaderCount, rec.IndexGameVersion, rec.IndexExeStamp) = (index.ContentHash, index.Shaders.Count, game.Version, ExeStamp(game));
             Sharing.SaveShipped(Store.GameDir(id), index);
-            CompactRecording(game, rec, index);
+            CompactRecording(game, rec, index, ct);
             Store.SaveGame(id, rec);
             // a newer community recording for exactly this build: fetched first, within a short wait (never holds a compile up)
             using (var wait = CancellationTokenSource.CreateLinkedTokenSource(ct))
@@ -2013,33 +2464,40 @@ public sealed class ScsKiller : IScsKiller
             // prepared once, for the plan and for the warm: the planner reads the recorded shaders' bytes too
             var prepared = false;
             Recording? recording = null;
+            WarmInputs.Recorded? recorded = null;   // the warm's recorded inputs, read before the recordings are prepared
             Recording? Prepared()
             {
                 if (prepared) return recording;
                 if (Directory.Exists(work)) Directory.Delete(work, true);
-                (prepared, recording) = (true, PrepareRecording(game, engine, index, work, ct));
+                using (Recordings.Lock(RecordingPath(id), ct: ct))   // no import (any process's) between the snapshot's read and the preparation's
+                {
+                    recorded = RecordedNow(game, rec);
+                    RecordingsRead?.Invoke();
+                    (prepared, recording) = (true, PrepareRecording(game, engine, index, work, ct));
+                }
                 return recording;
             }
             // middleware packs (another game's recording may have grown one this install's DLLs match): a change re-plans
-            var packs = (_planner as Planner)?.Packs;
+            var packs = _planner as Planner;
             bool current = false;   // this rebuild found the warm still current: nothing to warm
-            if (PlanIsStale(id, rec) || (packs != null && packs.Fingerprint(game) != (rec.PlanMiddleware ?? "")))
+            var shared = packs?.SharedFingerprint(game);   // before the build: a download during it must still re-plan
+            if (PlanIsStale(id, rec) || (packs != null && packs.PackFingerprint(game, shared) != (rec.PlanMiddleware ?? "")))
             {
                 Stage(QueueStage.Planning);
                 await Gate(id, ct);
-                var warmedKeys = WarmedPlanKeys(rec);   // before the build overwrites plan.bin
                 rec.PlanPerStage = PerStagePlans;
                 rec.Plan = _planner.Build(game, engine, index, Prepared(), Vendor.Caps, Store.GameDir(id), Log, ct, Settings.MaximumPlans);
                 (rec.PlanBuiltAt, rec.PlanVersion, rec.ResumeAt) = (DateTimeOffset.Now, Planner.Version, 0);
-                rec.PlanMiddleware = packs?.Fingerprint(game);   // after the build: it may have promoted into a pack
+                rec.PlanMiddleware = packs is null ? null : packs.SeededFingerprint(rec.Plan) ?? packs.PackFingerprint(game, shared);   // what the build read: it may have promoted into one
                 rec.PlanCommunity = CommunityInUse(id)?.Object;
                 var keys = PlanKeys(rec.Plan.FilePath);
                 rec.PlanItems = keys == null ? null : PlanFingerprint(keys);
-                rec.PlanNewItems = keys == null || warmedKeys == null ? null : keys.Count(k => !warmedKeys.Contains(k));
+                rec.PlanKeysFile = KeyFiles.Write(Store.GameDir(id), "plan", PlannerMade(rec.Plan, work));
                 // a newer planner that compiles nothing the warm didn't (the same records, or fewer): the warm is current
-                if (current = rec.PlanNewItems == 0 && rec.WarmedPlanVersion != Planner.Version && StaleReason(game, rec) == null)
+                if (current = PendingOf(game, rec).Planned == 0 && rec.WarmedPlanVersion != Planner.Version && StaleReason(game, rec) == null)
                     (rec.WarmedPlanVersion, rec.WarmedPlanItems) = (rec.PlanVersion, rec.PlanItems);
                 Store.SaveGame(id, rec);
+                Store.PruneKeyFiles(id);   // after the save: the state never names a file that is gone
             }
             bool planOnly;
             lock (_lock) planOnly = _planOnly.Remove(id);
@@ -2052,6 +2510,8 @@ public sealed class ScsKiller : IScsKiller
             Stage(QueueStage.Materializing);
             await Gate(id, ct);
             Prepared();
+            // the warm's inputs as it starts, read as the count reads them: what it prepared, and its plan; never read again
+            var inputs = WarmInputs.Of(recorded!, rec.Plan!.FilePath, [], Elsewhere(game, rec));
             if (recording != null) SessionLog.WriteRayQueryKeys(recording.DbPath, RayQueryKeysPath(id));
             else File.Delete(RayQueryKeysPath(id));
             // ponytail: re-materialized on every run (also after a stop); keep work\ across a stop if that gets slow
@@ -2132,11 +2592,13 @@ public sealed class ScsKiller : IScsKiller
                         rec.WarmedDriverVersion = Vendor.Gpu.DriverVersion;
                         (rec.WarmedPlanVersion, rec.WarmedExeName, rec.WarmedPerStage) = (rec.PlanVersion, exe, rec.PlanPerStage);
                         (rec.WarmedAgsApp, rec.AgsMissed) = (agsUsed?.App, rec.AgsMissed && agsUsed == null);   // after a miss, AGS returns only once the game's keys prove it
-                        (rec.WarmedPlanItems, rec.PlanNewItems) = (rec.PlanItems, 0);
+                        rec.WarmedPlanItems = rec.PlanItems;
                         (rec.WarmedAt, rec.LastWarmTime, rec.LastCacheGrowthBytes) = (DateTimeOffset.Now, TimeSpan.FromSeconds(seconds), result.CacheGrowthBytes);
                         (rec.LastWarmFailed, rec.LastWarmSkipped, rec.LastWarmNeedsRecording, rec.WarmedKeys) = (result.Failed, result.Skipped, needsRecording, [.. cacheKeys]);
                         rec.WarmedFiles = AppCache is AmdAppCache amd ? amd.D3D12FileNames(cacheKeys) : null;
-                        (rec.LastWarmCrashed, rec.RecordedSinceWarm) = (crashed, 0);
+                        rec.LastWarmCrashed = crashed;
+                        // what this warm replayed: what is new after it is derived against it (PendingOf)
+                        rec.WarmKeysFile = KeyFiles.Write(Store.GameDir(id), "warm", inputs.Select(WarmInputs.Token));
                         (rec.WarmedIndexHash, rec.WarmedExeStamp, rec.WarmedGameVersion) = (index.ContentHash, ExeStamp(game), game.Version);
                         (rec.ResumeAt, rec.ResumeItems, rec.ResumeSeconds) = (0, 0, 0);
                         (rec.WarmedCareful, rec.FirstLaunch) = (carefulPasses > 0, null);   // judged again by the next launch
@@ -2148,6 +2610,7 @@ public sealed class ScsKiller : IScsKiller
                             if (result.CacheGrowthBytes > 0 && n > 0) rec.BytesPerPso = (double)result.CacheGrowthBytes / n;
                         }
                         Store.SaveGame(id, rec);
+                        Store.PruneKeyFiles(id);
                         Stage(QueueStage.Done);
                         break;
                     case WarmOutcome.Stopped:
@@ -2169,10 +2632,13 @@ public sealed class ScsKiller : IScsKiller
         {
             try { if (Directory.Exists(work)) Directory.Delete(work, true); }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log?.Report($"could not delete {work}: {e.Message}"); }
-            Refresh(game);
+            // a stop, before or during it, skips what waits for the recording lock (the next scan imports): no shutdown waits.
+            // Anti-cheat it finds takes the recorder out all the same (AntiCheatFound).
+            try { Refresh(game, ct); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log?.Report($"{game.Name}: refreshing failed: {e.Message}"); }
             StartSharing([game]);   // the content hash of this build is known now
             // the staged warm runs under the game's exe name, so a reconcile meanwhile waited for it
-            if (ManageRecorders)
+            if (ManageRecorders && !ct.IsCancellationRequested)
                 try { ReconcileRecorders(id); }
                 catch (Exception e) { Log?.Report($"{game.Name}: reconciling the recorder failed: {e.Message}"); }
         }
@@ -2259,44 +2725,17 @@ public sealed class ScsKiller : IScsKiller
         return running;
     }
 
-    /// <summary>Staged warms are scskiller_warm.exe's children. The launched name's case comes from the module list (the PEB:
-    /// CASEPROBE.EXE for caseProbe.exe; the kernel gives the file's case), read once per process; anti-cheat games are never opened.</summary>
+    /// <summary>Staged warms are scskiller_warm.exe's children. Names only, from the process snapshot: no process is opened,
+    /// so a launched name's case comes from the recorder's #session marker (MergeLaunched), not from here.</summary>
     IReadOnlySet<string> DiscoveredGamesRunning()
     {
-        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var byName = Games.GroupBy(s => Path.GetFileName(s.Game.ExePath), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => (Disk: g.Key, AntiCheat: g.Any(s => s.AntiCheat != AntiCheat.None)), StringComparer.OrdinalIgnoreCase);
-        if (byName.Count == 0) return running;
-        var all = ProcessTree.Snapshot();
+        var disk = Games.Select(s => Path.GetFileName(s.Game.ExePath)).Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(n => n, StringComparer.OrdinalIgnoreCase);
+        var all = ProcessTree.Snapshot();   // fresh: one per poll
         var warms = all.Where(p => p.Exe.Equals("scskiller_warm.exe", StringComparison.OrdinalIgnoreCase)).Select(p => p.Pid).ToHashSet();
-        Dictionary<(int, string), string> known;
-        lock (_launchedByPid) known = new(_launchedByPid);
-        var seen = new Dictionary<(int, string), string>();
-        foreach (var (pid, parent, exe) in all)
-        {
-            if (!byName.TryGetValue(exe, out var game) || warms.Contains(parent)) continue;
-            if (!known.TryGetValue((pid, exe), out var name))
-            {
-                name = game.Disk;
-                if (!game.AntiCheat)
-                    try
-                    {
-                        using var p = Process.GetProcessById(pid);
-                        if (Path.GetFileName(p.MainModule?.FileName) is { } launched && launched.Equals(game.Disk, StringComparison.OrdinalIgnoreCase)) name = launched;
-                    }
-                    catch (Exception) { }   // access denied or exited: the install's name
-            }
-            seen[(pid, exe)] = name;
-            running.Add(name);
-        }
-        lock (_launchedByPid)   // exited processes are forgotten
-        {
-            _launchedByPid.Clear();
-            foreach (var (k, v) in seen) _launchedByPid[k] = v;
-        }
-        return running;
+        return all.Where(p => disk.ContainsKey(p.Exe) && !warms.Contains(p.Parent)).Select(p => disk[p.Exe])   // the install's case
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
-    readonly Dictionary<(int Pid, string Exe), string> _launchedByPid = [];
 
     string? GameNameIn(IReadOnlySet<string> runningExes) =>
         Games.FirstOrDefault(s => runningExes.Contains(Path.GetFileName(s.Game.ExePath)))?.Game.Name;
@@ -2335,7 +2774,8 @@ public sealed class ScsKiller : IScsKiller
         if (games.Count == 0) return;
         var at = Clock();
         var running = new HashSet<string>(Running(), StringComparer.OrdinalIgnoreCase);
-        var now = games.Where(s => running.Contains(Path.GetFileName(s.Game.ExePath))).Select(s => s.Game.Id).ToHashSet();
+        // also a game a launcher started under another exe name of its folders
+        var now = games.Where(s => running.Contains(Path.GetFileName(s.Game.ExePath)) || RunsFromItsFolder(s.Game)).Select(s => s.Game.Id).ToHashSet();
         var was = _playing;
         var started = now.Where(id => !was.Contains(id)).ToList();
         var ended = new List<string>();

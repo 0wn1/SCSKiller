@@ -11,13 +11,14 @@ namespace SCSKiller.Tests.Planning;
 /// the same DLL version and materializing from that install's copy (fake DLLs with embedded fake containers).</summary>
 public class MiddlewarePackTests(ITestOutputHelper output)
 {
-    static readonly EngineInfo Engine = new("Fake", "1", null, "D3D12", false, null);
+    internal static readonly EngineInfo Engine = new("Fake", "1", null, "D3D12", false, null);
     static readonly VendorCaps Caps = new("nvidia-1", true, true, true);
 
     /// <summary>A valid DXBC container with one chunk (fourcc + data); the seed makes each one's bytes (and hash) unique.</summary>
-    static byte[] Container(string fourcc, string seed)
+    internal static byte[] Container(string fourcc, string seed)
     {
-        var data = Encoding.ASCII.GetBytes(seed.PadRight(16, '.'));
+        // an RTS0 part is an empty 1.0 root signature (no parameters, no samplers), then the seed
+        byte[] data = [.. fourcc == "RTS0" ? new byte[] { 1, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0 } : [], .. Encoding.ASCII.GetBytes(seed.PadRight(16, '.'))];
         var size = 32 + 4 + 8 + data.Length;
         var b = new byte[size];
         "DXBC"u8.CopyTo(b);
@@ -32,7 +33,7 @@ public class MiddlewarePackTests(ITestOutputHelper output)
         return b;
     }
 
-    static string Sha(byte[] b) => PsoDb.Hex(SHA1.HashData(b));
+    internal static string Sha(byte[] b) => PsoDb.Hex(SHA1.HashData(b));
 
     /// <summary>A minimal PE32+ whose export directory names it <paramref name="exportName"/>, followed by
     /// <paramref name="payload"/> (embedded containers, as a DLL's .rdata holds them).</summary>
@@ -62,9 +63,9 @@ public class MiddlewarePackTests(ITestOutputHelper output)
         return [.. head, .. payload.SelectMany(p => p.Concat(new byte[13]))]; // unaligned, padded like real data
     }
 
-    static Game GameIn(string dir, string id) => new(id, id, Store.Other, dir, Path.Combine(dir, "game.exe"));
+    internal static Game GameIn(string dir, string id) => new(id, id, Store.Other, dir, Path.Combine(dir, "game.exe"));
 
-    static ShaderIndex Index(params string[] shas) =>
+    internal static ShaderIndex Index(params string[] shas) =>
         new("content-1", ["PCD3D_SM6"], shas.ToDictionary(h => h, h => new ShaderInfo(h, Stage.Compute, "cs_6_0", 0, new(0, 0, 0, 0), [], [], [])),
             [new ShaderMap("map", "Global", "PCD3D_SM6", shas)]);
 

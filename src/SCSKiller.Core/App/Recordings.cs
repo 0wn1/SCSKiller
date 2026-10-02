@@ -12,6 +12,33 @@ public static class Recordings
 {
     public const string KeysFile = "scskiller.keys";
 
+    /// <summary>Held around a read-modify-write of <paramref name="store"/> (import, compaction, migration, clearing) by every
+    /// process: two writers would each replace the file with their own merge and drop the other's records. Every writer
+    /// of <paramref name="store"/> holds it, so a temp file found under it belongs to a writer that is gone: removed once
+    /// not written for an hour, or written before the PC started (no process is looked at). <paramref name="wait"/>,
+    /// <paramref name="ct"/>: as <see cref="AppStore.PathGate"/>.</summary>
+    public static IDisposable Lock(string store, TimeSpan? wait = null, CancellationToken ct = default)
+    {
+        var gate = new AppStore.PathGate(store, wait, ct);
+        var dir = Path.GetDirectoryName(Path.GetFullPath(store))!;
+        var booted = DateTime.UtcNow - TimeSpan.FromMilliseconds(Environment.TickCount64);
+        try
+        {
+            if (Directory.Exists(dir))
+                foreach (var tmp in new DirectoryInfo(dir).EnumerateFiles(Path.GetFileName(store) + ".*tmp"))
+                    try
+                    {
+                        if (tmp.LastWriteTimeUtc < DateTime.UtcNow.AddHours(-1) || tmp.LastWriteTimeUtc < booted) tmp.Delete();
+                    }
+                    catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }   // still open: left
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }   // left for the next writer
+        return gate;
+    }
+
+    /// <summary>Tests: runs once a keys file is written, before it replaces the old one.</summary>
+    internal static Action? BeforeKeysPublished;
+
     // proxy.cpp load_keys: magic, then 20-byte record keys and blob hashes
     static ReadOnlySpan<byte> KeysMagic => "SCSKKEY1"u8;
 
@@ -41,6 +68,7 @@ public static class Recordings
         bool Dropped(Rec r) => r.Tag == 'B' && shipped != null && Hex(r.Payload.AsSpan(0, 20)) is var h && named.Contains(h) && shipped(h)
                                && !Dxbc.IsRootSignatureOnly(r.Payload.AsSpan(20));
         WriteCompact(store, Union().Where(r => !Dropped(r)));
+        KeyFiles.Forget(store);
         return added;
     }
 
@@ -52,8 +80,10 @@ public static class Recordings
     /// record it holds that replays from the two. A record naming a blob neither has is left out, so the recorder records it
     /// again, with its bytes, if the game still creates it. Returns how many were left out. With nothing to name, no file.
     /// Not <paramref name="nameShipped"/> (the install may be another build than <paramref name="shipped"/>'s): its shaders
-    /// only say which records stay named, and the recorder records every new shader with its bytes.</summary>
-    public static int WriteKeys(string store, IReadOnlySet<string>? shipped, string path, bool nameShipped = true)
+    /// only say which records stay named, and the recorder records every new shader with its bytes. Nothing created,
+    /// deleted or published unless <paramref name="publish"/> holds before it starts and right before the publish (the
+    /// proxy is still there and the game isn't running: a rollback deletes the file without the recording lock).</summary>
+    public static int WriteKeys(string store, IReadOnlySet<string>? shipped, string path, bool nameShipped = true, Func<bool>? publish = null)
     {
         var blobs = new HashSet<string>(nameShipped && shipped != null ? shipped : []);
         var records = new List<Rec>();
@@ -61,6 +91,7 @@ public static class Recordings
             if (r.Tag == 'B') blobs.Add(Hex(r.Payload.AsSpan(0, 20)));
             else records.Add(r);
         var keep = records.Where(r => r.Tag == 'N' || Rehydrate.References([r]).All(h => blobs.Contains(h) || shipped?.Contains(h) == true)).ToList();
+        if (publish?.Invoke() == false) return records.Count - keep.Count;   // nothing created or deleted
         if (blobs.Count + keep.Count == 0)
         {
             File.Delete(path);
@@ -75,7 +106,8 @@ public static class Recordings
                 foreach (var h in blobs) f.Write(Convert.FromHexString(h));
                 foreach (var r in keep) f.Write(Convert.FromHexString(r.Key));
             }
-            File.Move(tmp, path, true);
+            BeforeKeysPublished?.Invoke();
+            if (publish?.Invoke() != false) File.Move(tmp, path, true);
         }
         finally { File.Delete(tmp); }
         return records.Count - keep.Count;

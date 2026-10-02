@@ -31,7 +31,9 @@ add_executable(scskiller_warm warm.cpp version.rc)
 # The same exe on the segment heap (warm.manifest), in segheap\ under the same file name: the warmer runs it on NVIDIA
 add_executable(scskiller_warm_segheap warm.cpp version.rc warm.manifest)
 set_target_properties(scskiller_warm_segheap PROPERTIES OUTPUT_NAME scskiller_warm
-  RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_BINARY_DIR}/Release/segheap RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_BINARY_DIR}/Debug/segheap)
+  RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_BINARY_DIR}/Release/segheap RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_BINARY_DIR}/Debug/segheap
+  # both exes export the warm-host marker, so each writes a scskiller_warm.exp/.lib; keep them apart for parallel builds
+  ARCHIVE_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_BINARY_DIR}/Release/segheap ARCHIVE_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_BINARY_DIR}/Debug/segheap)
 target_include_directories(scskiller PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 foreach(t scskiller_warm scskiller_warm_segheap)
   target_compile_definitions(${t} PRIVATE SCSK_RC_WARM)

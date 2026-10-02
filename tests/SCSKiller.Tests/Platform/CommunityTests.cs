@@ -71,15 +71,16 @@ public class CommunityTests : IDisposable
     /// <summary>A root signature as the database carries it: a DXBC container of one RTS0 part (made-up bytes).</summary>
     internal static byte[] RootSignature()
     {
-        var c = new byte[52];
+        var c = new byte[68];
         "DXBC"u8.CopyTo(c);
         BinaryPrimitives.WriteUInt32LittleEndian(c.AsSpan(20), 1);
         BinaryPrimitives.WriteUInt32LittleEndian(c.AsSpan(24), (uint)c.Length);
         BinaryPrimitives.WriteUInt32LittleEndian(c.AsSpan(28), 1);
         BinaryPrimitives.WriteUInt32LittleEndian(c.AsSpan(32), 36);
         "RTS0"u8.CopyTo(c.AsSpan(36));
-        BinaryPrimitives.WriteUInt32LittleEndian(c.AsSpan(40), 8);
-        "rootsig!"u8.CopyTo(c.AsSpan(44));
+        BinaryPrimitives.WriteUInt32LittleEndian(c.AsSpan(40), 24);
+        // an empty 1.0 root signature: no parameters, no static samplers
+        foreach (var (at, v) in new[] { (44, 1u), (52, 24u), (60, 24u) }) BinaryPrimitives.WriteUInt32LittleEndian(c.AsSpan(at), v);
         return c;
     }
 
@@ -183,6 +184,96 @@ public class CommunityTests : IDisposable
         Assert.Equal(2, fake.Log.Count(l => l.Contains("/v1/o/")));   // each route once
     }
 
+    /// <summary>A body that sends nothing after the headers, until cancelled.</summary>
+    internal sealed class Stalled : Stream
+    {
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            return 0;
+        }
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    internal static HttpResponseMessage StalledBody()
+    {
+        var r = new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new Stalled()) };
+        r.Headers.Add("X-SCSK", "1");
+        return r;
+    }
+
+    [Fact]
+    public async Task A_body_that_stalls_after_its_headers_is_given_up_and_backs_off()
+    {
+        var obj = Brotli(HashOnly(new string('1', 40)));
+        var entry = new CommunityEntry(Content, PsoDb.Hex(SHA256.HashData(obj)), obj.Length, 1, 2);
+        var fake = new Fake(_ => StalledBody());
+        var community = new Community(_dir, (_, _) => Task.FromResult<string?>("t"), new RouteFailover(fake, [Com, Io], _clock), _clock)
+            { BodyIdle = TimeSpan.FromMilliseconds(200) };
+        var game = Path.Combine(_dir, "games", "steam_480");
+
+        Assert.Null(await community.DownloadAsync(entry, game).WaitAsync(TimeSpan.FromSeconds(10)));   // no CancellationToken: a background pass's
+        Assert.Contains("didn't answer in time", community.Problem);
+        Assert.Null(await community.DownloadAsync(entry, game));   // backing off: not asked again yet
+        Assert.Single(fake.Log);
+        Assert.False(File.Exists(Path.Combine(game, "community.db")));
+    }
+
+    /// <summary>A body sent a few bytes at a time, <paramref name="gap"/> apart.</summary>
+    sealed class Dribble(byte[] data, int chunks, TimeSpan gap) : Stream
+    {
+        int at;
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            if (at >= data.Length) return 0;
+            await Task.Delay(gap, ct);
+            var n = Math.Min(Math.Min(buffer.Length, (data.Length + chunks - 1) / chunks), data.Length - at);
+            data.AsMemory(at, n).CopyTo(buffer);
+            at += n;
+            return n;
+        }
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => at; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task A_slow_body_that_keeps_coming_is_not_given_up()
+    {
+        var obj = Brotli(HashOnly(new string('1', 40)));
+        var entry = new CommunityEntry(Content, PsoDb.Hex(SHA256.HashData(obj)), obj.Length, 1, 2);
+        var fake = new Fake(_ =>
+        {
+            var r = new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new Dribble(obj, 8, TimeSpan.FromMilliseconds(100))) };
+            r.Headers.Add("X-SCSK", "1");
+            return r;
+        });
+        var community = new Community(_dir, (_, _) => Task.FromResult<string?>("t"), new RouteFailover(fake, [Com, Io], _clock), _clock)
+            { BodyIdle = TimeSpan.FromMilliseconds(400) };
+        var took = System.Diagnostics.Stopwatch.StartNew();
+        Assert.NotNull(await community.DownloadAsync(entry, Path.Combine(_dir, "games", "steam_480")));   // 8 x 100 ms: twice the idle limit in all
+        Assert.True(took.Elapsed > community.BodyIdle);
+        Assert.Null(community.Problem);
+    }
+
     [Fact]
     public async Task A_download_is_checked_by_sha256_and_kept_with_its_pso_count()
     {
@@ -241,6 +332,21 @@ public class CommunityTests : IDisposable
         static HttpResponseMessage WithRetryAfter(HttpResponseMessage r) { r.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromMinutes(10)); return r; }
     }
 
+    /// <summary>A damaged compact recording: a record declaring 2 GB in a stream that can't seek (its Brotli) ends the read
+    /// like a torn tail, with nothing allocated from that length.</summary>
+    [Fact]
+    public void A_record_length_past_a_streams_end_allocates_nothing()
+    {
+        var packed = new MemoryStream();
+        using (var b = new System.IO.Compression.BrotliStream(packed, System.IO.Compression.CompressionLevel.Fastest, leaveOpen: true))
+            b.Write([(byte)'S', 0xff, 0xff, 0xff, 0x7f, 1, 2, 3]);
+        packed.Position = 0;
+        using var s = new System.IO.Compression.BrotliStream(packed, System.IO.Compression.CompressionMode.Decompress);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        Assert.Empty(PsoDb.Read(s).ToList());
+        Assert.InRange(GC.GetAllocatedBytesForCurrentThread() - before, 0, 16 << 20);
+    }
+
     [Fact]
     public void Only_root_signatures_and_pipelines_are_accepted()
     {
@@ -257,6 +363,12 @@ public class CommunityTests : IDisposable
         PsoDb.Write(m, 'P', new byte[48]);   // a plan item
         Assert.Null(Community.Check(m.ToArray()));
         Assert.Null(Community.Check([.. HashOnly(new string('1', 40)), (byte)'S', 9, 0]));   // a torn tail
+        // a root-signature-only container whose RTS0 part is empty: nothing a planner could read
+        byte[] empty = [.. "DXBC"u8, .. new byte[16], 1, 0, 0, 0, 44, 0, 0, 0, 1, 0, 0, 0, 36, 0, 0, 0, .. "RTS0"u8, 0, 0, 0, 0];
+        m.SetLength(0);
+        PsoDb.WriteBlob(m, Sha1(empty), empty);
+        PsoDb.Write(m, 'C', PsoDb.Compute(Sha1(empty), Sha1(SharingTests.Shader)));
+        Assert.Null(Community.Check(m.ToArray()));
     }
 
     /// <summary>A local recording with one record of every tag the recorder writes (proxy.cpp: 'B' root signature and shader

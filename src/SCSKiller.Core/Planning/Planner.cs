@@ -20,18 +20,36 @@ namespace SCSKiller.Core.Planning;
 /// ponytail: a PS that reads none of its VS/GS outputs only pairs with sources without attribute outputs. Pairing it with
 /// every source would catch 2 more of FF7's 994 recorded PSOs for +22.8k plan PSOs (+19%, measured); revisit per game.
 /// DirectX 11 games (and games that may run on either) also get every D3D11 shader of the game once: see <see cref="D3D11Cache"/>.</summary>
-public sealed class Planner(string? packDir = null) : IPlanner
+public sealed class Planner(string? packDir = null, string? sharedPackDir = null) : IPlanner
 {
     /// <summary>Middleware packs (<see cref="MiddlewarePacks"/>): filled from recordings, seeding the plan of every game
     /// with the same middleware DLL version; null = off (the default: tests and tools opt in).</summary>
     public MiddlewarePacks? Packs { get; } = packDir == null ? null : new MiddlewarePacks(packDir);
+    /// <summary>The shared packs downloaded for this PC's GPU vendor (docs/db-contract.md "Middleware packs"): they seed
+    /// plans like <see cref="Packs"/>, and are never promoted into or uploaded; null = none.</summary>
+    public MiddlewarePacks? SharedPacks { get; } = sharedPackDir == null ? null : new MiddlewarePacks(sharedPackDir);
+
+    /// <summary>What decides a plan's pack items (<see cref="MiddlewarePacks.Fingerprint"/>), of both kinds of pack;
+    /// <paramref name="shared"/>: the shared packs' as taken earlier (<see cref="SharedFingerprint"/>), else now.</summary>
+    public string PackFingerprint(Game game, string? shared = null) =>
+        (Packs?.Fingerprint(game) ?? "") + ((shared ?? SharedFingerprint(game)) is { Length: > 0 } s ? "|shared:" + s : "");
+
+    public string SharedFingerprint(Game game) => SharedPacks?.Fingerprint(game) ?? "";
+
+    /// <summary>A plan of this engine takes pack entries: middleware pipelines are D3D12 PSOs. With <see cref="MiddlewarePacks.Runs"/>,
+    /// the one rule for what packs seed, what counts as still to compile, and the upscaler chip.</summary>
+    public static bool SeedsPacks(EngineInfo engine) => engine.GraphicsApi.Contains("D3D12");
+
+    /// <summary>The distinct PSOs both kinds of pack hold for this DLL version that seed a plan on this GPU vendor.</summary>
+    public int PackPipelines(MiddlewareDll dll, bool? amd = null) =>
+        new[] { Packs, SharedPacks }.SelectMany(p => p?.Keys(dll, amd) ?? []).Distinct().Count();
     /// <summary>Materialize's pack line (entries written / skipped); optional.</summary>
     public IProgress<string>? Log { get; set; }
 
     /// <summary>Bump when the plan for the same game and inputs changes (new pipeline kinds, root-signature rules, D3D11):
     /// the app then rebuilds plans (warmed games' when idle, ScsKiller.CheckPlans) and offers a re-warm only where the new
     /// plan has records the warm didn't replay.</summary>
-    public const int Version = 20;
+    public const int Version = 21;
 
     /// <summary>The vendor's D3D11 driver cache persists across processes, is keyed on the exe file name and caches per
     /// shader, whatever the state or the other stages (measured on NVIDIA, proxy/probe11.cpp): a staged warm
@@ -94,7 +112,18 @@ public sealed class Planner(string? packDir = null) : IPlanner
     }
 
     public Plan Build(Game game, EngineInfo engine, ShaderIndex index, Recording? recording, VendorCaps caps, string outDir,
-        IProgress<string>? log, CancellationToken ct, bool maximum = false) => new PlanBuilder(game, engine, index, recording, caps, outDir, log, ct, maximum, Packs).Build();
+        IProgress<string>? log, CancellationToken ct, bool maximum = false)
+    {
+        var builder = new PlanBuilder(game, engine, index, recording, caps, outDir, log, ct, maximum, Packs, SharedPacks);
+        var plan = builder.Build();
+        if (builder.PackFingerprint is { } f) seeded.AddOrUpdate(plan, f);
+        return plan;
+    }
+
+    readonly System.Runtime.CompilerServices.ConditionalWeakTable<Plan, string> seeded = new();
+
+    /// <summary>The <see cref="PackFingerprint"/> of what <paramref name="plan"/>'s build seeded from; null when it read no pack.</summary>
+    public string? SeededFingerprint(Plan plan) => seeded.TryGetValue(plan, out var f) ? f : null;
 
     /// <summary>Render targets per pixel shader output (float -> RGBA16F, uint/sint -> RGBA32 UINT/SINT), D32 if it writes depth.</summary>
     internal static (uint[] Rt, uint Dsv) Targets(ShaderInfo ps)
@@ -104,6 +133,13 @@ public sealed class Planner(string? packDir = null) : IPlanner
         var rt = new uint[targets.Count == 0 ? 0 : targets.Max(o => o.Index) + 1];
         foreach (var o in targets) rt[o.Index] = o.CompType switch { 1 => R32G32B32A32Uint, 2 => R32G32B32A32Sint, _ => R16G16B16A16Float };
         return (rt, outs.Any(o => o.SysValue is 65 or 67 or 68) ? D32Float : 0); // SV_Depth, SV_DepthGreaterEqual, SV_DepthLessEqual
+    }
+
+    /// <summary>A plan file's records; none when it's missing or unreadable.</summary>
+    public static List<Rec> PlanBody(string? planFile)
+    {
+        try { return planFile != null && File.Exists(planFile) ? [.. PlanFile.Read(planFile).Records] : []; }
+        catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException or System.Text.Json.JsonException) { return []; }
     }
 
     public void Materialize(Plan plan, Game game, EngineInfo engine, IEngineReader reader, Recording? recording, string workDir, CancellationToken ct)

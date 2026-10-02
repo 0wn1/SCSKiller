@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.IO.Compression;
 using System.Security.Cryptography;
+using System.Text;
 using SCSKiller.Core.Carved;
 using static SCSKiller.Core.Planning.PsoDb;
 
@@ -14,6 +15,21 @@ namespace SCSKiller.Core.Planning;
 public static class HashOnly
 {
     public const int MaxRecords = 200_000, MaxRootSignature = 64 << 10;
+
+    /// <summary>Root signatures, DXIL libraries and collections the distinct state objects (by key) of one input name: an
+    /// upload, an import, a chunk of the app's. Each is a string held while it is checked. Real entries: 19,639 at most (3
+    /// games' community downloads). <see cref="MaxEntryStateObjectRefs"/>: the same for an entry, what a merge makes and a
+    /// download holds. Same values in records.rs.</summary>
+    public const int MaxStateObjectRefs = 262_144, MaxEntryStateObjectRefs = 1_048_576;
+
+    /// <summary>What an entry may name when uploads publish without the admin: an input's room short of
+    /// <see cref="MaxEntryStateObjectRefs"/>, so a device filling an entry can't stop the rest (the admin's approve may use
+    /// the room; `admin block --withdraw` takes the device's records back out).</summary>
+    public const int MaxAutoStateObjectRefs = MaxEntryStateObjectRefs - MaxStateObjectRefs;
+
+    /// <summary>The start of the refusal when the state objects of a <see cref="Canonical"/> input name more than its cap
+    /// allows: a merge batch that gets it goes one upload at a time.</summary>
+    public const string TooManyReferences = "state objects naming more than ";
     public const long MaxRaw = 256L << 20;
 
     /// <summary>The tags a hash-only recording may hold: all the recorder (proxy.cpp) writes, and 'L'. 'P' / 'Y' / '1' / '2' /
@@ -34,15 +50,16 @@ public static class HashOnly
     /// must have every root signature it names as a 'B' (a client can't rebuild those: they aren't in the game's files) and
     /// every record it builds on. <paramref name="local"/>: a full recording of this machine, whose shader blobs (DXIL
     /// libraries included) and unreplayable state objects are dropped; otherwise (someone else's upload) they are errors.
-    /// InvalidDataException names the first problem.</summary>
-    public static List<Rec> Canonical(IEnumerable<Rec> records, bool local, out Dropped dropped)
+    /// InvalidDataException names the first problem, <see cref="TooManyReferences"/> past <paramref name="maxRefs"/>
+    /// references (<see cref="MaxEntryStateObjectRefs"/> for an entry).</summary>
+    public static List<Rec> Canonical(IEnumerable<Rec> records, bool local, out Dropped dropped, int maxRefs = MaxStateObjectRefs)
     {
         var blobs = new SortedDictionary<string, Rec>(StringComparer.Ordinal);
         var psos = new SortedDictionary<string, Rec>(StringComparer.Ordinal);
         var states = new SortedDictionary<string, (Rec Rec, StateObject So)>(StringComparer.Ordinal);
         var nv = new SortedDictionary<string, Rec>(StringComparer.Ordinal);
         var flags = new SortedDictionary<string, Rec>(StringComparer.Ordinal);
-        int shaders = 0, dups = 0, n = 0;
+        int shaders = 0, dups = 0, n = 0, refs = 0;
         foreach (var r in records)
         {
             switch (r.Tag)
@@ -58,10 +75,14 @@ public static class HashOnly
                         shaders++;
                     }
                     else if (body.Length > MaxRootSignature) throw new InvalidDataException($"root signature {sha} is over {MaxRootSignature} bytes");
+                    else if (!Dxbc.RootSignatureValid(body)) throw new InvalidDataException($"root signature {sha} is malformed");
                     else if (!blobs.TryAdd(sha, r)) dups++;
                     break;
                 case 'R' or 'A':
-                    if (!states.TryAdd(r.Key, (r, ParseStateObject(r)))) dups++; // ParseStateObject: InvalidDataException when malformed
+                    var so = ParseStateObject(r);   // InvalidDataException when malformed
+                    if (!states.TryAdd(r.Key, (r, so))) dups++;   // a duplicate holds nothing more
+                    else if ((refs += so.Libraries.Count + so.RootSignatures.Count + so.Depends.Count) > maxRefs)
+                        throw new InvalidDataException($"{TooManyReferences}{maxRefs} root signatures, libraries and collections");
                     break;
                 case 'N':
                     NvState.Parse(r);
@@ -126,6 +147,24 @@ public static class HashOnly
         return [.. keep, .. psos.Values, .. ordered, .. nv.Values.Where(r => kept.Contains(Target(r))), .. flags.Values.Where(r => kept.Contains(Target(r)))];
     }
 
+    /// <summary>A shared middleware pack's key (docs/db-contract.md "Middleware packs"): "&lt;GPU vendor&gt;:&lt;DLL vendor&gt;:&lt;DLL
+    /// name, lower case&gt;:&lt;DLL SHA-1&gt;". Its entry's content hash is <see cref="PackHash"/>.</summary>
+    public static string PackKey(string gpu, string vendor, string dll, string sha1) => $"{gpu}:{vendor}:{dll.ToLowerInvariant()}:{sha1}";
+
+    public static string PackHash(string key) => Hex(SHA1.HashData(Encoding.UTF8.GetBytes(key)));
+
+    public static bool IsPackKey(string? key) => key?.Split(':') is [var gpu, var vendor, var dll, var sha1]
+        && gpu is "nvidia" or "amd"
+        && vendor is { Length: >= 1 and <= 16 } && vendor.All(c => char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c))
+        && dll is { Length: >= 5 and <= 96 } && dll.EndsWith(".dll", StringComparison.Ordinal)
+        && dll.All(c => char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c) || c is '_' or '.' or '-')
+        && sha1.Length == 40 && sha1.All(char.IsAsciiHexDigitLower);
+
+    /// <summary>A pack holds PSOs and the root signatures they name, nothing else: InvalidDataException otherwise.</summary>
+    public static List<Rec> CheckPack(List<Rec> canonical) =>
+        canonical.FindIndex(r => r.Tag is not ('B' or 'C' or 'G' or 'S')) is var i and >= 0
+            ? throw new InvalidDataException($"a pack holds only PSOs and root signatures, not '{canonical[i].Tag}' records") : canonical;
+
     /// <summary>The key of the record an 'N' or 'L' record is about.</summary>
     public static string Target(Rec r) => r.Tag == 'N' ? NvState.Parse(r).Target : Hex(r.Payload);
 
@@ -155,11 +194,16 @@ public static class HashOnly
     }
 
     /// <summary>Splits a canonical recording into canonical recordings (uploads, db-contract.md "Anonymous uploads") of at most
-    /// <paramref name="maxRecords"/> PSO and state object records and about <paramref name="maxRaw"/> bytes each, every one
+    /// <paramref name="maxRecords"/> PSO and state object records, about <paramref name="maxRaw"/> bytes and at most
+    /// <see cref="MaxStateObjectRefs"/> state object references each, every one
     /// valid on its own: a state object travels with every record it builds on (a shared base then goes in several), a record
-    /// with its 'N' and 'L', and each with the root signatures its records name.</summary>
-    public static List<List<Rec>> Chunks(IReadOnlyList<Rec> canonical, int maxRecords, long maxRaw)
+    /// with its 'N' and 'L', and each with the root signatures its records name. A state object whose closure alone names
+    /// more than an upload may is left out (<paramref name="skipped"/>: how many); the rest still go.</summary>
+    public static List<List<Rec>> Chunks(IReadOnlyList<Rec> canonical, int maxRecords, long maxRaw) => Chunks(canonical, maxRecords, maxRaw, out _);
+
+    public static List<List<Rec>> Chunks(IReadOnlyList<Rec> canonical, int maxRecords, long maxRaw, out int skipped)
     {
+        skipped = 0;
         var blobs = canonical.Where(r => r.Tag == 'B').ToList();
         var states = canonical.Where(r => r.Tag is 'R' or 'A').ToDictionary(r => r.Key);
         var about = canonical.Where(r => r.Tag is 'N' or 'L').ToLookup(Target);
@@ -171,74 +215,138 @@ public static class HashOnly
         }
         var chunks = new List<List<Rec>>();
         var chunk = new Dictionary<string, Rec>();
-        long raw = 0;
+        long raw = 0, refs = 0;
         void Flush()
         {
             if (chunk.Count > 0) chunks.Add(Canonical([.. blobs, .. chunk.Values], local: false, out _));
             chunk = [];
-            raw = 0;
+            raw = refs = 0;
         }
+        // what a state object names: an upload's are capped (MaxStateObjectRefs)
+        static long Refs(Rec u) => u.Tag is 'R' or 'A' && ParseStateObject(u) is var so ? so.Libraries.Count + so.RootSignatures.Count + so.Depends.Count : 0;
         foreach (var r in canonical.Where(r => r.Tag is not ('B' or 'N' or 'L')))
         {
             var unit = new Dictionary<string, Rec>();
             Close(r, unit);
+            if (unit.Values.Sum(Refs) > MaxStateObjectRefs) { skipped++; continue; }   // no upload could carry it
             var add = unit.Values.Where(u => !chunk.ContainsKey(u.Key)).ToList();
-            if (chunk.Count > 0 && (chunk.Count + add.Count > maxRecords || raw + add.Sum(u => 5L + u.Payload.Length) > maxRaw))
+            if (chunk.Count > 0 && (chunk.Count + add.Count > maxRecords || raw + add.Sum(u => 5L + u.Payload.Length) > maxRaw
+                    || refs + add.Sum(Refs) > MaxStateObjectRefs))
             {
                 Flush();
                 add = [.. unit.Values];
             }
             foreach (var u in add) chunk[u.Key] = u;
             raw += add.Sum(u => 5L + u.Payload.Length);
+            refs += add.Sum(Refs);
         }
         Flush();
         return chunks;
     }
 
-    /// <summary>The db bytes of <paramref name="records"/>, Brotli (quality 11): an object of the community database.</summary>
+    /// <summary>The db bytes of <paramref name="records"/>, Brotli (quality 11): an object of the community database. Encoded
+    /// as the records are read, holding no copy of them (the bytes are TryCompress's one-shot output).</summary>
     public static byte[] Compress(IEnumerable<Rec> records)
     {
-        var list = records as IList<Rec> ?? [.. records];
-        using var raw = new MemoryStream((int)Math.Min(Array.MaxLength, list.Sum(r => 5L + r.Payload.Length)));   // sized once: growing it held up to 3x the bytes
-        foreach (var r in list) Write(raw, r.Tag, r.Payload);
-        var out_ = new byte[BrotliEncoder.GetMaxCompressedLength((int)raw.Length)];
-        if (!BrotliEncoder.TryCompress(raw.GetBuffer().AsSpan(0, (int)raw.Length), out_, out var n, 11, 22))
-            throw new InvalidOperationException("Brotli failed");
-        return out_[..n];
+        using var enc = new BrotliEncoder(11, 22);
+        using var out_ = new MemoryStream();
+        var buf = new byte[1 << 16];
+        void Feed(ReadOnlySpan<byte> src, bool final)
+        {
+            for (var status = OperationStatus.DestinationTooSmall; status == OperationStatus.DestinationTooSmall || !src.IsEmpty;)
+            {
+                status = enc.Compress(src, buf, out var used, out var wrote, final);
+                if (status == OperationStatus.InvalidData) throw new InvalidOperationException("Brotli failed");
+                out_.Write(buf, 0, wrote);
+                src = src[used..];
+                if (status == OperationStatus.Done || status == OperationStatus.NeedMoreData && src.IsEmpty) break;
+            }
+        }
+        Span<byte> head = stackalloc byte[5];
+        foreach (var r in records)
+        {
+            head[0] = (byte)r.Tag;
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(head[1..], (uint)r.Payload.Length);
+            Feed(head, false);
+            Feed(r.Payload, false);
+        }
+        Feed([], true);
+        return out_.ToArray();
     }
 
-    /// <summary>The records of a Brotli-compressed db, at most <paramref name="max"/> bytes decompressed; a torn tail is an error.</summary>
-    public static List<Rec> Decompress(ReadOnlySpan<byte> compressed, long max = MaxRaw)
+    /// <summary>The records of a Brotli-compressed db, at most <paramref name="max"/> bytes decompressed; a torn tail is an error.
+    /// <paramref name="limit"/>: only the first that many are made (<see cref="Records"/>). Decoded twice, holding no
+    /// decompressed copy: first the stream and its framing to the end, then the records.</summary>
+    public static List<Rec> Decompress(ReadOnlySpan<byte> compressed, long max = MaxRaw, int limit = int.MaxValue)
     {
-        using var raw = new MemoryStream();
+        Walk(compressed, max, null, 0);
+        var recs = new List<Rec>();
+        Walk(compressed, max, recs, limit);
+        return recs;
+    }
+
+    /// <summary>One decoding of <see cref="Decompress"/>'s input: the records into <paramref name="into"/> (at most
+    /// <paramref name="limit"/>), or with none only the checks; a Brotli error before a framing one.</summary>
+    static void Walk(ReadOnlySpan<byte> compressed, long max, List<Rec>? into, int limit)
+    {
         // BrotliDecoder, not BrotliStream: the stream reads garbage or a truncated input as a short, valid end
         using var d = new BrotliDecoder();
         var buf = new byte[1 << 16];
+        Span<byte> head = stackalloc byte[5];
+        int headLen = 0, at = 0;
+        long raw = 0, left = 0;   // left: the current payload's bytes still to come
+        byte[]? payload = null;
         for (var status = OperationStatus.DestinationTooSmall; status != OperationStatus.Done;)
         {
             status = d.Decompress(compressed, buf, out var used, out var wrote);
             if (status is OperationStatus.InvalidData or OperationStatus.NeedMoreData) throw new InvalidDataException("not a complete Brotli stream");
-            if (raw.Length + wrote > max) throw new InvalidDataException($"over {max} bytes decompressed");
+            if (raw + wrote > max) throw new InvalidDataException($"over {max} bytes decompressed");
             compressed = compressed[used..];
-            raw.Write(buf, 0, wrote);
+            raw += wrote;
+            for (var chunk = buf.AsSpan(0, wrote); !chunk.IsEmpty;)
+                if (left > 0)
+                {
+                    var n = (int)Math.Min(left, chunk.Length);
+                    if (payload != null) chunk[..n].CopyTo(payload.AsSpan(at));
+                    (at, left) = (at + n, left - n);
+                    chunk = chunk[n..];
+                    if (left == 0 && payload != null) into!.Add(new Rec((char)head[0], payload));
+                }
+                else
+                {
+                    var n = Math.Min(5 - headLen, chunk.Length);
+                    chunk[..n].CopyTo(head[headLen..]);
+                    headLen += n;
+                    chunk = chunk[n..];
+                    if (headLen < 5) continue;
+                    headLen = 0;
+                    left = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(head[1..]);
+                    // only on the second pass, whose framing the first checked: no length is allocated before its bytes exist
+                    payload = into != null && into.Count < limit ? new byte[left] : null;
+                    at = 0;
+                    if (left == 0 && payload != null) into!.Add(new Rec((char)head[0], payload));
+                }
         }
         if (!compressed.IsEmpty) throw new InvalidDataException("bytes after the Brotli stream");
-        return Records(raw.GetBuffer().AsSpan(0, (int)raw.Length));
+        if (headLen != 0 || left != 0) throw new InvalidDataException("truncated record");
     }
 
+    /// <summary>Someone else's recording for <see cref="Canonical"/> with local: false, which refuses it by its
+    /// <see cref="MaxRecords"/> + 1st record (a shader blob is an error there, so every record counts): only that many are
+    /// made, however many the bytes frame.</summary>
+    public const int RemoteLimit = MaxRecords + 1;
+
     /// <summary>The records of an uncompressed db, read to its last byte; a torn tail is an error (unlike <see cref="PsoDb.Read(Stream)"/>,
-    /// which stops there like the proxy). The framing is checked before anything is allocated from a length field.</summary>
-    public static List<Rec> Records(ReadOnlySpan<byte> raw)
+    /// which stops there like the proxy). The framing is checked to the end before anything is allocated from a length
+    /// field, then the first <paramref name="limit"/> records are made.</summary>
+    public static List<Rec> Records(ReadOnlySpan<byte> raw, int limit = int.MaxValue)
     {
+        static long Len(ReadOnlySpan<byte> raw, long at) => System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(raw[(int)(at + 1)..]);
+        for (var at = 0L; at < raw.Length; at += 5 + Len(raw, at))
+            if (at + 5 > raw.Length || at + 5 + Len(raw, at) > raw.Length) throw new InvalidDataException("truncated record");
         var recs = new List<Rec>();
-        for (var at = 0L; at < raw.Length;)
-        {
-            if (at + 5 > raw.Length) throw new InvalidDataException("truncated record");
-            var len = (long)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(raw[(int)(at + 1)..]);
-            if (at + 5 + len > raw.Length) throw new InvalidDataException("truncated record");
-            recs.Add(new Rec((char)raw[(int)at], raw.Slice((int)at + 5, (int)len).ToArray()));
-            at += 5 + len;
-        }
+        for (var at = 0L; at < raw.Length && recs.Count < limit; at += 5 + Len(raw, at))
+            recs.Add(new Rec((char)raw[(int)at], raw.Slice((int)at + 5, (int)Len(raw, at)).ToArray()));
         return recs;
     }
 }

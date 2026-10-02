@@ -73,7 +73,7 @@ public static class PsoDb
     /// read back and compared before it replaces <paramref name="path"/>, so an interrupted write leaves the old file.</summary>
     public static void WriteCompact(string path, IEnumerable<Rec> records)
     {
-        var tmp = path + ".tmp";
+        var tmp = $"{path}.{Guid.NewGuid():N}.tmp";   // per writer: the app and the CLI may write at once
         try
         {
             byte[] sum;
@@ -132,8 +132,21 @@ public static class PsoDb
         {
             var len = BinaryPrimitives.ReadUInt32LittleEndian(head.AsSpan(1));
             if (f.CanSeek && len > f.Length - f.Position) yield break;   // a torn tail, or a stray file's "length": nothing allocated
-            var body = new byte[len];
-            if (f.ReadAtLeast(body, body.Length, false) < body.Length) yield break;
+            byte[] body;
+            if (f.CanSeek || len <= 1 << 20)
+            {
+                body = new byte[len];
+                if (f.ReadAtLeast(body, body.Length, false) < body.Length) yield break;
+            }
+            else
+            {
+                // a stream (a compact recording's Brotli) can't tell its length: the buffer grows only with bytes that arrive
+                using var m = new MemoryStream();
+                var chunk = new byte[1 << 20];
+                for (int n; m.Length < len && (n = f.Read(chunk, 0, (int)Math.Min(chunk.Length, len - m.Length))) > 0;) m.Write(chunk, 0, n);
+                if (m.Length < len) yield break;
+                body = m.ToArray();
+            }
             yield return new Rec((char)head[0], body);
         }
     }
@@ -289,6 +302,10 @@ public static class PsoDb
 
     public static bool IsStateObject(char tag) => tag is 'R' or 'A';
 
+    /// <summary>Subobjects in one state object record, at most. Real ones: 694 at most (3 games' community downloads, 5,393
+    /// state objects). Same value in records.rs.</summary>
+    public const uint MaxSubobjects = 8192;
+
     /// <summary>An 'N' record: the NVAPI state the record with key <paramref name="Target"/> was created with, which NVIDIA's
     /// compiler keys on (selftest nvext). <paramref name="Slot"/> / <paramref name="Space"/>: the shader-extension UAV
     /// (uint.MaxValue = none); <paramref name="Scope"/>: how the game set it (1 device, 2 thread, 3 PSO extension; the warm
@@ -328,7 +345,10 @@ public static class PsoDb
         void Exports() { for (var n = Next(); n > 0; n--) { Str(); Str(); Next(); } }
         var baseKey = r.Tag == 'A' ? H() : null;
         var so = new StateObject(Next(), baseKey, [], [], baseKey != null ? [baseKey] : []);
-        for (var n = Next(); n > 0; n--)
+        var count = Next();
+        // each library, collection and root signature becomes a string: refused from the count, before any is read
+        if (count > MaxSubobjects) throw new InvalidDataException($"state object of {count} subobjects, over {MaxSubobjects}");
+        for (var n = count; n > 0; n--)
             switch (Next())
             {
                 case 0 or 3 or 10: Next(); break;                        // state object config, node mask, pipeline config

@@ -229,7 +229,7 @@ public static unsafe class RootSig
                 for (var r = 0u; r < U(p); r++) { var q = U(p + 4) + (ver >= 2 ? 24u : 20u) * r; slots.Add((vis, U(q), U(q + 8), U(q + 4), U(q + 12))); }
             else slots.Add((vis, type switch { 3 => 0u, 4 => 1u, _ => 2u }, U(p), 1, U(p + 4))); // 1 constants and 2 CBV: b, 3 SRV, 4 UAV
         }
-        for (var s = 0u; s < U(12); s++) { var q = U(16) + 52 * s; slots.Add((U(q + 48), 3, U(q + 40), 1, U(q + 44))); }
+        for (var s = 0u; s < U(12); s++) { var q = U(16) + SamplerSize(ver) * s; slots.Add((U(q + 48), 3, U(q + 40), 1, U(q + 44))); }
         return new Ranges(U(20), [.. slots]);
     }
 
@@ -251,13 +251,19 @@ public static unsafe class RootSig
         return null;
     }
 
-    /// <summary>Static samplers (raw 52-byte D3D12_STATIC_SAMPLER_DESCs) of a serialized root signature.</summary>
+    /// <summary>Static samplers (raw 52-byte D3D12_STATIC_SAMPLER_DESCs) of a serialized root signature. A 1.2 signature's
+    /// are DESC1s (56 bytes: + flags), given without the flags, which the planner's 1.1 signatures can't carry: one rebuilt
+    /// from samplers that set them (a uint border color, non-normalized coordinates) never matches its 1.2 original.</summary>
     public static byte[] Samplers(byte[] blob)
     {
         var b = Rts0(blob);
-        var (n, off) = (BitConverter.ToInt32(b, 12), BitConverter.ToInt32(b, 16));
-        return b[off..(off + 52 * n)];
+        var (ver, n, off) = (BitConverter.ToUInt32(b, 0), BitConverter.ToInt32(b, 12), BitConverter.ToInt32(b, 16));
+        var size = (int)SamplerSize(ver);
+        return [.. Enumerable.Range(0, n).SelectMany(i => b[(off + size * i)..(off + size * i + 52)])];
     }
+
+    /// <summary>D3D12_STATIC_SAMPLER_DESC, or DESC1 in a 1.2 (version 3) signature.</summary>
+    static uint SamplerSize(uint version) => version == 3 ? 56u : 52u;
 
     internal static byte[] Rts0(byte[] blob)
     {
@@ -267,6 +273,9 @@ public static unsafe class RootSig
 
     static readonly delegate* unmanaged<void*, nint*, nint*, int> SerializeFn = (delegate* unmanaged<void*, nint*, nint*, int>)NativeLibrary.GetExport(
         NativeLibrary.Load(Path.Combine(Environment.SystemDirectory, "d3d12.dll")), "D3D12SerializeVersionedRootSignature"); // System32: never a proxy d3d12.dll next to the app
+
+    /// <summary>The runtime refused the description (E_INVALIDARG: overlapping registers, a bad sampler, ...).</summary>
+    public sealed class SerializeException(string message) : InvalidOperationException(message);
 
     public static byte[] Serialize(Desc d, byte[] samplers)
     {
@@ -308,7 +317,7 @@ public static unsafe class RootSig
             nint blob = 0, err = 0;
             var hr = SerializeFn(pd, &blob, &err);
             if (err != 0) Release(err);
-            if (hr < 0) throw new InvalidOperationException($"D3D12SerializeVersionedRootSignature failed 0x{hr:x8}");
+            if (hr < 0) throw new SerializeException($"D3D12SerializeVersionedRootSignature failed 0x{hr:x8}");
             var vt = *(nint**)blob; // ID3DBlob: GetBufferPointer = slot 3, GetBufferSize = slot 4
             var bytes = new ReadOnlySpan<byte>(((delegate* unmanaged<nint, void*>)vt[3])(blob), (int)((delegate* unmanaged<nint, nuint>)vt[4])(blob)).ToArray();
             Release(blob);

@@ -9,17 +9,17 @@
 //                  [--skip-keys <sha1 hex>,...] [--isolate i,j,...]
 //                  [--ags <amd_ags_x64.dll> --ags-app <name> --ags-engine <name>] [--pass K]
 //
-// Protocol (JSON lines on stdout, exit codes): ARCHITECTURE.md. Stages <workdir>\stage\<exe name> + d3d12.dll (the
-// proxy) + the dbs and runs that copy (the child), which prints the JSON. The caller only knows this process, so it
-// beats a shared counter every 100 ms: while it is suspended (pause) the child's workers wait, if it dies the child
-// stops gracefully. --package: the child runs with that packaged app's identity (NVIDIA keys a profiled packaged game's
-// cache on it, not on the exe name); such a child inherits no handles, so it finds everything by this process's id and
-// writes through named pipes. --stage-path (ignored with --package): the child runs from <workdir>\stage\<that path>,
-// since some AMD app profiles match the tail of the launched path, not just the name; afterwards the proxy's outputs are
-// moved up to <workdir>\stage\ and the rest of that tree is removed. --ags: the child creates its device through that AGS 6
-// DLL, registering the game's app and engine names, since AMD keys the cache of such a device on the app name; if that
-// fails it says why on stderr and creates a plain device. --pass K: <workdir>\scskiller_pass.bin holds each item's pass
-// (one byte per item); only pass K's items are created, the others count as done.
+// Protocol (JSON lines on stdout, exit codes): ARCHITECTURE.md. Stages <workdir>\stage-<pid>-<n>\<exe name> (a new folder
+// of this run's) + d3d12.dll (the proxy) + the dbs and runs that copy (the child), which prints the JSON. The caller only
+// knows this process, so it beats a shared counter every 100 ms: while it is suspended (pause) the child's workers wait,
+// if it dies the child stops gracefully. --package: the child runs with that packaged app's identity (NVIDIA keys a
+// profiled packaged game's cache on it, not on the exe name); such a child inherits no handles, so it finds everything by
+// this process's id and writes through named pipes. --stage-path (ignored with --package): the child runs from <staging
+// folder>\<that path>, since some AMD app profiles match the tail of the launched path, not just the name; afterwards the
+// proxy's outputs are moved up to the staging folder and the rest of that tree is removed. --ags: the child creates its
+// device through that AGS 6 DLL, registering the game's app and engine names, since AMD keys the cache of such a device
+// on the app name; if that fails it says why on stderr and creates a plain device. --pass K: <workdir>\scskiller_pass.bin
+// holds each item's pass (one byte per item); only pass K's items are created, the others count as done.
 #define NOMINMAX
 #include <windows.h>
 #include <d3d12.h>
@@ -36,6 +36,8 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "ole32.lib")
 
+extern "C" __declspec(dllexport) const int SCSKiller_WarmHost = 1;  // the proxy warms only in a process exporting it
+
 // What Invoke-CommandInDesktopPackage uses (Microsoft.Windows.Appx.PackageManager.Commands.dll).
 struct __declspec(uuid("F158268A-D5A5-45CE-99CF-00D6C3F3FC0A")) IDesktopAppXActivator : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE Activate(LPCWSTR, LPCWSTR, LPCWSTR, HANDLE*) = 0;
@@ -47,6 +49,7 @@ struct __declspec(uuid("F158268A-D5A5-45CE-99CF-00D6C3F3FC0A")) IDesktopAppXActi
 static const CLSID CLSID_DesktopAppXActivator = {0x168EB462, 0x775F, 0x42AE, {0x91, 0x11, 0xD7, 0x14, 0xB2, 0x30, 0x6C, 0x2E}};
 
 static std::wstring beat_name(DWORD parent) { return L"Local\\SCSKiller.Beat." + std::to_wstring(parent); }
+static std::wstring final_name(DWORD parent) { return L"Local\\SCSKiller.Final." + std::to_wstring(parent); }
 static std::wstring pipe_name(DWORD parent, int fd) { return L"\\\\.\\pipe\\SCSKiller.Warm." + std::to_wstring(parent) + L"." + std::to_wstring(fd); }
 
 enum { RUN, PAUSE, STOP };  // SCSKiller_Control states (proxy.cpp)
@@ -250,7 +253,7 @@ static int child(DWORD parent_pid, const Opts& o) {
     retry(r);
     const char *crashed, *isolate;  // JSON array bodies
     bool removed = crashes(&crashed, &isolate);
-    HANDLE final_event = OpenEventW(EVENT_MODIFY_STATE, FALSE, (L"Local\\SCSKiller.Final." + std::to_wstring(GetCurrentProcessId())).c_str());
+    HANDLE final_event = OpenEventW(EVENT_MODIFY_STATE, FALSE, final_name(parent_pid).c_str());
     if (r[0] && !stopping) {
         emit("{\"event\":\"retry\",\"from\":%llu,\"rtThreads\":%llu,\"failedItem\":%lld,\"done\":%llu,\"total\":%llu,\"failed\":%llu,\"seconds\":%.1f,"
              "\"reason\":\"%s\",\"crashed\":[%s],\"isolate\":[%s]}",
@@ -259,8 +262,10 @@ static int child(DWORD parent_pid, const Opts& o) {
         return 3;
     }
     if (p[0] < p[1] && !stopping) return fail(L"replay aborted after repeated faults, see stage\\scskiller.log");
-    emit("{\"event\":\"done\",\"done\":%llu,\"total\":%llu,\"failed\":%llu,\"seconds\":%.1f,\"stopped\":%s,\"crashed\":[%s]}", p[0], p[1], p[2],
-         (GetTickCount64() - t0) / 1000.0, p[0] < p[1] ? "true" : "false", crashed);
+    // stopped poisoned: items after the first unfinished one may be done, so it resumes from that one, not from the count
+    const uint64_t done = r[0] ? r[1] : p[0], failed = r[0] ? r[3] : p[2];
+    emit("{\"event\":\"done\",\"done\":%llu,\"total\":%llu,\"failed\":%llu,\"seconds\":%.1f,\"stopped\":%s,\"crashed\":[%s]}", done, p[1], failed,
+         (GetTickCount64() - t0) / 1000.0, done < p[1] ? "true" : "false", crashed);
     if (final_event) SetEvent(final_event);
     return 0;  // a normal exit: the driver writes its cache now
 }
@@ -279,8 +284,6 @@ int wmain(int argc, wchar_t** argv) {
     }
     std::wstring work = argv[1], exe = argv[2];
     if (work.back() != L'\\' && work.back() != L'/') work += L'\\';
-    const std::wstring flat = work + L"stage\\";
-    std::wstring stage = flat;
     wchar_t self[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     std::wstring bin = self;
@@ -289,7 +292,15 @@ int wmain(int argc, wchar_t** argv) {
     if (at == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY) || exe.find_first_of(L"\\/") != std::wstring::npos)
         return fail(L"workdir not found or exe is not a file name");
 
-    CreateDirectoryW(flat.c_str(), nullptr);
+    std::wstring flat;  // this run's own new staging folder: nothing in it was there before
+    for (int n = 1; n < 100 && flat.empty(); ++n) {
+        std::wstring d = work + L"stage-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(n) + L"\\";
+        if (CreateDirectoryW(d.c_str(), nullptr)) flat = d;
+        else if (GetLastError() != ERROR_ALREADY_EXISTS) break;
+    }
+    if (flat.empty()) return fail(L"can't create a staging folder in " + work + L" (error " + std::to_wstring(GetLastError()) + L")");
+    emit("{\"event\":\"stage\",\"stage\":%s}", json(flat.substr(0, flat.size() - 1)).c_str());  // first: a failure from here on has its log there
+    std::wstring stage = flat;
     std::vector<std::wstring> dirs;  // the --stage-path folders, outermost first
     if (!o.stage_path.empty() && o.package.empty()) {
         std::wstring sub;
@@ -313,33 +324,34 @@ int wmain(int argc, wchar_t** argv) {
     struct Unstage {
         std::function<void()> f;
         ~Unstage() { f(); }
-    } unstage{[&] {
-        if (stage == flat) return;
-        for (auto n : {L"scskiller.log", L"scskiller_creates.csv", L"scskiller_warm_times.csv"})  // the proxy's outputs
-            MoveFileExW((stage + n).c_str(), (flat + n).c_str(), MOVEFILE_REPLACE_EXISTING);
+    } unstage{[&] {  // only inside this run's folder: the staged inputs go, the proxy's outputs stay in flat
         for (auto n : {exe, std::wstring(L"d3d12.dll"), std::wstring(L"scskiller.db"), std::wstring(L"scskiller_gen.db"), std::wstring(L"scskiller_pass.bin")})
             DeleteFileW((stage + n).c_str());
+        if (stage == flat) return;
+        for (auto n : {L"scskiller.log", L"scskiller_creates.csv", L"scskiller_warm_times.csv"})
+            MoveFileExW((stage + n).c_str(), (flat + n).c_str(), 0);
         for (auto d = dirs.rbegin(); d != dirs.rend(); ++d) RemoveDirectoryW(d->c_str());  // only if empty
     }};
-    DeleteFileW((flat + L"scskiller.log").c_str());
-    DeleteFileW((stage + L"scskiller.log").c_str());
     auto put = [&](const std::wstring& from, const std::wstring& name, bool optional) {
         std::wstring to = stage + name;
-        DeleteFileW(to.c_str());  // no stale copy may survive, and a hard link is never written through
         if (optional && GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
         // the generated plan is big and only read: hard link; the recorded db is copied (the proxy may append to it)
-        return (name == L"scskiller_gen.db" && CreateHardLinkW(to.c_str(), from.c_str(), nullptr)) || CopyFileW(from.c_str(), to.c_str(), FALSE);
+        return (name == L"scskiller_gen.db" && CreateHardLinkW(to.c_str(), from.c_str(), nullptr)) || CopyFileW(from.c_str(), to.c_str(), TRUE);
     };
     std::wstring proxy = bin + L"d3d12.dll";
     if (GetFileAttributesW(proxy.c_str()) == INVALID_FILE_ATTRIBUTES) proxy = bin + L"..\\d3d12.dll";  // the segheap\ build uses its parent's
     if (!put(self, exe, false) || !put(proxy, L"d3d12.dll", false) || !put(work + L"scskiller.db", L"scskiller.db", true) ||
         !put(work + L"scskiller_gen.db", L"scskiller_gen.db", true) || !put(work + L"scskiller_pass.bin", L"scskiller_pass.bin", true))
-        return fail(L"staging into " + stage + L" failed (error " + std::to_wstring(GetLastError()) + L"; is a warm already running?)");
+        return fail(L"staging into " + stage + L" failed (error " + std::to_wstring(GetLastError()) + L")");
 
     const DWORD me = GetCurrentProcessId();
     HANDLE map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(LONG), beat_name(me).c_str());
     auto beat = map ? (volatile LONG*)MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, sizeof(LONG)) : nullptr;
     if (!beat) return fail(L"heartbeat setup failed");
+    // The child sets this after its last line; created before the child starts, so it can't miss it. A process whose driver
+    // was poisoned (a thread stuck in it) may never finish exiting: after SCSKILLER_WARM_EXIT_S (default 600 s: a big cache
+    // flush at exit takes minutes) it is terminated, and whatever it hadn't written of the driver cache is lost (ARCHITECTURE.md).
+    HANDLE final_event = CreateEventW(nullptr, TRUE, FALSE, final_name(me).c_str());
     std::wstring args = L"--child " + std::to_wstring(me);
     for (int i = 3; i < argc; ++i) args += L" \"" + std::wstring(argv[i]) + L"\"";
     fflush(stdout);
@@ -388,10 +400,6 @@ int wmain(int argc, wchar_t** argv) {
             return fail(L"launching the staged exe failed (error " + std::to_wstring(GetLastError()) + L")");
     }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);  // a starved heartbeat would read as a pause
-    // The child sets this after its last line. A process whose driver was poisoned (a thread stuck in it) may never finish
-    // exiting: after SCSKILLER_WARM_EXIT_S (default 600 s: a big cache flush at exit takes minutes) it is terminated, and
-    // whatever it hadn't written of the driver cache is lost (ARCHITECTURE.md).
-    HANDLE final_event = CreateEventW(nullptr, TRUE, FALSE, (L"Local\\SCSKiller.Final." + std::to_wstring(pi.dwProcessId)).c_str());
     wchar_t lim[16] = {};
     ULONGLONG exit_ms = 1000ull * (GetEnvironmentVariableW(L"SCSKILLER_WARM_EXIT_S", lim, 16) ? _wtoi(lim) : 600), final_at = 0;
     bool killed = false;

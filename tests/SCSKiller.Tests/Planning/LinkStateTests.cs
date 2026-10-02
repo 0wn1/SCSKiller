@@ -43,6 +43,8 @@ public class LinkStateTests
         return b;
     }
 
+    sealed class SyncLog(Action<string> a) : IProgress<string> { public void Report(string value) => a(value); }
+
     static readonly Dictionary<int, string> VsPs = new() { [(int)Stage.Vertex] = new('b', 40), [(int)Stage.Pixel] = new('c', 40) };
 
     [Fact]
@@ -111,6 +113,68 @@ public class LinkStateTests
         Assert.False(three.DualSource);
         Assert.Equal(0u, three.Dsv);
         Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(three.Blend.AsSpan(8)));
+    }
+
+    /// <summary>A shared recording's root signature that is an empty RTS0 part, or one whose static sampler the runtime refuses,
+    /// is left out with the records naming it, and a note; the rest of the game plans.</summary>
+    [Fact]
+    public void AMalformedRecordedRootSignatureLeavesOnlyItsRecordsOut()
+    {
+        // an empty RTS0 part; a 1.0 header naming one static sampler that is all zeros (filter 0, address mode 0)
+        byte[] Rts0(byte[] part) =>
+            [.. "DXBC"u8, .. new byte[16], 1, 0, 0, 0, .. BitConverter.GetBytes(44 + part.Length), 1, 0, 0, 0, 36, 0, 0, 0, .. "RTS0"u8, .. BitConverter.GetBytes(part.Length), .. part];
+        byte[] zeroSampler = [1, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 1, 0, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, .. new byte[52]];
+        foreach (var (caps, bad) in new[] { (Ff7.Amd, Rts0([])), (Ff7.Nvidia, Rts0([])), (Ff7.Amd, Rts0(zeroSampler)), (Ff7.Nvidia, Rts0(zeroSampler)) })
+        {
+            var dir = Ff7.TempDir("linkstate-bad-rs");
+            var path = Recording(dir);
+            var good = File.ReadAllBytes(path);
+            var badRs = Hex(System.Security.Cryptography.SHA1.HashData(bad));
+            using (var f = File.Create(path))
+            {
+                WriteBlob(f, badRs, bad);
+                var st = new Dictionary<int, string> { [(int)Stage.Vertex] = Vs1.Sha1, [(int)Stage.Pixel] = Ps2.Sha1 };
+                Write(f, 'S', Stream(badRs, st, [new("POSITION", 0, 6, 0)], 3, [R16G16B16A16Float], 20));
+                f.Write(good);
+            }
+            var log = new List<string>();
+            var plan = new Planner().Build(Ff7.Game, Ue426, Index(), new Recording(path), caps, Path.Combine(dir, "plan"), new SyncLog(log.Add), CancellationToken.None);
+            Assert.Contains(log, l => l.Contains("1 malformed root signatures left out with the 1 records naming them"));
+            Assert.Contains(PlanFile.Read(plan.FilePath).Records, r => r.Tag == 'S');
+        }
+    }
+
+    /// <summary>A valid recorded root signature whose static sampler sits at s0 (a resource-free compute shader: the rule
+    /// rebuilds it byte for byte), and another compute shader needing a sampler, for which the rule builds a sampler table at
+    /// s0 that the runtime won't serialize next to that static sampler: that stage set is left out with a warning, and the
+    /// rest plans.</summary>
+    [Fact]
+    public void ARootSignatureTheRuntimeWontSerializeLeavesOnlyItsStageSetOut()
+    {
+        var a = new ShaderInfo(new string('a', 40), Stage.Compute, "cs_6_0", 0, new(0, 0, 0, 0), [], [], []);
+        var b = new ShaderInfo(new string('b', 40), Stage.Compute, "cs_6_0", 0, new(0, 0, 0, 1), [new("sampler", 0, 0, 1)], [], []);
+        var c = new ShaderInfo(new string('c', 40), Stage.Compute, "cs_6_0", 0, new(0, 1, 0, 0), [new("srv", 0, 0, 1)], [], []);
+        var sampler = RootSig.Ue426Samplers[..52];
+        BinaryPrimitives.WriteUInt32LittleEndian(sampler.AsSpan(44), 0);   // space 0: s0 space 0
+        var rs = RootSig.Serialize(RootSig.Build(RootSig.Rule.Ff7, new Dictionary<Stage, ShaderInfo> { [Stage.Compute] = a }, true), sampler);
+        Assert.True(Core.Carved.Dxbc.RootSignatureValid(rs));
+        var dir = Ff7.TempDir("linkstate-unserializable");
+        var path = Path.Combine(dir, "recording.db");
+        using (var f = File.Create(path))
+        {
+            WriteBlob(f, Hex(System.Security.Cryptography.SHA1.HashData(rs)), rs);
+            Write(f, 'C', Compute(Hex(System.Security.Cryptography.SHA1.HashData(rs)), a.Sha1));
+        }
+        var index = new ShaderIndex("synthetic", ["PCD3D_SM6"], new[] { a, b, c }.ToDictionary(s => s.Sha1), [new ShaderMap("m", "Game", "PCD3D_SM6", [a.Sha1, b.Sha1, c.Sha1])]);
+        foreach (var caps in new[] { Ff7.Nvidia, Ff7.Amd })
+        {
+            var log = new List<string>();
+            var plan = new Planner().Build(Ff7.Game, Ue426, index, new Recording(path), caps, Path.Combine(dir, caps.Profile), new SyncLog(log.Add), CancellationToken.None);
+            var planned = PlanFile.Read(plan.FilePath).Records.Where(r => r.Tag is 'C' or 'S' or 'P').Select(r => r.Tag == 'P' ? ParseItem(r.Payload).Stages : Parse(r).Stages).ToList();
+            Assert.Contains(log, l => l.StartsWith("warning: 1 stage sets and 0 DXIL libraries left out: the runtime won't serialize"));
+            Assert.DoesNotContain(planned, s => s.ContainsValue(b.Sha1));
+            Assert.True(planned.Any(s => s.ContainsValue(c.Sha1)), string.Join(" | ", log));
+        }
     }
 
     [Fact]

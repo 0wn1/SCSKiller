@@ -198,7 +198,7 @@
                                 <DataTemplate x:DataType="local:StoreGroup">
                                     <StackPanel Orientation="Horizontal" Spacing="8">
                                         <TextBlock Text="{x:Bind Store}" Style="{StaticResource BodyStrongTextBlockStyle}" />
-                                        <TextBlock Text="{x:Bind CountText}" Style="{StaticResource Caption}" VerticalAlignment="Center" />
+                                        <TextBlock Text="{x:Bind CountText, Mode=OneWay}" Style="{StaticResource Caption}" VerticalAlignment="Center" />
                                     </StackPanel>
                                 </DataTemplate>
                             </GroupStyle.HeaderTemplate>

@@ -26,6 +26,11 @@ public sealed record MiddlewareImage(string Path, string ContentHash, long Size,
         using var h = File.OpenHandle(Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         return RandomAccess.Read(h, b, at.Offset) == b.Length && Hex(SHA1.HashData(b)) == sha1 ? b : null;
     }
+
+    /// <summary>Whether a GPU of this vendor runs the container's [WaveSize]: NVIDIA 32 lanes only, AMD 32 or 64 (a
+    /// FidelityFX DLL ships wave64 twins of its kernels for AMD, which NVIDIA's runtime rejects).</summary>
+    public bool Runs(string sha1, bool amd) =>
+        Read(sha1) is not { } b || Dxbc.WaveLanes(b) is not { } l || l.Min <= 32 && l.Max >= 32 || amd && l.Min <= 64 && l.Max >= 64;
 }
 
 /// <summary>Middleware shader libraries (FidelityFX, XeSS, OptiScaler, DirectStorage...) next to a game's exe: detection
@@ -34,6 +39,10 @@ public sealed record MiddlewareImage(string Path, string ContentHash, long Size,
 /// (<see cref="MiddlewarePacks"/>).</summary>
 public static class Middleware
 {
+    /// <summary>Vendors whose packs the community database shares, free (docs/db-contract.md "Middleware packs"): the
+    /// upscalers. Other packs stay on the PC that recorded them.</summary>
+    public static readonly string[] SharedVendors = ["amd", "intel"];
+
     static readonly string[] ProxyNames = ["dxgi.dll", "winmm.dll", "version.dll", "dbghelp.dll", "d3d12.dll", "wininet.dll", "winhttp.dll", "dinput8.dll", "nvngx.dll"];
 
     /// <summary>Vendor and canonical name of a known middleware DLL, by file name or export name; null = not middleware.</summary>
@@ -120,13 +129,14 @@ public static class Middleware
         catch (Exception e) when (e is BadImageFormatException or InvalidOperationException) { return null; }   // not a PE file
     }
 
-    static readonly ConcurrentDictionary<(string, long, DateTime), MiddlewareImage> scans = new();
+    static readonly ConcurrentDictionary<(string, string), MiddlewareImage> scans = new();
 
-    /// <summary>Hashes the file and every embedded container (read-only; cached per path, size and write time).</summary>
+    /// <summary>Hashes the file and every embedded container (read-only; cached per path and the file's size, write time
+    /// and content sample, as <see cref="App.KeyFiles"/> tells a file).</summary>
     public static MiddlewareImage Scan(string path)
     {
         var fi = new FileInfo(path);
-        var key = (fi.FullName.ToLowerInvariant(), fi.Length, fi.LastWriteTimeUtc);
+        var key = (fi.FullName.ToLowerInvariant(), App.KeyFiles.Stamp(fi.FullName) ?? "");
         if (scans.TryGetValue(key, out var hit)) return hit;
         byte[] data;
         using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
@@ -182,14 +192,20 @@ public static class Middleware
 /// File: "SCSKPACK", u32 version, u32 header length, header JSON (<see cref="PackHeader"/>), then proxy db records.</summary>
 public sealed class MiddlewarePack
 {
-    public sealed record PackHeader(string Vendor, string Dll, string ContentHash, long Size, List<string> Sources);
+    /// <param name="Object">a shared pack's: the community database object it was downloaded as</param>
+    /// <param name="Gpu">this PC's pack: the GPU vendor whose recordings filled it ("nvidia", "amd"); null in a pack from
+    /// before packs kept it</param>
+    public sealed record PackHeader(string Vendor, string Dll, string ContentHash, long Size, List<string> Sources, string? Object = null, string? Gpu = null);
 
     const int Version = 1;
     public PackHeader Header { get; private set; }
     public List<Rec> Entries { get; } = [];
     public Dictionary<string, byte[]> RootSignatures { get; } = [];
 
-    public MiddlewarePack(string vendor, string dll, string contentHash, long size) => Header = new(vendor, dll, contentHash, size, []);
+    public MiddlewarePack(string vendor, string dll, string contentHash, long size, string? obj = null, string? gpu = null) =>
+        Header = new(vendor, dll, contentHash, size, [], obj, gpu);
+
+    public void Adopt(string gpu) => Header = Header with { Gpu = gpu };
 
     public static string FileName(string dll, string contentHash) => $"{dll.ToLowerInvariant()}-{contentHash}.pack";
 
@@ -212,13 +228,25 @@ public sealed class MiddlewarePack
             foreach (var r in Entries) PsoDb.Write(f, r.Tag, r.Payload);
         }
         File.Move(tmp, path, true);
+        App.KeyFiles.Forget(path);
+    }
+
+    /// <summary>The header alone; null when the file isn't a readable pack.</summary>
+    public static PackHeader? ReadHeader(string path)
+    {
+        try
+        {
+            using var f = File.OpenRead(path);
+            return PlanFile.ReadHeader<PackHeader>(f, "SCSKPACK"u8, Version, $"{path}: not a v{Version} pack");
+        }
+        catch (Exception e) when (e is InvalidDataException or IOException or JsonException or UnauthorizedAccessException) { return null; }
     }
 
     public static MiddlewarePack Read(string path)
     {
         using var f = File.OpenRead(path);
         var h = PlanFile.ReadHeader<PackHeader>(f, "SCSKPACK"u8, Version, $"{path}: not a v{Version} pack");
-        var pack = new MiddlewarePack(h.Vendor, h.Dll, h.ContentHash, h.Size);
+        var pack = new MiddlewarePack(h.Vendor, h.Dll, h.ContentHash, h.Size, h.Object, h.Gpu);
         pack.Header.Sources.AddRange(h.Sources);
         foreach (var r in PsoDb.Read(f))
             if (r.Tag == 'B') pack.RootSignatures[Hex(r.Payload.AsSpan(0, 20))] = r.Payload[20..];
@@ -244,27 +272,79 @@ public sealed class MiddlewarePacks(string dir)
         catch (Exception e) when (e is InvalidDataException or IOException or JsonException) { return null; }
     }
 
-    /// <summary>PSOs in the pack of this DLL version; 0 without one. The DLL is hashed (<see cref="Middleware.Scan"/>'s cache)
-    /// only when a pack of its name exists.</summary>
-    public int Pipelines(MiddlewareDll dll)
+    /// <summary>PSOs in the pack of this DLL version; 0 without one.</summary>
+    public int Pipelines(MiddlewareDll dll) => Keys(dll).Count();
+
+    /// <summary>The record keys of the pack of this DLL version; none without one. <paramref name="amd"/> given: only
+    /// the entries a GPU of that vendor runs (<see cref="Runs"/>), what seeds its plans.</summary>
+    public IEnumerable<string> Keys(MiddlewareDll dll, bool? amd = null) => Seeds(dll, amd).Entries.Select(e => e.Key);
+
+    /// <summary>The entries of the pack of this DLL version (<paramref name="amd"/> given: those a GPU of that vendor runs)
+    /// and the root signatures the pack keeps for them. The DLL is hashed (<see cref="Middleware.Scan"/>'s cache) only when a pack
+    /// of its name exists.</summary>
+    public (List<Rec> Entries, List<string> RootSignatures) Seeds(MiddlewareDll dll, bool? amd = null)
     {
         var dir = Path.Combine(Dir, dll.Vendor);
         try
         {
-            return dll.Packable && Directory.Exists(dir) && Directory.EnumerateFiles(dir, MiddlewarePack.FileName(dll.Name, "*")).Any()
-                && Load(dll, Middleware.Scan(dll.Path)) is { } pack ? pack.Entries.Count : 0;
+            if (!dll.Packable || !Directory.Exists(dir) || !Directory.EnumerateFiles(dir, MiddlewarePack.FileName(dll.Name, "*")).Any()) return ([], []);
+            var image = Middleware.Scan(dll.Path);
+            if (Load(dll, image) is not { } pack) return ([], []);
+            List<Rec> entries = [.. pack.Entries.Where(e => amd is not { } a || Runs(e, image, a))];
+            return (entries, [.. entries.Select(e => Parse(e).Rs).Where(pack.RootSignatures.ContainsKey).Distinct()]);
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return 0; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return ([], []); }
     }
+
+    /// <summary>Whether a GPU of this vendor runs every shader of a pack entry (<see cref="MiddlewareImage.Runs"/>): the one
+    /// rule for what a pack seeds. <paramref name="memo"/>: per shader, across calls.</summary>
+    public static bool Runs(Rec entry, MiddlewareImage image, bool amd, Dictionary<string, bool>? memo = null)
+    {
+        Pso p;
+        try { p = Parse(entry); }
+        catch (Exception e) when (e is InvalidDataException or ArgumentException or KeyNotFoundException) { return false; }   // seeds nothing
+        return p.Stages.Values.All(h => memo == null ? image.Runs(h, amd) : memo.TryGetValue(h, out var ok) ? ok : memo[h] = image.Runs(h, amd));
+    }
+
+    /// <summary>A shared pack downloaded for <paramref name="dll"/> (canonical records, <see cref="HashOnly.CheckPack"/>)
+    /// as a pack of this install's copy: only the PSOs whose every shader that copy holds and this GPU vendor runs
+    /// (<see cref="MiddlewareImage.Runs"/>), and whose root signature the copy holds or the download has as a 'B' (a PSO
+    /// naming anything else could only be skipped). <paramref name="dropped"/>: the others.</summary>
+    public static MiddlewarePack FromShared(List<Rec> records, MiddlewareDll dll, MiddlewareImage image, bool amd, string obj, out int dropped)
+    {
+        var blobs = records.Where(r => r.Tag == 'B').ToDictionary(r => Hex(r.Payload.AsSpan(0, 20)), r => r.Payload[20..]);
+        var pack = new MiddlewarePack(dll.Vendor, dll.Name, image.ContentHash, image.Size, obj);
+        pack.Header.Sources.Add("community");
+        dropped = 0;
+        foreach (var r in records.Where(r => r.Tag != 'B'))
+        {
+            var p = Parse(r);
+            if (p.Stages.Count == 0 || !p.Stages.Values.All(h => image.Containers.ContainsKey(h) && image.Runs(h, amd))
+                || p.Rs != Zero && !image.Containers.ContainsKey(p.Rs) && !blobs.ContainsKey(p.Rs)) { dropped++; continue; }
+            if (blobs.TryGetValue(p.Rs, out var rs)) pack.RootSignatures[p.Rs] = rs;
+            pack.Entries.Add(r);
+        }
+        return pack;
+    }
+
+    /// <summary>A pack as a canonical hash-only recording: its root signatures as 'B' records and its PSOs (an upload's body).</summary>
+    public static List<Rec> Records(MiddlewarePack pack) =>
+        HashOnly.CheckPack(HashOnly.Canonical([.. pack.RootSignatures.Select(r => new Rec('B', [.. Convert.FromHexString(r.Key), .. r.Value])), .. pack.Entries],
+            local: false, out _));
 
     public sealed record Promoted(MiddlewareDll Dll, string ContentHash, int Records, int New, string PackPath);
 
     /// <summary>Records of a recording whose stages are all containers of one detected DLL and none a game-index shader
     /// go into that DLL version's pack with their root signature (only RTS0-only blobs; a record whose root signature isn't
-    /// in the recording, or is shader-bearing, is left out). Returns per DLL how many qualified and how many were new.</summary>
+    /// in the recording, or is shader-bearing, is left out). Returns per DLL how many qualified and how many were new.
+    /// <paramref name="gpu"/>: this GPU's vendor ("nvidia", "amd"), kept in the pack (<see cref="PackHeader.Gpu"/>), so a pack
+    /// holds one vendor's pipelines: a PSO whose wave size this GPU doesn't run is left out (the recording may hold another
+    /// vendor's, from a community recording merged in), another vendor's pack starts over (a GPU change), and a pack from
+    /// before packs kept their GPU is adopted by this one without the PSOs it doesn't run.</summary>
     public List<Promoted> Promote(IEnumerable<Rec> records, IReadOnlyDictionary<string, byte[]> blobs, IReadOnlyDictionary<string, ShaderInfo> index,
-        IEnumerable<MiddlewareDll> dlls, string source)
+        IEnumerable<MiddlewareDll> dlls, string source, string? gpu = null)
     {
+        bool? amd = gpu == null ? null : gpu == "amd";
         var candidates = new List<(Rec R, Pso P)>();
         foreach (var r in records)
         {
@@ -278,9 +358,21 @@ public sealed class MiddlewarePacks(string dir)
         foreach (var dll in dlls.Where(d => d.Packable))
         {
             var image = Middleware.Scan(dll.Path);
-            var mine = candidates.Where(c => c.P.Stages.Values.All(image.Containers.ContainsKey)).ToList();
+            var mine = candidates.Where(c => c.P.Stages.Values.All(h => image.Containers.ContainsKey(h) && (amd is not { } a || image.Runs(h, a)))).ToList();
             if (mine.Count == 0) continue;
-            var pack = Load(dll, image) ?? new MiddlewarePack(dll.Vendor, dll.Name, image.ContentHash, image.Size);
+            var pack = Load(dll, image);
+            var reset = false;
+            if (gpu != null && pack != null && pack.Header.Gpu != gpu)
+            {
+                if (pack.Header.Gpu == null)
+                {
+                    pack.Entries.RemoveAll(e => !Parse(e).Stages.Values.All(h => image.Runs(h, amd!.Value)));
+                    pack.Adopt(gpu);
+                }
+                else pack = null;
+                reset = true;
+            }
+            pack ??= new MiddlewarePack(dll.Vendor, dll.Name, image.ContentHash, image.Size, gpu: gpu);
             var added = 0;
             foreach (var (r, p) in mine)
             {
@@ -292,7 +384,7 @@ public sealed class MiddlewarePacks(string dir)
                 if (pack.Add(r, source)) added++;
             }
             var path = PathOf(dll.Vendor, dll.Name, image.ContentHash);
-            if (added > 0) pack.Write(path);
+            if (added > 0 || reset) pack.Write(path);
             result.Add(new Promoted(dll, image.ContentHash, mine.Count, added, path));
         }
         return result;
@@ -300,30 +392,33 @@ public sealed class MiddlewarePacks(string dir)
 
     public sealed record Seeded(MiddlewareDll Dll, string ContentHash, MiddlewarePack Pack);
 
-    /// <summary>The packs of the detected DLL versions (same content hash) that have any.</summary>
-    public List<Seeded> Seed(IEnumerable<MiddlewareDll> dlls)
+    /// <summary>The packs of the detected DLL versions (same content hash) that have any, and the <see cref="Fingerprint"/>
+    /// of what was read.</summary>
+    public List<Seeded> Seed(IEnumerable<MiddlewareDll> dlls, out string fingerprint)
     {
         var list = new List<Seeded>();
+        var parts = new List<string>();
         foreach (var dll in dlls.Where(d => d.Packable))
         {
             if (!Directory.Exists(Path.Combine(Dir, dll.Vendor))) continue; // no pack of this vendor: don't hash the DLL
             var image = Middleware.Scan(dll.Path);
+            parts.Add(Part(dll, image.ContentHash));   // before the read: a pack changed after it mismatches the next time
             if (Load(dll, image) is { Entries.Count: > 0 } pack) list.Add(new Seeded(dll, image.ContentHash, pack));
         }
+        fingerprint = string.Join('|', parts);
         return list;
     }
 
     /// <summary>What decides a plan's pack items: the detected DLL versions and their packs' sizes (a changed DLL or a
     /// grown pack means the plan could seed more; a caller may re-plan when it changes).</summary>
-    public string Fingerprint(Game game)
+    public string Fingerprint(Game game) => string.Join('|', Middleware.Detect(game).Where(d => d.Packable && Directory.Exists(Path.Combine(Dir, d.Vendor))) // no pack of its vendor: can't seed, not hashed
+        .Select(d => Part(d, Middleware.Scan(d.Path).ContentHash)));
+
+    string Part(MiddlewareDll d, string hash)
     {
-        var parts = Middleware.Detect(game).Where(d => d.Packable && Directory.Exists(Path.Combine(Dir, d.Vendor))).Select(d => // no pack of its vendor: can't seed, not hashed
-        {
-            var hash = Middleware.Scan(d.Path).ContentHash;
-            var p = PathOf(d.Vendor, d.Name, hash);
-            return $"{d.Name}:{hash}:{(File.Exists(p) ? new FileInfo(p).Length : 0)}";
-        });
-        return string.Join('|', parts);
+        var p = PathOf(d.Vendor, d.Name, hash);
+        // a shared pack is replaced whole: another object of the same length is other PSOs
+        return $"{d.Name}:{hash}:{(File.Exists(p) ? new FileInfo(p).Length : 0)}" + (File.Exists(p) && MiddlewarePack.ReadHeader(p)?.Object is { } obj ? ":" + obj : "");
     }
 
     // plan body: 'M' = a pack entry: u8 inner tag, DLL content sha1[20], u8 name length, name (UTF-8), inner payload

@@ -73,7 +73,10 @@ catch (Exception e)
     code = Fail(e is ArgumentException or InvalidOperationException or IOException or UnauthorizedAccessException ? e.Message : e.ToString());
 }
 // Run elevated by the app (Elevated.Run): runas can't redirect stdout, so the outcome goes to a file.
-if (Opt(Elevated.ResultArg) is { } resultFile) Elevated.WriteResult(resultFile, code == 0, Outcome.Message ?? "");
+string? resultFile = null;
+try { resultFile = Opt(Elevated.ResultArg); }
+catch (ArgumentException e) { code = Fail(e.Message); }
+if (resultFile != null) Elevated.WriteResult(resultFile, code == 0, Outcome.Message ?? "");
 return code;
 
 static int Fail(string message)
@@ -132,7 +135,18 @@ static GameState Match(IReadOnlyList<GameState> games, string query)
     };
 }
 
-string? Opt(string name) => Array.IndexOf(args, name) is var i and >= 0 && i + 1 < args.Length ? args[i + 1] : null;
+string? Opt(string name)
+{
+    int i = Array.IndexOf(args, name);
+    if (i < 0) return null;
+    return i + 1 < args.Length && !args[i + 1].StartsWith("--") ? args[i + 1] : throw new ArgumentException($"{name} needs a value");
+}
+
+/// <summary>Refuses an option the command doesn't take (a typo would otherwise run with the default).</summary>
+void Only(params string[] known)
+{
+    if (args.Skip(1).FirstOrDefault(a => a.StartsWith("--") && !known.Contains(a)) is { } unknown) throw new ArgumentException($"unknown option '{unknown}'");
+}
 
 async Task<int> Scan(bool rescan)
 {
@@ -175,7 +189,7 @@ async Task<int> Status(string? query)
           keys       {(rec.CacheKeys.Count > 0 ? string.Join(", ", rec.CacheKeys.Order()) : "-")}{(k.WarmAgs(g.Game.Id) is { } ags ? $" (compiles register its AGS app name {ags.App}, key {k.AgsKey(g.Game.Id)}: the exe name's case doesn't matter)" : AmdAppCache.IsNameHashed(rec.CacheKeys, ScsKiller.WarmExeName(g.Game, rec)) == false ? " (an app profile's key, not the exe name's hash: the name's case doesn't matter)" : "")}
           recorder   {(g.RecorderInstalled ? "installed" : "not installed")}
           recording  {(g.RecordingBytes > 0 ? $"{Format.Bytes(g.RecordingBytes)} (the game folder's files and SCSKiller's copy)" : "-")}, limit {ScsKiller.LimitText(k.Settings.RecordingLimitMB)} per game{(g.RecordingPaused ? $"; {ScsKiller.PausedNote(k.Settings)}" : "")}
-          last play  {(g.LastSession is { } l ? $"{Hms(l.Duration)}, {l.Requests} pipelines: {l.FromGameLibrary} from the game's library, {l.CacheHits} cache hits, {l.Compiles} compiles (worst {l.WorstCompileMs:0.0} ms){(l.RayQueryRecompiles > 0 ? $", {l.RayQueryRecompiles} ray-traced pipelines the driver partly recompiles every launch" : "")}{(l.StateObjectsReady + l.StateObjectsCompiled > 0 ? $"; ray tracing state objects: {l.StateObjectsReady} ready, {l.StateObjectsCompiled} compiled" : "")}" : "-")}
+          last play  {(g.LastSession is { } l ? $"{Hms(l.Duration)}, {l.Requests} pipelines: {l.FromGameLibrary} from the game's library, {l.CacheHits} cache hits, {l.Compiles} compiles (worst {l.WorstCompileMs:0.0} ms){(l.StartupCompiles > 0 ? $", {l.StartupCompiles} compiles while the game started" : "")}{(l.RayQueryRecompiles > 0 ? $", {l.RayQueryRecompiles} ray-traced pipelines the driver partly recompiles every launch" : "")}{(l.StateObjectsReady + l.StateObjectsCompiled + l.StateObjectsStartupCompiled > 0 ? $"; ray tracing state objects: {l.StateObjectsReady} ready, {l.StateObjectsCompiled} compiled{(l.StateObjectsStartupCompiled > 0 ? $", {l.StateObjectsStartupCompiled} compiled while the game started" : "")}" : "")}" : "-")}
           1st launch {(rec.FirstLaunch is { } fl ? $"{fl.At.LocalDateTime:yyyy-MM-dd HH:mm}, after the last compile: {fl.Hits} cache hits, {fl.Compiles} compiles ({fl.Compiled * 100:0.0}% compiled)" : "-")}
         """);
     return 0;
@@ -206,9 +220,11 @@ async Task<int> RunQueue(ScsKiller k, IReadOnlyList<GameState> targets, bool whe
 {
     if (targets.Count == 0) { Console.WriteLine("nothing to compile"); return 0; }
     PrintQueueChanges(k);
+    bool cancelled = false;
     Console.CancelKeyPress += (_, e) =>
     {
         e.Cancel = true;
+        cancelled = true;
         Console.WriteLine("stopping (in-flight compiles finish so the driver writes its cache)...");
         foreach (var q in k.Queue.Where(q => q.Stage == QueueStage.Waiting)) k.Remove(q.GameId);
         k.StopQueue();
@@ -218,7 +234,7 @@ async Task<int> RunQueue(ScsKiller k, IReadOnlyList<GameState> targets, bool whe
     if (whenIdle) Console.WriteLine($"waiting until the PC has been idle for {k.IdleAfter.TotalMinutes:0} min (pauses on input)");
     else k.StartQueue();
     await k.WhenQueueIdle();
-    return k.Queue.All(q => q.Stage == QueueStage.Done) ? 0 : 1;
+    return !cancelled && k.Queue.Count > 0 && k.Queue.All(q => q.Stage == QueueStage.Done) ? 0 : 1;   // Ctrl+C: not everything compiled
 }
 
 // A debugging shell: the queue lives in this process, so commands come on stdin (or piped: echo add ff7 | scskiller queue).
@@ -292,8 +308,10 @@ async Task<int> CacheClear()
 async Task<int> Compile()
 {
     if (args.Length < 2) return Fail("compile <game|--all-ready> [--threads N] [--idle | --when-idle] [--careful | --fast]");
+    Only("--all-ready", "--threads", "--idle", "--when-idle", "--careful", "--fast");
+    int? threads = Opt("--threads") is { } t ? int.TryParse(t, out var n) && n > 0 ? n : throw new ArgumentException("--threads takes a number of threads") : null;
     var k = await Open();
-    if (Opt("--threads") is { } t) k.ThreadsOverride = int.Parse(t);
+    if (threads != null) k.ThreadsOverride = threads;
     bool whenIdle = args.Contains("--when-idle");
     k.Background = args.Contains("--idle");
     if (k.Background || whenIdle) BackgroundPriority();

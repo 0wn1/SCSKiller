@@ -180,6 +180,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
         var platforms = new List<string>();
         var byKey = new Dictionary<string, (string Sha, string Platform)>(); // version-1 archives: archive hash -> shader
         var lanes = new ConcurrentDictionary<string, string>(); // shader -> its [WaveSize] platform suffix
+        var byHash = new Dictionary<string, (string Sha, string Platform)>(); // library hash -> shader
         using var content = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
         foreach (var lib in Libraries(provider))
         {
@@ -208,6 +209,9 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
             if (arc.Keys is { } keys)
                 for (var i = 0; i < keys.Length; i++)
                     if (sha[i] != null) byKey[keys[i]] = (sha[i], lib.Platform);
+            if (arc.Hashes is { } hashes)
+                for (var i = 0; i < Math.Min(hashes.Length, sha.Length); i++)
+                    if (sha[i] != null && shaders.ContainsKey(sha[i])) byHash[hashes[i]] = (sha[i], lib.Platform);
             for (var m = 0; m < arc.MapHashes.Length; m++)
             {
                 var list = Enumerable.Range(arc.Maps[m].Off, arc.Maps[m].Num).Select(k => sha[arc.Indices[k]]).ToList();
@@ -231,7 +235,30 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
             log?.Report($"shader maps from package references: {found.Count} of {scanned} scanned packages, {found.SelectMany(m => m.Shaders).Distinct().Count()} of {byKey.Values.Select(v => v.Sha).Distinct().Count()} archive shaders referenced ({sw.Elapsed.TotalSeconds:F1}s)");
         }
         if (wide.Apply(shaders)) log?.Report("resource counts: 10-byte layout with a 16-bit SRV count (the shaders' bindings agree)");
+        maps.AddRange(ShippedPipelines(provider, byHash, log));
         return new ShaderIndex(Convert.ToHexStringLower(content.GetHashAndReset()), platforms, shaders, maps);
+    }
+
+    /// <summary>The graphics PSOs of the game's shipped pipeline caches (<see cref="StablePipelineCache"/>), one exact map each,
+    /// so the planner pairs their shaders as the game does. With r.ShaderPipelineCache.ExcludePrecachePSO they are what PSO
+    /// precaching doesn't create: global and post-process passes. Not in the content hash: they change no shader, and the
+    /// community database finds a build by that hash.</summary>
+    static List<ShaderMap> ShippedPipelines(AbstractFileProvider provider, Dictionary<string, (string Sha, string Platform)> byHash, IProgress<string>? log)
+    {
+        var maps = new List<ShaderMap>();
+        foreach (var f in provider.Files.Values.Where(f => f.Path.EndsWith(".stable.upipelinecache", StringComparison.OrdinalIgnoreCase)).OrderBy(f => f.Path, StringComparer.Ordinal))
+        {
+            List<StablePipelineCache.Pso>? psos;
+            try { psos = StablePipelineCache.Read(f.Read()); }
+            catch (Exception) { psos = null; } // an entry CUE4Parse can't read
+            if (psos == null) { log?.Report($"{f.Name}: not a pipeline cache this reads, skipped"); continue; }
+            var graphics = psos.Where(p => p.Type == StablePipelineCache.PsoType.Graphics).ToList();
+            var known = graphics.Where(p => p.Shaders.Length > 0 && p.Shaders.All(byHash.ContainsKey)).ToList();
+            maps.AddRange(known.Select(p => new ShaderMap($"{f.NameWithoutExtension}:{p.Key:x8}", "PipelineCache", byHash[p.Shaders[0]].Platform,
+                p.Shaders.Select(h => byHash[h].Sha).ToList(), IsPipeline: true)));
+            log?.Report($"{f.Name}: {psos.Count} PSOs, {graphics.Count} graphics{(known.Count < graphics.Count ? $" ({graphics.Count - known.Count} name a shader no library has)" : "")}");
+        }
+        return maps;
     }
 
     /// <summary>Calls <paramref name="sink"/> once per found shader, one call at a time.</summary>
@@ -404,7 +431,8 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
     /// <summary>One opened library: shader map hashes, map -> (offset, count) into Indices, and per-shader code producers
     /// (IoStore groups decompress several shaders at once).</summary>
     internal sealed record Archive(string[] MapHashes, (int Off, int Num)[] Maps, uint[] Indices, int Count, Func<IEnumerable<(int, byte[])>>[] Codes,
-        string[]? Keys = null); // version 1: each shader's archive hash (packages reference it); no maps
+        string[]? Keys = null, // version 1: each shader's archive hash (packages reference it); no maps
+        string[]? Hashes = null); // each shader's library hash (FSHAHash), which pipeline caches name it by
 
     static IEnumerable<Library> Libraries(AbstractFileProvider provider) =>
         provider.Files.Values.Where(f => f.Extension == "ushaderbytecode").OrderBy(f => f.Path, StringComparer.Ordinal).Select(f =>
@@ -431,7 +459,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
                         var code = e.Size == e.UncompressedSize ? arc.ShaderCode[i] : Decompress(arc.ShaderCode[i], (int)e.UncompressedSize);
                         arc.ShaderCode[i] = null!; // free as we go
                         return [(i, code)];
-                    })).ToArray());
+                    })).ToArray(), Hashes: lib.ShaderHashes.Select(h => h.ToString().ToLowerInvariant()).ToArray());
             case FIoStoreShaderCodeArchive io: // UE5 IoStore: code lives in shader-group IoChunks, each compressed as a whole
                 var readers = provider.MountedVfs.OfType<IoStoreReader>().ToList();
                 return new Archive(io.ShaderMapHashes.Select(h => h.ToString().ToLowerInvariant()).ToArray(),
@@ -444,7 +472,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
                         var members = io.ShaderIndices.Skip((int)g.ShaderIndicesOffset).Take((int)g.NumShaders)
                             .Select(s => (s: (int)s, o: (int)io.ShaderEntries[s].UncompressedOffsetInGroup)).OrderBy(x => x.o).ToList();
                         return members.Select((m, k) => (m.s, group[m.o..(k + 1 < members.Count ? members[k + 1].o : (int)g.UncompressedSize)]));
-                    })).ToArray());
+                    })).ToArray(), Hashes: io.ShaderHashes.Select(h => h.ToString().ToLowerInvariant()).ToArray());
             default:
                 return null;
         }

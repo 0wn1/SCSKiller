@@ -75,12 +75,82 @@ public class RecordingsTests(ITestOutputHelper output) : IDisposable
         }
         Assert.Throws<IOException>(() => PsoDb.WriteCompact(path, Failing()));
         Assert.Equal(before, File.ReadAllBytes(path));
-        Assert.False(File.Exists(path + ".tmp"));
+        Assert.Empty(Directory.GetFiles(_dir, "*.tmp"));
 
-        File.WriteAllText(path + ".tmp", "left by a process that was killed mid-write");
+        File.WriteAllText(path + ".tmp", "left by an older build's process that was killed mid-write");
+        File.SetLastWriteTime(path + ".tmp", DateTime.Now.AddHours(-2));   // not written for an hour: its writer is gone
+        var recent = $"{path}.{Guid.NewGuid():N}.tmp";   // under the lock no writer is live, but it may be a minute old: kept for an hour
+        File.WriteAllText(recent, "?");
+        using (Recordings.Lock(path)) { }   // whoever writes next removes the old ones
+        Assert.Equal([recent], Directory.GetFiles(_dir, "*.tmp"));
+        File.SetLastWriteTime(recent, DateTime.Now.AddHours(-2));
+        using (Recordings.Lock(path)) { }
+        Assert.Empty(Directory.GetFiles(_dir, "*.tmp"));
         PsoDb.WriteCompact(path, PsoDb.Read(path).ToList());
         Assert.Equal(Keys(HashOnly.Records(before)), Keys(PsoDb.Read(path)));
-        Assert.False(File.Exists(path + ".tmp"));
+        Assert.Empty(Directory.GetFiles(_dir, "*.tmp"));
+    }
+
+    [Fact]
+    public async Task The_lock_is_an_exclusive_file_reentered_by_its_holder_and_waited_for_up_to_a_limit()
+    {
+        var path = Path.Combine(_dir, "recording.db");
+        using var held = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var first = Task.Factory.StartNew(() =>
+        {
+            using (Recordings.Lock(path))
+            using (Recordings.Lock(path))   // re-entered (ImportRecording -> WriteKeys): no wait on itself
+            {
+                held.Set();
+                release.Wait();
+            }
+        }, TaskCreationOptions.LongRunning);
+        Assert.True(held.Wait(TimeSpan.FromSeconds(10)));
+        var second = Task.Factory.StartNew(() => { using (Recordings.Lock(path)) { } }, TaskCreationOptions.LongRunning);
+        Assert.False(second.Wait(300));   // a file, so a process in another session waits the same way
+        Assert.Throws<IOException>(() => new FileStream(path + ".lock", FileMode.Open, FileAccess.Read, FileShare.ReadWrite));
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsAsync<IOException>(() => Task.Factory.StartNew(() => Recordings.Lock(path, TimeSpan.FromMilliseconds(200)).Dispose(),
+            TaskCreationOptions.LongRunning));
+        Assert.InRange(clock.Elapsed.TotalSeconds, 0.15, 5);
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));   // a community download's deadline, a stopped queue
+        clock.Restart();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Task.Factory.StartNew(() => Recordings.Lock(path, ct: cts.Token).Dispose(),
+            TaskCreationOptions.LongRunning));
+        Assert.InRange(clock.Elapsed.TotalSeconds, 0.15, 5);
+        release.Set();
+        await first;
+        await second.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
+    public void Two_writers_never_share_a_temp_file()
+    {
+        var rs = CommunityTests.RootSignature();
+        var path = Raw("recording.db", Blob(rs), Blob(Shader("a")), Cs(rs, Shader("a")));
+        var records = PsoDb.Read(path).ToList();
+        using (new FileStream(path + ".tmp", FileMode.Create, FileAccess.Write, FileShare.None))   // another writer's, mid-write
+            PsoDb.WriteCompact(path, records);
+        Assert.Equal(Keys(records), Keys(PsoDb.Read(path)));
+    }
+
+    [Fact]
+    public async Task Recording_writes_take_turns_whatever_the_paths_spelling()
+    {
+        var path = Path.Combine(_dir, "recording.db");
+        using var held = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var first = Task.Factory.StartNew(() =>
+        {
+            using (Recordings.Lock(path)) { held.Set(); release.Wait(); }
+        }, TaskCreationOptions.LongRunning);
+        held.Wait();
+        var second = Task.Factory.StartNew(() => { using (Recordings.Lock(Path.Combine(_dir, ".", "RECORDING.DB"))) { } }, TaskCreationOptions.LongRunning);
+        Assert.False(second.Wait(300));   // a named mutex: the app and the CLI wait for each other the same way
+        release.Set();
+        await first;
+        await second.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     [Fact]

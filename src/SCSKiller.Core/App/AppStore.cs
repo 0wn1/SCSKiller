@@ -21,7 +21,8 @@ public sealed class GameRecord
     public int WarmedPlanVersion { get; set; }               // PlanVersion of the plan the last complete warm replayed
     public string? PlanItems { get; set; }                   // ScsKiller.PlanFingerprint of plan.bin's records (null: not taken, or not readable)
     public string? WarmedPlanItems { get; set; }             // PlanItems of the plan the last complete warm replayed
-    public long? PlanNewItems { get; set; }                  // records of plan.bin the last complete warm didn't replay; null = not known
+    public string? PlanKeysFile { get; set; }                // the plan's planner-made pipelines (KeyFiles), in the game's folder; null = not kept
+    public string? WarmKeysFile { get; set; }                // what the last complete warm replayed (KeyFiles); null = a warm from before they were kept
     public bool PlanPerStage { get; set; }                  // the plan has each stage unit once, not every pairing (per-stage cache, not Maximum)
     public bool WarmedPerStage { get; set; }                // PlanPerStage of the plan the last complete warm replayed
     public string? PlanMiddleware { get; set; }             // MiddlewarePacks.Fingerprint when the plan was built (DLL versions + pack sizes)
@@ -47,13 +48,15 @@ public sealed class GameRecord
     public DateTimeOffset? RecordingImportedAt { get; set; }  // when an import last added records
     public string? RecordingInbox { get; set; }             // the game folder's scskiller.db (size:write ticks) when last imported
     public string? RecordingIndexHash { get; set; }         // the index build whose shaders the recording names by hash only; null: not checked since an import
-    public long RecordedSinceWarm { get; set; }             // pipeline records the imports added since the last complete warm that its plan lacks
     public Dictionary<string, string> RecorderFiles { get; set; } = [];   // file name in the exe folder -> SHA-256 we installed
     public string? RecorderExe { get; set; }                 // the game's exe while a recorder is installed: uninstall finds it without a scan
+    public string? RecorderInstallDir { get; set; }          // and its install root, for the running check
     // null = not migrated: the first reconcile makes an installed recorder of ours On (the user put it there), else Default
     public RecorderOverride? Recorder { get; set; }
     public bool RecordAlongsideMod { get; set; }             // opt-in: install the recorder where a mod's d3d12.dll is, chained to it
     public ChainedDll? RecorderChained { get; set; }         // that mod's d3d12.dll, renamed for the chain: put back when the recorder goes
+    public bool RecorderRollback { get; set; }               // a failed install couldn't take the proxy out: the next reconcile does
+    public bool KeysPending { get; set; }                    // the keys file wasn't rewritten while the game ran: the next refresh or reconcile does
     public HashSet<string> CacheKeys { get; set; } = [];     // driver-cache application keys seen open by this game's warms or the game (IAppCache)
     public HashSet<string> GameKeys { get; set; } = [];      // ...of them, the ones the game's own process held open
     public HashSet<string>? WarmedKeys { get; set; }         // ...the ones the last complete warm held open; null = not recorded
@@ -125,7 +128,49 @@ public sealed class AppStore(string dataDir)
     public Dictionary<string, DateTimeOffset> LoadFeedTimes() => Load<Dictionary<string, DateTimeOffset>>(Path.Combine(DataDir, "feeds.json")) ?? [];
     public void SaveFeedTimes(Dictionary<string, DateTimeOffset> times) => Save(Path.Combine(DataDir, "feeds.json"), times);
 
-    public string GameDir(string gameId) => Path.Combine(DataDir, "games", gameId.Replace(':', '_'));
+    /// <summary>The game's folder under games\: the id with ':' replaced by '_', as it always was, when that is a plain
+    /// folder name (<see cref="IsPlainName"/>). Launcher metadata (an Xbox Identity.Name, an EA content id, an Epic app
+    /// name) may hold separators or "..": such an id gets '%' and its <see cref="Segment"/> instead, which a plain name
+    /// never starts with, so the two kinds never meet and existing folders keep their names. <see cref="GameId"/> reverses it.</summary>
+    public string GameDir(string gameId)
+    {
+        var games = Path.Combine(DataDir, "games");
+        var plain = gameId.Replace(':', '_');
+        var dir = Path.Combine(games, IsPlainName(plain) ? plain : EncodedPrefix + Segment(gameId));
+        if (!string.Equals(Path.GetDirectoryName(Path.GetFullPath(dir)), Path.GetFullPath(games), StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException($"game id {gameId} isn't a folder name");
+        return dir;
+    }
+
+    // the escape character of Segment: an id from a store ("steam:", "epic:", ...) never starts with it
+    const char EncodedPrefix = '%';
+
+    /// <summary>A folder name that stays itself: not empty, no character a file name can't hold, no trailing dot or space
+    /// (Windows trims them, so "." and ".." too), and not starting with <see cref="EncodedPrefix"/>.</summary>
+    static bool IsPlainName(string name) =>
+        name.Length > 0 && name[0] != EncodedPrefix && name.IndexOfAny(BadNameChars) < 0 && name[^1] is not ('.' or ' ');
+
+    /// <summary>The id whose <see cref="GameDir"/> is the folder <paramref name="folderName"/>: a plain folder name is its own
+    /// (<see cref="GameDir"/> maps it to itself).</summary>
+    public static string GameId(string folderName) =>
+        folderName.StartsWith(EncodedPrefix) ? Uri.UnescapeDataString(folderName[1..]) : folderName;
+
+    /// <summary><paramref name="name"/> as one file name, reversibly: '%', what a file name can't hold and the dots and spaces
+    /// Windows trims off the end (all of "." and "..") become %XX. A valid name without them is left as it is.</summary>
+    public static string Segment(string name)
+    {
+        var s = new StringBuilder(name.Length);
+        var tail = name.Length - name.AsSpan().TrimEnd(". ").Length;
+        for (var i = 0; i < name.Length; i++)
+        {
+            var c = name[i];
+            if (c == '%' || i >= name.Length - tail || Array.IndexOf(BadNameChars, c) >= 0) s.Append($"%{(int)c:X2}");
+            else s.Append(c);
+        }
+        return s.ToString();
+    }
+
+    static readonly char[] BadNameChars = Path.GetInvalidFileNameChars();
 
     // What each record handed out held when it was loaded or last saved: a save writes only what its holder changed since.
     readonly ConditionalWeakTable<GameRecord, JsonObject> _held = new();
@@ -141,22 +186,79 @@ public sealed class AppStore(string dataDir)
     /// stored record, re-read under a lock shared by every process of this user: a path that holds a record for long (a
     /// compile) never puts back what another path saved meanwhile (a watched exit, a learned key). The record's sets
     /// merge by what was added and removed. A record that wasn't loaded here is written whole.</summary>
-    public void SaveGame(string gameId, GameRecord r)
+    public void SaveGame(string gameId, GameRecord r, TimeSpan? wait = null)
     {
         var path = Path.Combine(GameDir(gameId), "state.json");
         var now = JsonSerializer.SerializeToNode(r, Json)!.AsObject();
-        using (var gate = new Mutex(false, "SCSKiller-state-" + Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(path).ToUpperInvariant())))))
+        Locked(path, () =>
         {
-            try { gate.WaitOne(); }
-            catch (AbandonedMutexException) { }   // its holder exited without releasing it: owned now all the same
-            try
-            {
-                var stored = _held.TryGetValue(r, out var was) && Load<JsonObject>(path) is { } latest ? Merge(latest, was, now) : now;
-                WriteAtomic(path, JsonSerializer.SerializeToUtf8Bytes(stored, Json));
-            }
-            finally { gate.ReleaseMutex(); }
-        }
+            var stored = _held.TryGetValue(r, out var was) && Load<JsonObject>(path) is { } latest ? Merge(latest, was, now) : now;
+            WriteAtomic(path, JsonSerializer.SerializeToUtf8Bytes(stored, Json));
+        }, wait);
         _held.AddOrUpdate(r, (JsonObject)now.DeepClone());
+    }
+
+    /// <summary>Deletes the game folder's key files its stored record doesn't name, read under the record's lock, and older
+    /// than an hour: one another process just wrote is named by its record soon (<see cref="KeyFiles.Prune"/>).</summary>
+    public void PruneKeyFiles(string gameId, TimeSpan? age = null)
+    {
+        var path = Path.Combine(GameDir(gameId), "state.json");
+        Locked(path, () =>
+        {
+            var stored = Load<GameRecord>(path);
+            KeyFiles.Prune(GameDir(gameId), age ?? TimeSpan.FromHours(1), stored?.PlanKeysFile, stored?.WarmKeysFile);
+        });
+    }
+
+    /// <summary>Runs <paramref name="f"/> holding the record's lock (<see cref="PathGate"/>).</summary>
+    internal static void Locked(string path, Action f, TimeSpan? wait = null)
+    {
+        using (new PathGate(path, wait)) f();
+    }
+
+    /// <summary>Owns the lock on <paramref name="path"/> every process of this user takes turns on (the app, the CLI, the
+    /// scheduled tasks, in any session): <c>&lt;path&gt;.lock</c> opened exclusively, until disposed on the thread that made
+    /// it. Re-entrant per thread, checked before any wait. A holder's handle goes when its process does. Waits up to
+    /// <paramref name="wait"/> (10 minutes when not given), then throws the IOException of the last try; or until
+    /// <paramref name="ct"/> is cancelled.</summary>
+    internal sealed class PathGate : IDisposable
+    {
+        readonly string _file;
+
+        public PathGate(string path, TimeSpan? wait = null, CancellationToken ct = default)
+        {
+            _file = Path.GetFullPath(path) + ".lock";
+            _held ??= new(StringComparer.OrdinalIgnoreCase);
+            if (_held.TryGetValue(_file, out var h))
+            {
+                h.Count++;
+                return;
+            }
+            Directory.CreateDirectory(Path.GetDirectoryName(_file)!);
+            var limit = wait ?? TimeSpan.FromMinutes(10);
+            for (var clock = System.Diagnostics.Stopwatch.StartNew(); ; ct.WaitHandle.WaitOne(20))
+                try
+                {
+                    ct.ThrowIfCancellationRequested();
+                    _held[_file] = new(new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
+                    return;
+                }
+                // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION: another holder has it
+                catch (IOException e) when ((e.HResult & 0xFFFF) is 32 or 33 && clock.Elapsed < limit) { }
+        }
+
+        public void Dispose()
+        {
+            if (_held!.TryGetValue(_file, out var h) && --h.Count == 0)
+            {
+                h.Stream.Dispose();
+                _held.Remove(_file);
+            }
+        }
+
+        sealed class Held(FileStream stream) { public readonly FileStream Stream = stream; public int Count = 1; }
+
+        [ThreadStatic] static Dictionary<string, Held>? _held;
     }
 
     static JsonObject Merge(JsonObject latest, JsonObject was, JsonObject now)
@@ -200,6 +302,7 @@ public sealed class AppStore(string dataDir)
         File.WriteAllBytes(tmp, bytes);
         try { Retry(() => { File.Move(tmp, path, overwrite: true); return 0; }); }
         finally { if (File.Exists(tmp)) File.Delete(tmp); }
+        KeyFiles.Forget(path);
     }
 
     /// <summary>Another process may be replacing the file right now: short retries for 2.5 s, then the error.</summary>

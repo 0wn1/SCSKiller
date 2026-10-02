@@ -16,12 +16,13 @@ public sealed record CommunityEntry(string ContentHash, string Object, long Size
 public sealed record CommunityDownload(string Object, string ContentHash, int Psos, DateTimeOffset DownloadedAt);
 
 /// <summary>The manifest (docs/db-contract.md): fixed 80-byte little-endian records, replayed in file order. Record 0 is the
-/// 'M' header (format 1, the epoch); 'E' entry: content hash -> object (the last one wins); 'A' alias: SHA-1 of the store
-/// build key -> content hash; 'T' tombstone: withdraws an entry until a later 'E'. Unknown kinds are skipped.</summary>
+/// 'M' header (format 1, the epoch); 'E' entry: content hash -> object (the last one wins); 'P' the same for a middleware
+/// pack, by its pack hash; 'A' alias: SHA-1 of the store build key -> content hash; 'T' tombstone: withdraws an entry or
+/// pack until a later 'E' or 'P'. Unknown kinds are skipped.</summary>
 public sealed class CommunityManifest
 {
     public const int RecordSize = 80;
-    readonly Dictionary<string, CommunityEntry> entries = [];
+    readonly Dictionary<string, CommunityEntry> entries = [], packs = [];
     readonly Dictionary<string, string> aliases = [];
     public uint Epoch { get; }
 
@@ -39,12 +40,15 @@ public sealed class CommunityManifest
             var hash = Convert.ToHexStringLower(r.Slice(4, 20));
             switch ((char)r[0])
             {
-                case 'E':
-                    m.entries[hash] = new(hash, Convert.ToHexStringLower(r.Slice(24, 32)), BinaryPrimitives.ReadUInt32LittleEndian(r[56..]),
+                case 'E' or 'P':
+                    (r[0] == 'E' ? m.entries : m.packs)[hash] = new(hash, Convert.ToHexStringLower(r.Slice(24, 32)), BinaryPrimitives.ReadUInt32LittleEndian(r[56..]),
                         (int)Math.Min(int.MaxValue, BinaryPrimitives.ReadUInt32LittleEndian(r[60..])), BinaryPrimitives.ReadUInt16LittleEndian(r[2..]));
                     break;
                 case 'A': m.aliases[hash] = Convert.ToHexStringLower(r.Slice(24, 20)); break;
-                case 'T': m.entries.Remove(hash); break;
+                case 'T':
+                    m.entries.Remove(hash);
+                    m.packs.Remove(hash);
+                    break;
             }
         }
         return m;
@@ -53,6 +57,11 @@ public sealed class CommunityManifest
     /// <summary>The alias key of a store build: lowercase hex SHA-1 of the UTF-8 "&lt;Game.Id&gt;@&lt;Game.Version&gt;"; null
     /// when the store gives no build id (such a game is found by its content hash once indexed).</summary>
     public static string? AliasKey(Game g) => g.Version is { Length: > 0 } v ? Convert.ToHexStringLower(SHA1.HashData(Encoding.UTF8.GetBytes($"{g.Id}@{v}"))) : null;
+
+    public bool HasPacks => packs.Count > 0;
+
+    /// <summary>The shared pack of a pack key (<see cref="HashOnly.PackKey"/>); its <see cref="CommunityEntry.ContentHash"/> is the pack hash.</summary>
+    public CommunityEntry? FindPack(string packKey) => packs.GetValueOrDefault(HashOnly.PackHash(packKey));
 
     /// <summary>By content hash when given (a fresh index), else by the game's store build.</summary>
     public CommunityEntry? Find(Game g, string? contentHash) =>
@@ -78,7 +87,7 @@ public sealed class Community
     readonly Func<bool, CancellationToken, Task<string?>> dbToken;
     readonly SemaphoreSlim manifestGate = new(1, 1);
     CommunityManifest? manifest;
-    DateTimeOffset backoffUntil;
+    DateTimeOffset backoffUntil, packBackoffUntil;
 
     /// <param name="dbToken">(fresh, ct): an access token that carries "db", else null (signed out, or not a supporter);
     /// fresh: a new one, after a 401 (<see cref="Account.GetDbTokenAsync"/>)</param>
@@ -160,7 +169,7 @@ public sealed class Community
                     Problem = Refused(r);
                     return null;
                 }
-                var packed = await Bounded(await r.Content.ReadAsStreamAsync(ct), (int)e.Size, ct);
+                var packed = await Body(r, (int)e.Size, ct);
                 if (packed == null || Convert.ToHexStringLower(SHA256.HashData(packed)) != e.Object)
                 {
                     Problem = "A community recording didn't match its checksum and was ignored. It's downloaded again at the next scan.";
@@ -172,9 +181,12 @@ public sealed class Community
                     Problem = "A community recording this version can't read was ignored. An update of SCSKiller may fix it.";
                     return null;
                 }
-                AppStore.WriteAtomic(Path.Combine(gameDir, "community.db"), raw);
                 var got = new CommunityDownload(e.Object, e.ContentHash, psos, clock.GetUtcNow());
-                Write(Path.Combine(gameDir, "community.json"), got);
+                using (Recordings.Lock(Path.Combine(gameDir, "recording.db"), ct: ct))   // not while a compile (any process's) reads the recordings it prepares
+                {
+                    AppStore.WriteAtomic(Path.Combine(gameDir, "community.db"), raw);
+                    Write(Path.Combine(gameDir, "community.json"), got);
+                }
                 Problem = null;
                 return got;
             }
@@ -182,6 +194,48 @@ public sealed class Community
         catch (Exception x) when (!ct.IsCancellationRequested)
         {
             if (x is HttpRequestException or OperationCanceledException) backoffUntil = clock.GetUtcNow() + TimeSpan.FromMinutes(5);   // offline: not once per game
+            Problem = Plain(x);
+            return null;
+        }
+    }
+
+    /// <summary>Downloads the shared pack <paramref name="e"/> (GET /v1/p/, no token: free for every install, signed in or
+    /// not) for this install's <paramref name="dll"/> and writes it into <paramref name="shared"/>: only the PSOs that copy of
+    /// the DLL can give (<see cref="MiddlewarePacks.FromShared"/>). The PSO count kept, or null on any failure
+    /// (<see cref="Problem"/>) or while backing off; a pack downloaded before stays.</summary>
+    public async Task<int?> DownloadPackAsync(CommunityEntry e, MiddlewareDll dll, MiddlewareImage image, MiddlewarePacks shared, bool amd, CancellationToken ct = default)
+    {
+        if (clock.GetUtcNow() < packBackoffUntil || e.Size > MaxRaw) return null;
+        try
+        {
+            using var r = await http.GetAsync(new Uri(routes.Primary, "v1/p/" + e.Object), HttpCompletionOption.ResponseHeadersRead, ct);
+            if (!r.IsSuccessStatusCode)
+            {
+                if (r.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.ServiceUnavailable)
+                    packBackoffUntil = clock.GetUtcNow() + (r.Headers.RetryAfter?.Delta ?? TimeSpan.FromHours(1));
+                Problem = Refused(r);
+                return null;
+            }
+            var packed = await Body(r, (int)e.Size, ct);
+            if (packed == null || Convert.ToHexStringLower(SHA256.HashData(packed)) != e.Object)
+            {
+                Problem = "An upscaler pack didn't match its checksum and was ignored. It's downloaded again at the next scan.";
+                return null;
+            }
+            MiddlewarePack pack;
+            try { pack = MiddlewarePacks.FromShared(HashOnly.CheckPack(HashOnly.Canonical(HashOnly.Decompress(packed, MaxRaw), local: false, out _, HashOnly.MaxEntryStateObjectRefs)), dll, image, amd, e.Object, out _); }
+            catch (InvalidDataException)
+            {
+                Problem = "An upscaler pack this version can't read was ignored. An update of SCSKiller may fix it.";
+                return null;
+            }
+            pack.Write(shared.PathOf(dll.Vendor, dll.Name, image.ContentHash));
+            Problem = null;
+            return pack.Entries.Count;
+        }
+        catch (Exception x) when (!ct.IsCancellationRequested)
+        {
+            if (x is HttpRequestException or OperationCanceledException) packBackoffUntil = clock.GetUtcNow() + TimeSpan.FromMinutes(5);
             Problem = Plain(x);
             return null;
         }
@@ -205,7 +259,7 @@ public sealed class Community
     /// The same check the server applies to uploads (<see cref="HashOnly.Canonical"/>).</summary>
     public static int? Check(byte[] raw)
     {
-        try { return HashOnly.Count(HashOnly.Canonical(HashOnly.Records(raw), local: false, out _)).Psos; }
+        try { return HashOnly.Count(HashOnly.Canonical(HashOnly.Records(raw, HashOnly.RemoteLimit), local: false, out _, HashOnly.MaxEntryStateObjectRefs)).Psos; }
         catch (InvalidDataException) { return null; }
     }
 
@@ -223,7 +277,19 @@ public sealed class Community
         File.Move(tmp, output, true);
     }
 
-    static async Task<byte[]?> Bounded(Stream s, int max, CancellationToken ct)
+    /// <summary>How long a download's body may send nothing before it's given up (OperationCanceledException): the
+    /// client's timeout ends at the response headers, and a background pass has no cancellation of its own.</summary>
+    public TimeSpan BodyIdle { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>A response body of at most <paramref name="max"/> bytes, null past it; cancelled after <see cref="BodyIdle"/> without a byte.</summary>
+    async Task<byte[]?> Body(HttpResponseMessage r, int max, CancellationToken ct)
+    {
+        using var idle = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        idle.CancelAfter(BodyIdle);
+        return await Bounded(await r.Content.ReadAsStreamAsync(idle.Token), max, idle.Token, () => idle.CancelAfter(BodyIdle));
+    }
+
+    static async Task<byte[]?> Bounded(Stream s, int max, CancellationToken ct, Action? progress = null)
     {
         await using (s)
         {
@@ -233,6 +299,7 @@ public sealed class Community
             {
                 if (buf.Length + n > max) return null;
                 buf.Write(chunk, 0, n);
+                progress?.Invoke();
             }
             return buf.ToArray();
         }

@@ -57,7 +57,7 @@ public sealed partial class LibraryPage : Page
 
     void OnCompileQueue(object _, RoutedEventArgs __)
     {
-        App.Core.StartQueue();
+        App.CompileQueue();
         App.Main.Navigate(typeof(QueuePage));
     }
 

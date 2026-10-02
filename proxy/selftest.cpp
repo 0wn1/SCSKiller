@@ -11,7 +11,7 @@
 // `selftest so <seed>` records stream output pipelines through the proxy, on WARP (so_rows; gen/test_so.py).
 // `selftest dxr [runs]` runs only probe 7: does the driver's disk cache keep ray tracing state objects
 //        (CreateStateObject / collections / AddToStateObject), and at what granularity (see dxr_plan). Needs
-//        dxcompiler.dll + dxil.dll (SELFTEST_DXC=<dir>, next to the exe, or the newest Windows SDK's bin\<ver>\x64).
+//        dxcompiler.dll + dxil.dll (next to the exe, SELFTEST_DXC=<dir>, or the newest Windows SDK's bin\<ver>\x64).
 // `selftest vulkan [runs]` runs only probe 8: does the Vulkan driver keep its own disk cache of pipelines (no
 //        VkPipelineCache), keyed how (exe name, folder, NVIDIA's cache redirect variables), and at what granularity
 //        (see vk_child). Needs vulkan-1.dll (installed with every Vulkan driver); SPIR-V from vk_spirv.h.
@@ -45,6 +45,8 @@
 #include <vector>
 
 #pragma comment(lib, "dxgi.lib")
+
+extern "C" __declspec(dllexport) const int SCSKiller_WarmHost = 1;  // the proxy warms only in a process exporting it
 
 template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE T, class V> struct alignas(void*) Sub { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; V v; };
 struct Stream {
@@ -362,7 +364,9 @@ static int fields_child(int proc, unsigned seed, const std::wstring& out) {
     // Further sets (probe 6b) are added by addvs/addps: fresh per run (seed + 1000.. / 2000..), the same in every process.
     std::vector<D3D12_SHADER_BYTECODE> vsb, psb;
     bool shaders_ok = true;
-    IDxcCompiler3* dxc = GetEnvironmentVariableW(L"SELFTEST_FIELDS_DXIL", nullptr, 0) ? dxc_compiler() : nullptr;
+    const bool want_dxil = GetEnvironmentVariableW(L"SELFTEST_FIELDS_DXIL", nullptr, 0) > 0;
+    IDxcCompiler3* dxc = want_dxil ? dxc_compiler() : nullptr;
+    CHECK(dxc || !want_dxil);
     std::deque<std::string> dxil;
     auto blob = [&](const std::string& src, const char* target) -> D3D12_SHADER_BYTECODE {
         if (dxc) {
@@ -713,6 +717,7 @@ static int run(const std::wstring& exe, const std::wstring& args) {
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess), CloseHandle(pi.hThread);
     return (int)code;
 }
 
@@ -1023,23 +1028,33 @@ static std::string dxr_src(const std::vector<DxrFn>& fns) {
     return s;
 }
 
-// dxcompiler.dll: next to the exe, else SELFTEST_DXC, else the newest Windows SDK's bin\<ver>\x64. dxil.dll (signing) is
-// loaded by dxcompiler from the same search path.
-static HMODULE dxc_load() {
+// The folder of dxcompiler.dll + dxil.dll: next to the exe, else SELFTEST_DXC, else the newest Windows SDK's bin\<ver>\x64.
+// A probe parent sets SELFTEST_DXC to it for its children: they run from their run folders, away from the exe's.
+static std::wstring dxc_dir() {
     namespace fs = std::filesystem;
     wchar_t v[MAX_PATH];
-    std::wstring dir;
-    if (GetEnvironmentVariableW(L"SELFTEST_DXC", v, MAX_PATH)) dir = v;
-    else {
-        std::error_code ec;
-        std::vector<fs::path> vers;
-        for (auto& e : fs::directory_iterator(L"C:\\Program Files (x86)\\Windows Kits\\10\\bin", ec))
-            if (fs::exists(e.path() / L"x64" / L"dxcompiler.dll", ec) && fs::exists(e.path() / L"x64" / L"dxil.dll", ec)) vers.push_back(e.path() / L"x64");
-        std::sort(vers.begin(), vers.end());
-        if (!vers.empty()) dir = vers.back().wstring();
+    GetModuleFileNameW(nullptr, v, MAX_PATH);
+    std::error_code ec;
+    if (fs::path exe = fs::path(v).parent_path(); fs::exists(exe / L"dxcompiler.dll", ec)) return exe.wstring();
+    if (GetEnvironmentVariableW(L"SELFTEST_DXC", v, MAX_PATH)) {  // absolute, and only if it has one: no other DXC instead
+        wchar_t full[MAX_PATH];
+        DWORD n = GetFullPathNameW(v, MAX_PATH, full, nullptr);
+        if (n && n < MAX_PATH && fs::exists(fs::path(full) / L"dxcompiler.dll", ec)) return full;
+        return printf("  SELFTEST_DXC=%ls has no dxcompiler.dll\n", v), L"";
     }
+    std::vector<fs::path> vers;
+    for (auto& e : fs::directory_iterator(L"C:\\Program Files (x86)\\Windows Kits\\10\\bin", ec))
+        if (fs::exists(e.path() / L"x64" / L"dxcompiler.dll", ec) && fs::exists(e.path() / L"x64" / L"dxil.dll", ec)) vers.push_back(e.path() / L"x64");
+    std::sort(vers.begin(), vers.end());
+    return vers.empty() ? L"" : vers.back().wstring();
+}
+
+// dxcompiler.dll from dxc_dir() only, never another one on the search path; dxil.dll (signing) is loaded by dxcompiler
+// from the DLL directory.
+static HMODULE dxc_load() {
+    std::wstring dir = dxc_dir();
     if (!dir.empty()) SetDllDirectoryW(dir.c_str());
-    HMODULE m = LoadLibraryW(L"dxcompiler.dll");
+    HMODULE m = dir.empty() ? nullptr : LoadLibraryExW((dir + L"\\dxcompiler.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     wchar_t p[MAX_PATH] = L"";
     if (m) GetModuleFileNameW(m, p, MAX_PATH);
     printf(m ? "  dxcompiler: %ls\n" : "  dxcompiler.dll not found (set SELFTEST_DXC to a folder with dxcompiler.dll + dxil.dll)\n", p);
@@ -1282,7 +1297,8 @@ static int dxr_child(int proc, unsigned seed, const std::wstring& blobs, const s
                     std::vector<std::thread> ts;
                     for (int i = 0; i < op.threads; ++i)
                         ts.emplace_back([&] {
-                            for (size_t j; (j = next++) < op.objs.size();) bad = bad || create(op.objs[j], op.add_to, nullptr) < 0;
+                            for (size_t j; (j = next++) < op.objs.size();)
+                                if (!bad && create(op.objs[j], op.add_to, nullptr) < 0) bad = true;
                         });
                     for (auto& th : ts) th.join();
                 });
@@ -1371,8 +1387,10 @@ static std::wstring env_or(const wchar_t* name, std::wstring fallback) {
     return n > 0 && n < MAX_PATH ? std::wstring(v, n) : fallback;
 }
 
-// Takes the dev GPU lock for a timing run: "" when the GPU is busy (another SCSKiller run's lock younger than 30 min, or
-// the other tool's busy file, which has no staleness rule). The caller deletes the returned path when done.
+// Takes the dev GPU lock for a timing run: "" when the GPU is busy (another run holds the lock, a lock file another tool
+// wrote less than 30 min ago, or the other tool's busy file, which has no staleness rule). The lock stays open without
+// sharing until this process exits, and the OS deletes it then, also after a crash.
+static HANDLE g_gpu_lock;
 static std::wstring gpu_lock(const char* who) {
 #ifdef SCSK_TEAM_GPU_BUSY_FILE
     std::wstring busy = env_or(L"SCSKILLER_GPU_BUSY_FILE", SCSK_TEAM_GPU_BUSY_FILE);
@@ -1389,63 +1407,106 @@ static std::wstring gpu_lock(const char* who) {
     std::wstring lockdir = env_or(L"SCSKILLER_DEV_DIR", std::wstring(tmp) + L"scskiller-test");
 #endif
     std::wstring lock = lockdir + L"\\gpu.lock";
+    CreateDirectoryW(lockdir.c_str(), nullptr);
+    auto open = [&](DWORD how) { return CreateFileW(lock.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, how, FILE_FLAG_DELETE_ON_CLOSE, nullptr); };
+    HANDLE h = open(CREATE_NEW);
     WIN32_FILE_ATTRIBUTE_DATA fa;
-    if (GetFileAttributesExW(lock.c_str(), GetFileExInfoStandard, &fa)) {  // someone else's GPU run, unless stale (30 min)
+    if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_EXISTS && GetFileAttributesExW(lock.c_str(), GetFileExInfoStandard, &fa)) {
         FILETIME now;
         GetSystemTimeAsFileTime(&now);
         ULARGE_INTEGER n{{now.dwLowDateTime, now.dwHighDateTime}}, w{{fa.ftLastWriteTime.dwLowDateTime, fa.ftLastWriteTime.dwHighDateTime}};
         if (n.QuadPart - w.QuadPart < 30ull * 60 * 10000000) return printf("GPU busy: %ls\n", lock.c_str()), L"";
+        // older: a tool's lock file left behind, or a long run's that it still holds: then opening it without sharing fails
+        if ((h = open(OPEN_EXISTING)) == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION)
+            return printf("GPU busy: %ls\n", lock.c_str()), L"";
     }
-    CreateDirectoryW(lockdir.c_str(), nullptr);
-    if (FILE* l = _wfopen(lock.c_str(), L"w")) fputs(who, l), fclose(l);
+    if (h == INVALID_HANDLE_VALUE) return printf("GPU lock %ls can't be created\n", lock.c_str()), L"";
+    DWORD n;
+    WriteFile(h, who, (DWORD)strlen(who), &n, nullptr);
+    g_gpu_lock = h;
     return lock;
 }
 
-struct Cleanup {
-    std::vector<std::wstring> files, dirs;
-    ~Cleanup() {
-        for (auto& f : files) DeleteFileW(f.c_str());
-        for (auto& d : dirs) RemoveDirectoryW(d.c_str());
+// A probe run's own new folder, <dir><what>-<pid>-<n>\ (never one that already exists). The run makes every file it
+// writes in there (exe copies, outputs, a redirected cache), and the folder goes at the end with all in it, unless kept.
+struct RunDir {
+    std::wstring path;
+    bool keep;
+    RunDir(const std::wstring& dir, const wchar_t* what, bool keep = false) : keep(keep) {
+        static int n;
+        std::wstring p = dir + what + L"-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(++n) + L"\\";
+        if (CreateDirectoryW(p.c_str(), nullptr)) path = p;
+        else printf("can't create a new folder %ls (error %lu)\n", p.c_str(), GetLastError());
+    }
+    ~RunDir() {
+        std::error_code ec;
+        if (!path.empty() && !keep) std::filesystem::remove_all(path, ec);
     }
 };
 
-// Deletes the driver-cache files created since start (a probe's throwaway exe names; not D3DSCache: the runtime's, never
-// cleared). More than `most` means another app wrote some meanwhile: then all are left. rmdirs: and the folders they emptied.
-static void drop_new_cache(const DxrSnap& start, size_t most, bool rmdirs = false) {
+// Lists the driver-cache files created since start (not D3DSCache: the runtime's). A probe never deletes them: no name
+// proves which process made one (NVIDIA's key isn't derivable from the exe name, AMD's 32-bit name hash collides).
+// ponytail: probe runs leave their throwaway names' cache files; delete by the keys the children hold open
+// (NvidiaAppCache.KeysOpenBy) if they pile up
+static void list_new_cache(const DxrSnap& start) {
     std::vector<std::wstring> made;
     for (auto& [p, v] : dxr_snap())
         if (!start.count(p) && p.find(L"\\D3DSCache\\") == std::wstring::npos) made.push_back(p);
-    if (made.size() > most) {
-        printf("%zu new driver-cache files, not all ours: left in place\n", made.size());
-        for (auto& p : made) printf("  %ls\n", p.c_str());
-        return;
-    }
-    int gone = 0;
-    for (auto& p : made) {
-        gone += DeleteFileW(p.c_str()) ? 1 : (printf("could not delete %ls\n", p.c_str()), 0);
-        if (rmdirs) RemoveDirectoryW(std::filesystem::path(p).parent_path().wstring().c_str());  // only if now empty
-    }
-    printf("deleted %d driver-cache files the runs created\n", gone);
+    if (!made.empty()) printf("%zu new driver-cache files (left in place):\n", made.size());
+    for (auto& p : made) printf("  %ls\n", p.c_str());
+}
+
+// `selftest gpulock` (no GPU): the GPU lock has one owner at a time and goes with its handle.
+static int gpu_lock_rules() {
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    RunDir run(tmp, L"scsk-lock");
+    CHECK(!run.path.empty());
+    std::wstring dev = run.path.substr(0, run.path.size() - 1), lock = dev + L"\\gpu.lock";
+    SetEnvironmentVariableW(L"SCSKILLER_DEV_DIR", dev.c_str());
+    SetEnvironmentVariableW(L"SCSKILLER_GPU_BUSY_FILE", (dev + L"\\none").c_str());
+    HANDLE f = CreateFileW(lock.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);  // another tool's lock file
+    CHECK(f != INVALID_HANDLE_VALUE);
+    CloseHandle(f);
+    CHECK(gpu_lock("a").empty());  // young: respected
+    f = CreateFileW(lock.c_str(), FILE_WRITE_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    FILETIME now_ft;
+    GetSystemTimeAsFileTime(&now_ft);
+    ULARGE_INTEGER t{{now_ft.dwLowDateTime, now_ft.dwHighDateTime}};
+    t.QuadPart -= 31ull * 60 * 10000000;
+    FILETIME old = {t.LowPart, t.HighPart};
+    CHECK(f != INVALID_HANDLE_VALUE && SetFileTime(f, nullptr, nullptr, &old));
+    CloseHandle(f);
+    CHECK(gpu_lock("b") == lock && gpu_lock("c").empty());  // left behind: taken over, then held
+    f = CreateFileW(lock.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    CHECK(f == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION);  // held without sharing: nobody else opens it
+    CloseHandle(g_gpu_lock);
+    CHECK(GetFileAttributesW(lock.c_str()) == INVALID_FILE_ATTRIBUTES);  // gone with its handle
+    CHECK(gpu_lock("d") == lock);
+    CloseHandle(g_gpu_lock);
+    SetEnvironmentVariableW(L"SCSKILLER_DEV_DIR", (dev + L"\\none\\sub").c_str());  // a folder that can't be made: no lock
+    CHECK(gpu_lock("e").empty());
+    printf("gpulock OK\n");
+    return 0;
 }
 
 static int fields_main(const std::wstring& a, const std::wstring& dir, int runs, bool dxil) {
+    if (dxil && !dxc_compiler()) return printf("fields dxil: no DXC (dxcompiler.dll + dxil.dll)\n"), 1;
     std::wstring lock = gpu_lock("selftest fields");
     if (lock.empty()) return 1;
     std::wstring name = L"scskf" + std::to_wstring(GetTickCount() % 1000000) + L".exe", odir = dir + L"fields_other\\";
-    Cleanup cleanup{{lock, dir + name, odir + name}, {odir}};
     CreateDirectoryW(odir.c_str(), nullptr);
     CHECK(CopyFileW(a.c_str(), (dir + name).c_str(), FALSE) && CopyFileW(a.c_str(), (odir + name).c_str(), FALSE));
     if (dxil) SetEnvironmentVariableW(L"SELFTEST_FIELDS_DXIL", L"1");
     const DxrSnap start = dxr_snap();
     int rc = fields_parent(dir + name, odir + name, dir, runs);
-    drop_new_cache(start, 8);
+    list_new_cache(start);
     return rc;
 }
 
 static int dxr_parent(const std::wstring& a, const std::wstring& dir, int runs) {
     std::wstring lock = gpu_lock("selftest dxr");
     if (lock.empty()) return 1;
-    Cleanup cleanup{{lock}};
 
     IDxcCompiler3* comp = dxc_compiler();
     CHECK(comp);
@@ -1454,8 +1515,6 @@ static int dxr_parent(const std::wstring& a, const std::wstring& dir, int runs) 
     std::wstring odir = dir + L"dxr_other\\", x = dir + L"scskdxr" + stamp + L"x.exe", y = dir + L"scskdxr" + stamp + L"y.exe",
                  x5 = odir + L"scskdxr" + stamp + L"x.exe", blobs = dir + L"dxr_blobs.bin";
     CreateDirectoryW(odir.c_str(), nullptr);
-    cleanup.dirs.push_back(odir);
-    cleanup.files.insert(cleanup.files.end(), {x, y, x5, blobs});
     CHECK(CopyFileW(a.c_str(), x.c_str(), FALSE) && CopyFileW(a.c_str(), y.c_str(), FALSE) && CopyFileW(a.c_str(), x5.c_str(), FALSE));
     printf("probe 7: exe X = %ls, Y = %ls\n", x.substr(dir.size()).c_str(), y.substr(dir.size()).c_str());
     const DxrSnap start = dxr_snap();
@@ -1503,7 +1562,7 @@ static int dxr_parent(const std::wstring& a, const std::wstring& dir, int runs) 
         printf("%-56s%s%s%s%s%s%s %s%s%s\n", n.c_str(), cell(med(0, n)).c_str(), cell(p2).c_str(), cell(med(2, n)).c_str(), cell(med(3, n)).c_str(),
                cell(med(4, n)).c_str(), cell(med(5, n)).c_str(), pc, cell(med(6, n)).c_str(), cell(med(7, n)).c_str());
     }
-    drop_new_cache(start, 16);
+    list_new_cache(start);
     return 0;
 }
 
@@ -1862,7 +1921,6 @@ static int vk_child(int proc, unsigned seed, const std::wstring& out) {
 static int vk_parent(const std::wstring& a, const std::wstring& dir, int runs) {
     std::wstring lock = gpu_lock("selftest vulkan");
     if (lock.empty()) return 1;
-    Cleanup cleanup{{lock}};
     SetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", L"~all~");  // overlays and Steam's Fossilize layer would time themselves
     SetEnvironmentVariableW(L"DISABLE_VK_LAYER_VALVE_steam_fossilize_1", L"1");
 
@@ -1872,8 +1930,6 @@ static int vk_parent(const std::wstring& a, const std::wstring& dir, int runs) {
                  x5 = odir + L"scskvk" + stamp + L"x.exe";
     CreateDirectoryW(odir.c_str(), nullptr);
     CreateDirectoryW(redirect.c_str(), nullptr);  // measured: a missing folder = no disk cache at all (cold, nothing written)
-    cleanup.dirs.push_back(odir);
-    cleanup.files.insert(cleanup.files.end(), {x, y, z, x5});
     for (auto& e : {x, y, z, x5}) CHECK(CopyFileW(a.c_str(), e.c_str(), FALSE));
     printf("probe 8: exe X = %ls, Y = %ls, Z = %ls; p6-p8 cache redirect %ls, app name %ls (p8: + \"b\")\n", x.substr(dir.size()).c_str(),
            y.substr(dir.size()).c_str(), z.substr(dir.size()).c_str(), redirect.c_str(), app.c_str());
@@ -1928,14 +1984,13 @@ static int vk_parent(const std::wstring& a, const std::wstring& dir, int runs) {
                cell(med(8, n)).c_str(), pc, fc[n].c_str());
     }
 
-    // The redirect folder is ours: list it, then remove it.
+    // The redirect folder, inside the run's: what the driver wrote there.
     namespace fs = std::filesystem;
     std::error_code ec;
     printf("files in the p6-p8 redirect folder:\n");
     for (fs::recursive_directory_iterator it(redirect, ec), end; !ec && it != end; it.increment(ec))
         if (it->is_regular_file(ec)) printf("  %ls (%llu)\n", it->path().wstring().substr(redirect.size()).c_str(), (unsigned long long)it->file_size(ec));
-    fs::remove_all(redirect, ec);
-    drop_new_cache(start, 40, true);
+    list_new_cache(start);
     return 0;
 }
 
@@ -2239,9 +2294,8 @@ static int nvext_parent(const std::wstring& a, const std::wstring& dir, int runs
     std::wstring stamp = std::to_wstring(GetTickCount() % 1000000), w = dir + L"nvext\\", x = dir + L"scsknv" + stamp + L"x.exe",
                  r = w + L"scsknv" + stamp + L"r.exe", y = w + L"scsknv" + stamp + L"y.exe", out = dir + L"nvext.txt";
     CreateDirectoryW(w.c_str(), nullptr);
-    Cleanup cleanup{{lock, x, r, y, out, w + L"d3d12.dll", w + L"scskiller.db", w + L"scskiller.log", w + L"scskiller_creates.csv"}, {w}};
     CHECK(CopyFileW(a.c_str(), x.c_str(), FALSE) && CopyFileW(a.c_str(), r.c_str(), FALSE) && CopyFileW(a.c_str(), y.c_str(), FALSE));
-    CHECK(CopyFileW((dir + L"d3d12.dll").c_str(), (w + L"d3d12.dll").c_str(), FALSE));
+    CHECK(CopyFileW((a.substr(0, a.find_last_of(L'\\') + 1) + L"d3d12.dll").c_str(), (w + L"d3d12.dll").c_str(), FALSE));
     const DxrSnap start = dxr_snap();
     Col col[2];  // first mode's process, second mode's process
     std::random_device rd;
@@ -2277,14 +2331,14 @@ static int nvext_parent(const std::wstring& a, const std::wstring& dir, int runs
     printf("nvext: create ms, median of %d run(s); first = the row's first mode (p1 / p3), second = its second mode (p2 / p5)\n", runs);
     printf("%-12s %9s %9s\n", "row", "first", "second");
     for (auto& row : kNvRows) printf("%-12s %9.2f %9.2f\n", row.name, med(0, row.name), med(1, row.name));
-    drop_new_cache(start, 12);
+    list_new_cache(start);
     return 0;
 }
 
 // `selftest cacheprobe`: what does NVIDIA's DXCache keep of a PSO (root signature? shader bytes? hashes?)
 // Can SCSKiller learn a game's root signatures from the cache the game wrote, without the proxy? A throwaway exe name
 // (scskcp<seed>.exe) creates PSOs with known, marked root signatures and shaders; the cache files it creates are copied
-// to <exe dir>\cacheprobe\ after each process, then deleted from DXCache. tools/cacheprobe.py searches them for the blobs.
+// to <run folder>\cacheprobe\ after each process (the folder is kept). tools/cacheprobe.py searches them for the blobs.
 //   p1: RS A (v1.0) + RS B (v1.1); VS+PS and CS in DXBC (fxc) and, with dxcompiler, DXIL; each blob written to <out>.
 //   p2: the same again (cached?), + the DXBC CS on RS C and on RS D (a used binding moved): the p1 -> p2 diff isolates
 //   their records. `selftest cacheprobechild 0 <seed> <dir>` writes only the blobs (no device), to re-derive them.
@@ -2358,7 +2412,9 @@ static int cacheprobe_child(int proc, unsigned seed, const std::wstring& out) {
     CHECK(v && pb && cb);
     auto str = [](ID3DBlob* b) { return std::string((const char*)b->GetBufferPointer(), b->GetBufferSize()); };
     sets.push_back({"dxbc", {str(v), str(pb), str(cb)}});
-    if (IDxcCompiler3* comp = dxc_compiler()) {
+    IDxcCompiler3* comp = dxc_compiler();
+    CHECK(comp || !GetEnvironmentVariableW(L"SELFTEST_DXC", nullptr, 0));  // the parent found one: this child must load it
+    if (comp) {
         Set s;
         if (dxc_compile(comp, cp_src('v', 0x3FC0FFE1, seed), s.vs, L"vs_6_0") && dxc_compile(comp, cp_src('p', 0x3FBEEF02, seed), s.ps, L"ps_6_0") &&
             dxc_compile(comp, cp_src('c', 0xC0DE5678, seed), s.cs, L"cs_6_0"))
@@ -2399,14 +2455,11 @@ static int cacheprobe_child(int proc, unsigned seed, const std::wstring& out) {
     return 0;
 }
 
-// Copies the DXCache files one process created or changed to <out>\p<n>_<name>, then deletes the ones this probe created
-// (all under one key, else nothing is deleted and the parent says so).
+// Copies the DXCache files one process created or changed to <out>\p<n>_<name>, and lists the new ones.
 static int cacheprobe_parent(const std::wstring& a, const std::wstring& dir) {
     std::random_device rd;  // no GPU lock: 9 small PSOs, correctness only
     unsigned seed = 100000 + rd() % 8000000;
     std::wstring exe = dir + L"scskcp" + std::to_wstring(seed) + L".exe", out = dir + L"cacheprobe\\";
-    std::error_code ec;
-    std::filesystem::remove_all(out, ec);  // the last run's copies
     CreateDirectoryW(out.c_str(), nullptr);
     CHECK(CopyFileW(a.c_str(), exe.c_str(), FALSE));
     auto nv = [] {
@@ -2432,11 +2485,7 @@ static int cacheprobe_parent(const std::wstring& a, const std::wstring& dir) {
         prev = now;
     }
     DeleteFileW(exe.c_str());
-    std::set<std::wstring> keys;
-    for (auto& p : created) keys.insert(p.substr(p.size() - 13, 8));  // TTTTa91d KKKKKKKK .nvph
-    if (keys.size() == 1)
-        for (auto& p : created) printf("  deleted %ls: %s\n", p.c_str(), DeleteFileW(p.c_str()) ? "ok" : "FAILED");
-    else printf("  %zu keys among the new files: nothing deleted, check by hand\n", keys.size());
+    for (auto& p : created) printf("  new, left in place: %ls\n", p.c_str());  // never deleted: see list_new_cache
     printf("cacheprobe seed %u -> %ls (python tools/cacheprobe.py \"%ls\")\n", seed, out.c_str(), out.c_str());
     return r;
 }
@@ -2449,7 +2498,7 @@ static int cacheprobe_parent(const std::wstring& a, const std::wstring& dir) {
 // pipeline's shader and root signature). SELFTEST_AGILITY=<dir with an Agility SDK D3D12Core.dll>: everything again on that
 // runtime (its copy in a folder next to the exe, through ID3D12SDKConfiguration1::CreateDeviceFactory; the loader takes the
 // system's runtime instead when that one is newer, so p1 prints the D3D12Core.dll it got). With an exe name the
-// children run under it (e.g. one a warm just filled), create only the SELFTEST_BINDLESS rows, and no cache file is deleted.
+// children run under it (e.g. one a warm just filled), create only the SELFTEST_BINDLESS rows.
 static const char* kBlRows[] = {"ctrl", "flags", "heap", "rq", "rq+heap"};
 
 static std::string bl_src(int row, unsigned seed) {
@@ -2549,7 +2598,7 @@ static int bindless_child(int proc, unsigned seed, char rt, UINT sdk, const std:
     for (int row = 0; synthetic && row < (int)std::size(kBlRows); ++row) {
         std::string cs;
         ID3D12RootSignature* rs = make_rs(row);
-        if (!rs || !dxc_compile(comp, bl_src(row == 1 ? 0 : row, seed + row), cs, L"cs_6_6")) {
+        if (!rs || !dxc_compile(comp, bl_src(row == 1 ? 0 : row, seed + (row == 1 ? 0 : row)), cs, L"cs_6_6")) {
             fprintf(f, "%s\t-1\t-1\n", kBlRows[row]);
             continue;
         }
@@ -2616,10 +2665,11 @@ static void nv_used_diff(const std::map<std::wstring, uint64_t>& a, const std::m
 
 static int bindless_parent(const std::wstring& a, const std::wstring& dir, int runs, const std::wstring& name) {
     if (process_running(L"scskiller_warm.exe")) return printf("GPU busy: scskiller_warm.exe is running\n"), 1;
+    if (name.find_first_of(L"\\/:") != std::wstring::npos || name.find(L"..") != std::wstring::npos || name == L".")
+        return printf("bindless: %ls is not a file name\n", name.c_str()), 1;
     std::wstring lock = gpu_lock("selftest bindless");
     if (lock.empty()) return 1;
     std::wstring core = dir + L"scskbl_d3d12\\", out = dir + L"bindless.txt";
-    Cleanup cleanup{{lock, out, core + L"D3D12Core.dll"}, {core}};
     std::string rts = "s";
     UINT sdk = 0;
     wchar_t ag[MAX_PATH];
@@ -2640,7 +2690,7 @@ static int bindless_parent(const std::wstring& a, const std::wstring& dir, int r
         for (char rt : rts) {
             unsigned seed = 100000 + rd() % 8000000;
             std::wstring exe = dir + (name.empty() ? L"scskbl" + std::to_wstring(seed) + L".exe" : name);
-            CHECK(CopyFileW(a.c_str(), exe.c_str(), FALSE));
+            if (!CopyFileW(a.c_str(), exe.c_str(), TRUE)) return printf("%ls exists already (or can't be written): not replaced\n", exe.c_str()), 1;
             for (int p = 1; p <= 2; ++p) {
                 auto before = nv_used();
                 int rc = run(exe, L"bindlesschild " + std::to_wstring(p) + L" " + std::to_wstring(seed) + L" " + std::wstring(1, rt) + L" " +
@@ -2664,7 +2714,7 @@ static int bindless_parent(const std::wstring& a, const std::wstring& dir, int r
             printf("\n");
         }
     }
-    if (name.empty()) drop_new_cache(start, 3 * runs * rts.size());
+    list_new_cache(start);
     return 0;
 }
 
@@ -2801,12 +2851,24 @@ static int dxcfill(long long count, int unroll, unsigned seed, int hold) {
 // `selftest frames <n>`: presents on WARP through the proxy's DXGI hooks, with an overlay that hooked Present / Present1 on
 // the swap chain vtable before the proxy did (a swap chain made on a device from the system d3d12.dll first). n Presents,
 // n Present1s, one DXGI_PRESENT_TEST and one Present that the overlay turns into a nested Present1: 2n + 1 frames. Then a
-// compute PSO on this thread and one on another (the csv's presents column: 1, then 0).
-// Prints "overlay <calls>" and "frames <n>" (scskiller_frames.bin's frames after its last launch record, -1 = no file).
-static std::atomic<int> g_overlay;
+// second overlay hooks them after the proxy did, and a second swap chain on the same vtable presents once with each: 2
+// more frames, through both overlays. Then a compute PSO on this thread and one on another (the csv's presents column: 1,
+// then 0). Prints "overlay <calls>", "late <calls>" (the second overlay's) and "frames <n>" (scskiller_frames.bin's frames
+// after its last launch record, -1 = no file).
+static std::atomic<int> g_overlay, g_late;
 static void* g_ov_present;
 static void* g_ov_present1;
+static void* g_late_present;
+static void* g_late_present1;
 static bool g_ov_nest;
+static HRESULT STDMETHODCALLTYPE late_present(IDXGISwapChain* sc, UINT sync, UINT flags) {
+    ++g_late;
+    return ((HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT))g_late_present)(sc, sync, flags);
+}
+static HRESULT STDMETHODCALLTYPE late_present1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
+    ++g_late;
+    return ((HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*))g_late_present1)(sc, sync, flags, p);
+}
 static HRESULT STDMETHODCALLTYPE ov_present(IDXGISwapChain* sc, UINT sync, UINT flags) {
     ++g_overlay;
     IDXGISwapChain1* sc1;
@@ -2835,14 +2897,13 @@ static int frames_rows(const std::wstring& dir, int n) {
     IDXGIFactory4* f = nullptr;
     IDXGIAdapter* warp = nullptr;
     CHECK(proxy_create && real_create && SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&f))) && SUCCEEDED(f->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
-    HWND wnd = CreateWindowExW(0, L"STATIC", L"scskiller frames", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr, nullptr, nullptr);
-    CHECK(wnd);
     auto chain = [&](ID3D12Device* dev, IDXGISwapChain1** sc) {
+        HWND wnd = CreateWindowExW(0, L"STATIC", L"scskiller frames", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr, nullptr, nullptr);
         D3D12_COMMAND_QUEUE_DESC qd = {};
         ID3D12CommandQueue* q = nullptr;
         DXGI_SWAP_CHAIN_DESC1 d = {64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, {1, 0}, DXGI_USAGE_RENDER_TARGET_OUTPUT, 2};
         d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        return SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) && SUCCEEDED(f->CreateSwapChainForHwnd(q, wnd, &d, nullptr, nullptr, sc));
+        return wnd && SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) && SUCCEEDED(f->CreateSwapChainForHwnd(q, wnd, &d, nullptr, nullptr, sc));
     };
     ID3D12Device *dev0 = nullptr, *dev = nullptr;
     IDXGISwapChain1 *sc0 = nullptr, *sc = nullptr;
@@ -2861,6 +2922,13 @@ static int frames_rows(const std::wstring& dir, int n) {
     g_ov_nest = true;
     sc->Present(0, 0);
     g_ov_nest = false;
+    CHECK(VirtualProtect(&vt[8], 15 * sizeof(void*), PAGE_READWRITE, &old));
+    g_late_present = vt[8], g_late_present1 = vt[22];
+    vt[8] = (void*)late_present, vt[22] = (void*)late_present1;
+    VirtualProtect(&vt[8], 15 * sizeof(void*), old, &old);
+    IDXGISwapChain1* sc2 = nullptr;
+    CHECK(chain(dev, &sc2) && *(void***)sc2 == vt);
+    sc2->Present(0, 0), sc2->Present1(0, 0, &p);
     // a compute PSO on this (presenting) thread, then one on another: the csv's last column says 1, then 0
     auto ser = (decltype(&D3D12SerializeRootSignature))GetProcAddress(m, "D3D12SerializeRootSignature");
     D3D12_ROOT_PARAMETER up = {D3D12_ROOT_PARAMETER_TYPE_UAV};
@@ -2878,7 +2946,7 @@ static int frames_rows(const std::wstring& dir, int n) {
     pso(1);
     std::thread(pso, 2).join();
     Sleep(2500);  // the proxy writes the frames once a second
-    printf("overlay %d\n", g_overlay.load());
+    printf("overlay %d\nlate %d\n", g_overlay.load(), g_late.load());
     FILE* fr = _wfopen((dir + L"scskiller_frames.bin").c_str(), L"rb");
     long frames = -1;
     for (uint32_t r; fr && fread(&r, 4, 1, fr) == 1;) {
@@ -2891,6 +2959,36 @@ static int frames_rows(const std::wstring& dir, int n) {
     return 0;
 }
 
+// `selftest unload`: a device made through the proxy d3d12.dll next to the exe on WARP, released, then FreeLibrary (a game
+// probing for D3D12). Prints "loaded <0|1>" (the proxy is still loaded: its hooks are in the runtime's vtables) and
+// "created 0x<hr>" for a root signature on a device from the system dll, which runs the proxy's hook.
+static int unload_rows(const std::wstring& dir) {
+    SetEnvironmentVariableW(L"SCSKILLER_MODE", L"record");
+    HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str()), real = load_system(L"d3d12.dll");
+    CHECK(m && real);
+    auto proxy_create = (decltype(&D3D12CreateDevice))GetProcAddress(m, "D3D12CreateDevice");
+    auto real_create = (decltype(&D3D12CreateDevice))GetProcAddress(real, "D3D12CreateDevice");
+    auto ser = (decltype(&D3D12SerializeRootSignature))GetProcAddress(real, "D3D12SerializeRootSignature");
+    IDXGIFactory4* f = nullptr;
+    IDXGIAdapter* warp = nullptr;
+    CHECK(proxy_create && real_create && ser && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f))) && SUCCEEDED(f->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
+    ID3D12Device* dev = nullptr;
+    CHECK(SUCCEEDED(proxy_create(warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))));
+    dev->Release();
+    FreeLibrary(m);
+    printf("loaded %d\n", GetModuleHandleW((dir + L"d3d12.dll").c_str()) != nullptr);
+    fflush(stdout);
+    CHECK(SUCCEEDED(real_create(warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))));
+    D3D12_ROOT_PARAMETER up = {D3D12_ROOT_PARAMETER_TYPE_UAV};
+    D3D12_ROOT_SIGNATURE_DESC rd = {1, &up};
+    ID3DBlob *rb = nullptr, *err = nullptr;
+    ID3D12RootSignature* rs = nullptr;
+    CHECK(SUCCEEDED(ser(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err)));
+    HRESULT hr = dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(&rs));
+    printf("created 0x%08x\n", (unsigned)hr);
+    return SUCCEEDED(hr) ? 0 : 1;
+}
+
 int wmain(int argc, wchar_t** argv) {
     wchar_t p[MAX_PATH];
     GetModuleFileNameW(nullptr, p, MAX_PATH);
@@ -2898,6 +2996,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc > 1 && !wcscmp(argv[1], L"layoutrules")) return layout_rules();
     if (argc > 2 && !wcscmp(argv[1], L"so")) return so_rows(dir, (unsigned)_wtoi(argv[2]));
     if (argc > 2 && !wcscmp(argv[1], L"frames")) return frames_rows(dir, _wtoi(argv[2]));
+    if (argc > 1 && !wcscmp(argv[1], L"unload")) return unload_rows(dir);
     if (argc > 2 && !wcscmp(argv[1], L"chain")) return chain_rows(dir, (unsigned)_wtoi(argv[2]), argc > 3 && !wcscmp(argv[3], L"swap"));
     if (argc > 1 && !wcscmp(argv[1], L"warpluid")) {  // for scskiller_warm --adapter-luid: WARP (the runtime's checks, no GPU cache)
         IDXGIFactory4* f = nullptr;
@@ -2908,28 +3007,37 @@ int wmain(int argc, wchar_t** argv) {
         return 0;
     }
     if (argc > 4 && !wcscmp(argv[1], L"dxcfill")) return dxcfill(_wtoi64(argv[2]), _wtoi(argv[3]), (unsigned)_wtoi(argv[4]), argc > 5 ? _wtoi(argv[5]) : 0);
-    if (argc > 1 && !wcscmp(argv[1], L"cacheprobe")) return cacheprobe_parent(a, dir);
+    // a probe works in a new folder of its own (RunDir); cacheprobe's stays: it holds the copies tools/cacheprobe.py reads
+    auto in_run = [&](const wchar_t* what, bool keep, auto&& probe) {
+        if (std::wstring d = dxc_dir(); !d.empty()) SetEnvironmentVariableW(L"SELFTEST_DXC", d.c_str());
+        RunDir r(dir, what, keep);
+        return r.path.empty() ? 1 : probe(r.path);
+    };
+    if (argc > 1 && !wcscmp(argv[1], L"cacheprobe")) return in_run(L"cacheprobe", true, [&](const std::wstring& dir) { return cacheprobe_parent(a, dir); });
     if (argc > 4 && !wcscmp(argv[1], L"cacheprobechild")) return cacheprobe_child(_wtoi(argv[2]), (unsigned)_wtoi(argv[3]), argv[4]);
-    if (argc > 1 && !wcscmp(argv[1], L"bindless")) return bindless_parent(a, dir, argc > 2 ? std::max(1, _wtoi(argv[2])) : 1, argc > 3 ? argv[3] : L"");
+    if (argc > 1 && !wcscmp(argv[1], L"bindless")) return in_run(L"bindless", false, [&](const std::wstring& dir) { return bindless_parent(a, dir, argc > 2 ? std::max(1, _wtoi(argv[2])) : 1, argc > 3 ? argv[3] : L""); });
     if (argc > 6 && !wcscmp(argv[1], L"bindlesschild")) return bindless_child(_wtoi(argv[2]), (unsigned)_wtoi(argv[3]), (char)argv[4][0], (UINT)_wtoi(argv[5]), argv[6], argc <= 7);
-    if (argc > 1 && !wcscmp(argv[1], L"nvext")) return nvext_parent(a, dir, argc > 2 ? std::max(1, _wtoi(argv[2])) : 1);
+    if (argc > 1 && !wcscmp(argv[1], L"nvext")) return in_run(L"nvext", false, [&](const std::wstring& dir) { return nvext_parent(a, dir, argc > 2 ? std::max(1, _wtoi(argv[2])) : 1); });
     if (argc > 4 && !wcscmp(argv[1], L"nvextchild")) return nvext_child(_wtoi(argv[2]), (unsigned)_wtoi(argv[3]), dir, argv[4]);
-    if (argc > 1 && !wcscmp(argv[1], L"dxr")) return dxr_parent(a, dir, argc > 2 ? std::max(1, _wtoi(argv[2])) : 1);
+    if (argc > 1 && !wcscmp(argv[1], L"dxr")) return in_run(L"dxr", false, [&](const std::wstring& dir) { return dxr_parent(a, dir, argc > 2 ? std::max(1, _wtoi(argv[2])) : 1); });
     if (argc > 3 && !wcscmp(argv[1], L"dxrblobs")) {
         IDxcCompiler3* comp = dxc_compiler();
         return comp && dxr_blobs(comp, dxr_plan((unsigned)_wtoi(argv[2])), argv[3]) >= 0 ? 0 : 1;
     }
     if (argc > 5 && !wcscmp(argv[1], L"dxrchild")) return dxr_child(_wtoi(argv[2]), (unsigned)_wtoi(argv[3]), argv[4], argv[5]);
-    if (argc > 1 && !wcscmp(argv[1], L"vulkan")) return vk_parent(a, dir, argc > 2 ? std::max(1, _wtoi(argv[2])) : 1);
+    if (argc > 1 && !wcscmp(argv[1], L"vulkan")) return in_run(L"vulkan", false, [&](const std::wstring& dir) { return vk_parent(a, dir, argc > 2 ? std::max(1, _wtoi(argv[2])) : 1); });
     if (argc > 4 && !wcscmp(argv[1], L"vkchild")) return vk_child(_wtoi(argv[2]), (unsigned)_wtoi(argv[3]), argv[4]);
     if (argc > 1 && !wcscmp(argv[1], L"fields"))
-        return fields_main(a, dir, argc > 2 ? std::max(1, _wtoi(argv[2])) : 1, argc > 3 && !wcscmp(argv[3], L"dxil"));
+        return in_run(L"fields", false, [&](const std::wstring& dir) { return fields_main(a, dir, argc > 2 ? std::max(1, _wtoi(argv[2])) : 1, argc > 3 && !wcscmp(argv[3], L"dxil")); });
     if (argc > 3 && !wcsncmp(argv[1], L"fields", 6)) return fields_child(argv[1][6] - L'0', (unsigned)_wtoi(argv[2]), argv[3]);
+    if (argc > 1 && !wcscmp(argv[1], L"gpulock")) return gpu_lock_rules();
     if (argc > 2) return child(dir, argv[1], (unsigned)_wtoi(argv[2]));
-    for (auto f : {L"scskiller.db", L"scskiller_gen.db", L"scskiller.log", L"scskiller_creates.csv"}) DeleteFileW((dir + f).c_str());
-    std::wstring seed = L" " + std::to_wstring(GetTickCount() % 1000000);
-    int r = run(a, L"record" + seed);
-    if (!r) r = run(a, L"warm" + seed);
+    int r = in_run(L"selftest", false, [&](const std::wstring& d) {  // the proxy writes its db and log next to itself: in there
+        if (!CopyFileW(a.c_str(), (d + L"selftest.exe").c_str(), TRUE) || !CopyFileW((dir + L"d3d12.dll").c_str(), (d + L"d3d12.dll").c_str(), TRUE)) return 1;
+        std::wstring seed = L" " + std::to_wstring(GetTickCount() % 1000000);
+        int rc = run(d + L"selftest.exe", L"record" + seed);
+        return rc ? rc : run(d + L"selftest.exe", L"warm" + seed);
+    });
     printf(r ? "selftest FAILED\n" : "selftest OK\n");
     return r;
 }

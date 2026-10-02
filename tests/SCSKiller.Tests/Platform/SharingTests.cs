@@ -321,4 +321,52 @@ public class SharingTests : IDisposable
         Assert.False(File.Exists(Path.Combine(_dir, "upload.dat")));
         Assert.Null(Sharing.Shared(GameDir));
     }
+
+    [Fact]
+    public async Task Upscaler_packs_upload_under_their_pack_key_once_per_change_and_only_for_the_shared_vendors()
+    {
+        var packs = Path.Combine(_dir, "packs");
+        var rs = RootSignature();
+        var dllSha = new string('d', 40);
+        var fsr = new MiddlewarePack("amd", "amd_fidelityfx_dx12.dll", dllSha, 1000, gpu: "nvidia");
+        fsr.RootSignatures[Sha1(rs)] = rs;
+        fsr.Add(new PsoDb.Rec('C', PsoDb.Compute(Sha1(rs), Sha1(Shader))), "steam:480");
+        var path = Path.Combine(packs, "amd", MiddlewarePack.FileName(fsr.Header.Dll, dllSha));
+        fsr.Write(path);
+        var opti = new MiddlewarePack("optiscaler", "OptiScaler.dll", dllSha, 1000, gpu: "nvidia");   // stays on this PC
+        opti.Add(new PsoDb.Rec('C', PsoDb.Compute(PsoDb.Zero, Sha1(Shader))), "steam:480");
+        opti.Write(Path.Combine(packs, "optiscaler", MiddlewarePack.FileName(opti.Header.Dll, dllSha)));
+        var sharing = Make();
+
+        Assert.Equal([("amd_fidelityfx_dx12.dll", 1)], await sharing.SharePacksAsync(packs, "nvidia", "1.4.0"));
+        var up = _sent.Single(s => s.Line.Contains("/v1/upload"));
+        Assert.EndsWith(" Bearer " + Anon, up.Line);
+        var key = $"nvidia:amd:amd_fidelityfx_dx12.dll:{dllSha}";
+        using (var meta = JsonDocument.Parse(up.Meta!))
+            Assert.Equal((key, Core.Planning.HashOnly.PackHash(key), "nvidia"),
+                (meta.RootElement.GetProperty("store_build_key").GetString(), meta.RootElement.GetProperty("content_hash").GetString(), meta.RootElement.GetProperty("vendor").GetString()));
+        Assert.Equal("BC", string.Concat(Core.Planning.HashOnly.Decompress(up.Body).Select(r => r.Tag)));   // hash-only: the root signature and the PSO
+        Assert.True(up.Body.AsSpan().IndexOf(Shader) < 0);
+
+        Assert.Empty(await sharing.SharePacksAsync(packs, "nvidia", "1.4.0"));   // unchanged: not again
+        fsr.Add(new PsoDb.Rec('C', PsoDb.Compute(Sha1(rs), Sha1("another"u8.ToArray()))), "steam:480");
+        fsr.Write(path);
+        Assert.Single(await sharing.SharePacksAsync(packs, "nvidia", "1.4.0"));   // it gained a record
+        Assert.Equal(2, Uploads.Count);
+
+        // a pack another GPU vendor filled (this PC before a GPU change), or one from before packs kept their GPU: not shared
+        var xess = new MiddlewarePack("intel", "libxess.dll", dllSha, 1000, gpu: "amd");
+        xess.Add(new PsoDb.Rec('C', PsoDb.Compute(PsoDb.Zero, Sha1(Shader))), "steam:480");
+        xess.Write(Path.Combine(packs, "intel", MiddlewarePack.FileName(xess.Header.Dll, dllSha)));
+        var old = new MiddlewarePack("amd", "ffx_fsr2_api_dx12_x64.dll", dllSha, 1000);
+        old.Add(new PsoDb.Rec('C', PsoDb.Compute(PsoDb.Zero, Sha1(Shader))), "steam:480");
+        old.Write(Path.Combine(packs, "amd", MiddlewarePack.FileName(old.Header.Dll, dllSha)));
+        Assert.Empty(await sharing.SharePacksAsync(packs, "nvidia", "1.4.0"));
+        Assert.Equal(2, Uploads.Count);
+
+        _enabled = false;
+        File.Delete(Path.Combine(_dir, "packs-shared.json"));
+        Assert.Empty(await sharing.SharePacksAsync(packs, "nvidia", "1.4.0"));
+        Assert.Equal(2, Uploads.Count);
+    }
 }

@@ -1,4 +1,4 @@
-﻿using System.ComponentModel;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -11,9 +11,11 @@ namespace SCSKiller.Core.Warming;
 /// its device was removed, "removed") says where a new process goes on: <paramref name="From"/> (--start),
 /// <paramref name="RtThreads"/> (--rt-threads), <paramref name="FailedItem"/> (-1 or an item that faulted alone: --skip from
 /// then on), <paramref name="Isolate"/> (--isolate). <paramref name="Crashed"/> (retry and done): the record keys of the items
-/// that crash the driver, skipped or blamed by that process (--skip-keys from then on).</summary>
+/// that crash the driver, skipped or blamed by that process (--skip-keys from then on). <paramref name="Stage"/> (the "stage"
+/// event, the first line): the process's own staging folder, where its scskiller.log ends up.</summary>
 public sealed record WarmEvent(string Event, long Done, long Total, long Failed, double Rate, double Seconds, bool Stopped, string? Message,
-    long From = 0, int RtThreads = 0, long FailedItem = -1, string? Reason = null, IReadOnlyList<string>? Crashed = null, IReadOnlyList<long>? Isolate = null)
+    long From = 0, int RtThreads = 0, long FailedItem = -1, string? Reason = null, IReadOnlyList<string>? Crashed = null, IReadOnlyList<long>? Isolate = null,
+    string? Stage = null)
 {
     static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -83,6 +85,7 @@ public sealed class Warmer(IGpuVendorBackend vendor, string? warmExe = null) : I
 
     const int MaxPath = 260;
     const string LongestStagedName = "scskiller_warm_times.csv";
+    const string LongestStageDir = "stage-4294967295-99";   // scskiller_warm's staging folder: stage-<pid>-<n>
 
     /// <summary>scskiller_warm's --stage-path: the install folder's name, the exe's folder inside the install, the exe's
     /// file name (AMD app profiles such as Hogwarts Legacy's match the launched path's tail, e.g.
@@ -97,7 +100,7 @@ public sealed class Warmer(IGpuVendorBackend vendor, string? warmExe = null) : I
             : null;
         if (why != null) return null;
         var path = Path.Combine(Path.GetFileName(install), rel);
-        var dir = Path.GetFullPath(Path.Combine(workDir, "stage", Path.GetDirectoryName(path)!));
+        var dir = Path.GetFullPath(Path.Combine(workDir, LongestStageDir, Path.GetDirectoryName(path)!));
         if (dir.Length + 1 + Math.Max(Path.GetFileName(path).Length, LongestStagedName.Length) < MaxPath) return path;
         why = $"the staged path under {workDir} would be longer than {MaxPath - 1} characters";
         return null;
@@ -189,14 +192,16 @@ sealed class WarmRun : IWarmRun
             string? error;
             int code;
             bool betweenPasses = false;   // stopped after a pass ended: the next one resumes from its first item
+            string? stage = null;         // the last process's staging folder (its stage event)
             for (var n = 1; ; n++)
             {
                 var passNote = passes == null ? null : passes.IsFast(pass) ? "careful compile: the plan's other pipelines at full speed"
                     : $"careful compile: recorded pipelines, pass {passes.Number(pass)} of {passes.CarefulCount}";
                 var report = progress == null ? null : new Adjusted(progress, carried, note ?? passNote, passes?.Total);
                 var lastPass = passes == null || pass == passes.Count - 1;
+                stage = null;   // this process's, never an earlier one's
                 (last, done, error) = await WarmOutput.Pump(_p.StandardOutput, report, Growth, ReportEvery,
-                    () => { if (lastPass || _stopping) _doneSeen.TrySetResult(); }, Whole);
+                    () => { if (lastPass || _stopping) _doneSeen.TrySetResult(); }, Whole, s => stage = s);
                 await _p.WaitForExitAsync();
                 code = _p.ExitCode;
                 crashed.UnionWith(done?.Crashed ?? []);
@@ -245,7 +250,7 @@ sealed class WarmRun : IWarmRun
                                     : "scskiller_warm exited without a done event";
             var failed = carried + (stopped ? 0 : last?.Failed ?? 0);
             return new WarmResult(outcome, Whole(last?.Done ?? from), passes?.Total ?? last?.Total ?? 0, failed, clock.Elapsed, growth,
-                Path.Combine(workDir, "stage", "scskiller.log"), outcome == WarmOutcome.Failed ? error : null,
+                Path.Combine(stage ?? Path.Combine(workDir, "stage"), "scskiller.log"), outcome == WarmOutcome.Failed ? error : null,
                 Crashed: crashed.Count > 0 ? crashed : null);
         });
     }
@@ -312,9 +317,10 @@ public static class WarmOutput
     /// sees the current line, not a backlog: a listener that took seconds per line (cache attribution over a 42 GB driver
     /// cache) once filled the pipe, blocked the child's progress loop on its stdout, and the queue showed numbers 10 minutes
     /// old. The rate reported is the recent one (<see cref="RecentRate"/>), not the child's average since it started.
-    /// <paramref name="whole"/> maps a line's done to the reported one (a pass of a careful warm: <see cref="WarmPasses.Overall"/>).</summary>
+    /// <paramref name="whole"/> maps a line's done to the reported one (a pass of a careful warm: <see cref="WarmPasses.Overall"/>).
+    /// <paramref name="onStage"/> gets the stage event's staging folder.</summary>
     public static async Task<(WarmEvent? Last, WarmEvent? Done, string? Error)> Pump(TextReader stdout, IProgress<WarmProgress>? progress,
-        Func<long> cacheGrowth, TimeSpan every, Action? onDone = null, Func<long, long>? whole = null)
+        Func<long> cacheGrowth, TimeSpan every, Action? onDone = null, Func<long, long>? whole = null, Action<string>? onStage = null)
     {
         whole ??= d => d;
         WarmEvent? last = null, done = null, latest = null;
@@ -327,6 +333,7 @@ public static class WarmOutput
                 if (e.Event == "error") error ??= e.Message ?? "unknown error";
                 else if (e.Event is "done" or "retry") done = e;   // retry: the process ends, a new one goes on (WarmRun)
                 if (e.Event == "done") onDone?.Invoke();
+                if (e is { Event: "stage", Stage: { Length: > 0 } st }) onStage?.Invoke(st);
                 if (e.Event is "start" or "progress" or "done" or "retry") last = e;
                 if (e.Event is "progress" or "done") Volatile.Write(ref latest, e);
             }
@@ -405,6 +412,20 @@ static class ProcessTree
         finally { CloseHandle(snap); }
         return all;
     }
+
+    /// <summary><see cref="Snapshot"/>, at most a second old.</summary>
+    public static List<(int Pid, int Parent, string Exe)> RecentSnapshot()
+    {
+        lock (SnapshotLock)
+        {
+            if (_snapshot == null || Environment.TickCount64 - _snapshotAt > 1000) (_snapshot, _snapshotAt) = (Snapshot(), Environment.TickCount64);
+            return _snapshot;
+        }
+    }
+
+    static readonly Lock SnapshotLock = new();
+    static List<(int, int, string)>? _snapshot;
+    static long _snapshotAt;
 
     internal static List<int> WithDescendants(int root)
     {

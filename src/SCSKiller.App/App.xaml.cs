@@ -100,6 +100,13 @@ public partial class App : Application
         if (Core is not FakeScsKiller)   // the design data never touches the registry or the running app
         {
             AppInstance.GetCurrent().Activated += (_, a) => Main.DispatcherQueue.TryEnqueue(() => OnActivated(a));
+            // the unattended --driver-updated launch leaves game folders alone only until someone opens the window
+            Main.Activated += (_, a) =>
+            {
+                if (a.WindowActivationState == WindowActivationState.Deactivated || Core is not ScsKiller { ManageRecorders: false } r) return;
+                r.ManageRecorders = true;
+                Task.Run(() => r.ReconcileRecorders());
+            };
             // a game played while the window was away changed its cache size
             var lastSizes = DateTime.MinValue;
             Main.Activated += (_, a) =>
@@ -125,8 +132,7 @@ public partial class App : Application
         {
             // Relaunched by a toast click: OnToast activates the window for everything but "idle" and "skip".
             var toastArgs = ((AppNotificationActivatedEventArgs)activation.Data).Arguments;
-            OnToast(toastArgs);
-            if (ActionOf(toastArgs) == "skip") _ = QuitAsync();   // nothing queued: no reason to stay resident
+            OnToast(toastArgs, relaunched: true);
             return;
         }
 
@@ -297,20 +303,23 @@ public partial class App : Application
         if (quitNow != null) { quitNow.TrySetResult(); return; }
         if (quitting) return;
         quitting = true;
-        if (Running() != null)
+        try
         {
-            quitNow = new TaskCompletionSource();
-            Main.AppWindow.Hide();
-            UpdateTip();
-            StopAll();
-            var idle = Task.Run(async () => { while (Running() != null) await Task.Delay(250); });
-            await Task.WhenAny(idle, quitNow.Task);
+            if (Core.Compiling)   // a removed item's warm too: it is still saving
+            {
+                quitNow = new TaskCompletionSource();
+                Main.AppWindow.Hide();
+                UpdateTip();
+                StopAll();
+                var idle = Task.Run(async () => { while (Core.Compiling) await Task.Delay(250); });
+                await Task.WhenAny(idle, quitNow.Task);
+            }
+            stopWatching.Cancel();
+            await Task.WhenAny(watcher, Task.Delay(1000));   // let a poll's refresh in flight finish
+            DisposeTray();
+            await Updater.ApplyOnExitAsync();   // a downloaded update installs once this process has exited
         }
-        stopWatching.Cancel();
-        await Task.WhenAny(watcher, Task.Delay(1000));   // let a poll's refresh in flight finish
-        DisposeTray();
-        Updater.ApplyOnExit();   // a downloaded update installs once this process has exited
-        Current.Exit();
+        finally { Current.Exit(); }   // Quit quits, whatever went wrong before
     }
 
     public static void DisposeTray()
@@ -367,35 +376,50 @@ public partial class App : Application
         else Core.ScanAsync(CancellationToken.None).ContinueWith(_ => Main.DispatcherQueue.TryEnqueue(() => act()));
     }
 
-    static void OnToast(IDictionary<string, string> args)
+    /// <summary><paramref name="relaunched"/>: the click started the app, which only stays for what the click queued.</summary>
+    static void OnToast(IDictionary<string, string> args, bool relaunched = false)
     {
-        var ids = args.TryGetValue("games", out var list) ? list.Split('|') : Core.DriverStaleGames().Select(g => g.Game.Id).ToArray();
+        // called after the scan: a driver toast names no games, they are the stale ones
+        string[] Ids() => args.TryGetValue("games", out var list) ? list.Split('|') : Core.DriverStaleGames().Select(g => g.Game.Id).ToArray();
         switch (ActionOf(args))
         {
             case "shaders-compile":
-                AfterScan(() => CompileNow(ids));
+                AfterScan(() => CompileNow(Ids()));
                 break;
             case "shaders-show":
                 AfterScan(() =>
                 {
+                    var ids = Ids();
                     if (ids.Length == 1 && Core.Games.Any(s => s.Game.Id == ids[0])) Main.Navigate(typeof(DetailPage), ids[0]);
                     else Main.Navigate(typeof(LibraryPage));
                     ShowWindow();
                 });
                 break;
             case "now":
-                CompileNow(ids);
+                AfterScan(() => CompileNow(Ids()));
                 break;
             case "idle":
-                foreach (var id in ids) Core.EnqueueWhenIdle(id);
+                AfterScan(() => { foreach (var id in Ids()) Core.EnqueueWhenIdle(id); });
                 break;
             case "skip":
-                Core.DismissStale();
+                AfterScan(() =>
+                {
+                    Core.DismissStale();
+                    if (relaunched) _ = QuitAsync();   // nothing queued: no reason to stay resident
+                });
                 break;
             default:   // toast body clicked
                 ShowWindow();
                 break;
         }
+    }
+
+    /// <summary>"Compile queue" (the library's and the queue's): everything listed, "when idle" items too (Enqueue makes
+    /// them normal ones).</summary>
+    public static void CompileQueue()
+    {
+        foreach (var q in Core.Queue.Where(q => q.Stage == QueueStage.Waiting && q.Note == ScsKiller.WhenIdleNote).ToList()) Core.Enqueue(q.GameId);
+        Core.StartQueue();
     }
 
     static void CompileNow(IEnumerable<string> ids)

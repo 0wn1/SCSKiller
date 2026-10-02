@@ -56,8 +56,9 @@ public sealed partial class MainWindow : Window
 
     void ShowUpdate()
     {
-        UpdateButton.Visibility = Updater.Ready != null ? Visibility.Visible : Visibility.Collapsed;
-        ToolTipService.SetToolTip(UpdateButton, Updater.Problem ?? $"SCSKiller {Updater.Ready} is ready. Restarting stops a running compile safely " +
+        var ready = Updater.Ready;   // once: a check may replace it meanwhile
+        UpdateButton.Visibility = ready != null ? Visibility.Visible : Visibility.Collapsed;
+        ToolTipService.SetToolTip(UpdateButton, Updater.Problem ?? $"SCSKiller {ready} is ready. Restarting stops a running compile safely " +
             "(the driver saves its cache first) and continues it afterwards. Otherwise it installs when you quit SCSKiller.");
     }
 

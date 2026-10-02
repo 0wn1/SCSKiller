@@ -345,6 +345,204 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
         finally { Directory.Delete(root, true); }
     }
 
+    [Fact]
+    public void Hidden_and_system_anti_cheat_markers_are_found()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-anticheat-test-").FullName;
+        try
+        {
+            Game Install(string name, Action<string> mark)
+            {
+                var dir = Directory.CreateDirectory(Path.Combine(root, name)).FullName;
+                File.WriteAllBytes(Path.Combine(dir, "Game.exe"), new byte[100]);
+                mark(dir);
+                return new Game($"test:{name}", name, Store.Other, dir, Path.Combine(dir, "Game.exe"));
+            }
+            var eac = Install("eac", d => File.SetAttributes(Directory.CreateDirectory(Path.Combine(d, "EasyAntiCheat")).FullName, FileAttributes.Directory | FileAttributes.Hidden));
+            var ricochet = Install("ricochet", d =>
+            {
+                File.WriteAllBytes(Path.Combine(d, "randgrid.sys"), [0]);
+                File.SetAttributes(Path.Combine(d, "randgrid.sys"), FileAttributes.System | FileAttributes.Hidden);
+            });
+            var below = Install("below", d =>   // inside a hidden folder one level down
+            {
+                var hidden = Directory.CreateDirectory(Path.Combine(d, "bin")).FullName;
+                File.WriteAllBytes(Path.Combine(hidden, "BEService_x64.exe"), [0]);
+                File.SetAttributes(hidden, FileAttributes.Directory | FileAttributes.Hidden | FileAttributes.System);
+            });
+            var deep = Install("deep", d =>   // <install>\support\security, away from the exe's folder
+                File.WriteAllBytes(Path.Combine(Directory.CreateDirectory(Path.Combine(d, "support", "security")).FullName, "BEService_x64.exe"), [0]));
+            var clean = Install("clean", _ => { });
+            var exeElsewhere = clean with { Id = "test:elsewhere", ExePath = Path.Combine(root, "eac", "Game.exe") };   // the exe's folder is outside the install
+
+            Assert.Equal(AntiCheat.EasyAntiCheat, GameFiles.DetectAntiCheat(eac));
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(ricochet));
+            Assert.Equal(AntiCheat.BattlEye, GameFiles.DetectAntiCheat(below));
+            Assert.Equal(AntiCheat.BattlEye, GameFiles.DetectAntiCheat(deep));
+            Assert.Equal(AntiCheat.EasyAntiCheat, GameFiles.DetectAntiCheat(exeElsewhere));
+            Assert.Equal(AntiCheat.None, GameFiles.DetectAntiCheat(clean));
+        }
+        finally
+        {
+            foreach (var f in Directory.EnumerateFileSystemEntries(root, "*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = 0 }))
+                File.SetAttributes(f, File.GetAttributes(f) & FileAttributes.Directory);
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public void An_install_folder_that_cannot_be_listed_is_not_known_to_be_clean()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-anticheat-acl-test-").FullName;
+        var locked = Directory.CreateDirectory(Path.Combine(root, "support")).FullName;
+        var me = System.Security.Principal.WindowsIdentity.GetCurrent().User!;
+        var deny = new System.Security.AccessControl.FileSystemAccessRule(me, System.Security.AccessControl.FileSystemRights.ListDirectory,
+            System.Security.AccessControl.AccessControlType.Deny);
+        try
+        {
+            File.WriteAllBytes(Path.Combine(root, "Game.exe"), new byte[100]);
+            var game = new Game("test:locked", "Locked", Store.Other, root, Path.Combine(root, "Game.exe"));
+            Assert.Equal(AntiCheat.None, GameFiles.DetectAntiCheat(game));
+
+            var acl = new DirectoryInfo(locked).GetAccessControl();
+            acl.AddAccessRule(deny);
+            new DirectoryInfo(locked).SetAccessControl(acl);
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(game));   // whatever it holds: never installed into
+        }
+        finally
+        {
+            var acl = new DirectoryInfo(locked).GetAccessControl();
+            acl.RemoveAccessRule(deny);
+            new DirectoryInfo(locked).SetAccessControl(acl);
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public void An_install_root_that_cannot_be_listed_is_not_known_to_be_clean()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-anticheat-root-test-").FullName;
+        var install = Directory.CreateDirectory(Path.Combine(root, "Game")).FullName;
+        var exeDir = Directory.CreateDirectory(Path.Combine(root, "Launcher")).FullName;   // the exe outside the install
+        File.WriteAllBytes(Path.Combine(exeDir, "Game.exe"), new byte[100]);
+        var game = new Game("test:root", "Root", Store.Other, install, Path.Combine(exeDir, "Game.exe"));
+        var me = System.Security.Principal.WindowsIdentity.GetCurrent().User!;
+        System.Security.AccessControl.FileSystemAccessRule Deny(System.Security.AccessControl.FileSystemRights r) =>
+            new(me, r, System.Security.AccessControl.AccessControlType.Deny);
+        // the install can't be listed nor its attributes read, and its parent can't be listed: Directory.Exists says false
+        var (installDeny, parentDeny) = (Deny(System.Security.AccessControl.FileSystemRights.ListDirectory | System.Security.AccessControl.FileSystemRights.ReadAttributes),
+            Deny(System.Security.AccessControl.FileSystemRights.ListDirectory));
+        void Acl(string dir, System.Security.AccessControl.FileSystemAccessRule rule, bool add)
+        {
+            var acl = new DirectoryInfo(dir).GetAccessControl();
+            if (add) acl.AddAccessRule(rule); else acl.RemoveAccessRule(rule);
+            new DirectoryInfo(dir).SetAccessControl(acl);
+        }
+        try
+        {
+            Assert.Equal(AntiCheat.None, GameFiles.DetectAntiCheat(game));
+            Acl(install, installDeny, true);
+            Acl(root, parentDeny, true);
+            Assert.False(Directory.Exists(install));
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(game));
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(game, quick: true));
+        }
+        finally
+        {
+            Acl(root, parentDeny, false);
+            Acl(install, installDeny, false);
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public void Junctions_are_names_not_folders_to_walk()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-anticheat-link-test-").FullName;
+        var links = new List<string>();
+        try
+        {
+            void Junction(string link, string target)
+            {
+                links.Add(link);
+                using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c mklink /J \"{link}\" \"{target}\"")
+                    { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!;
+                p.StandardOutput.ReadToEnd();
+                p.WaitForExit();
+                Assert.Equal(0, p.ExitCode);
+            }
+            var protectedGame = Directory.CreateDirectory(Path.Combine(root, "Protected", "EasyAntiCheat")).Parent!.FullName;
+            var install = Directory.CreateDirectory(Path.Combine(root, "Clean", "bin")).Parent!.FullName;
+            File.WriteAllBytes(Path.Combine(install, "bin", "Game.exe"), new byte[100]);
+            var game = new Game("test:clean", "Clean", Store.Other, install, Path.Combine(install, "bin", "Game.exe"));
+            Junction(Path.Combine(install, "shared"), protectedGame);   // into another game's install: not this game's files
+            Junction(Path.Combine(install, "bin", "loop"), install);    // a cycle
+            Assert.Equal(AntiCheat.None, GameFiles.DetectAntiCheat(game));
+
+            Junction(Path.Combine(install, "BattlEye"), protectedGame);   // its name still counts
+            Assert.Equal(AntiCheat.BattlEye, GameFiles.DetectAntiCheat(game));
+
+            // the exe's own folder is a link: <install>\bin -> elsewhere\GameBin, with Game.exe and support\EasyAntiCheat
+            var binTarget = Directory.CreateDirectory(Path.Combine(root, "elsewhere", "GameBin", "support", "EasyAntiCheat")).Parent!.Parent!.FullName;
+            File.WriteAllBytes(Path.Combine(binTarget, "Game.exe"), new byte[100]);
+            var linked = Directory.CreateDirectory(Path.Combine(root, "Linked")).FullName;
+            Junction(Path.Combine(linked, "bin"), binTarget);
+            var viaLink = new Game("test:linked", "Linked", Store.Other, linked, Path.Combine(linked, "bin", "Game.exe"));
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(viaLink));
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(viaLink, quick: true));
+        }
+        finally
+        {
+            foreach (var link in links.Where(Directory.Exists)) Directory.Delete(link);   // the link only, never its target
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public void Launcher_ids_never_name_a_folder_outside_the_data_folder()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-ids-test-").FullName;
+        try
+        {
+            var store = new Core.App.AppStore(Path.Combine(root, "data"));
+            var games = Path.GetFullPath(Path.Combine(root, "data", "games"));
+            var install = Directory.CreateDirectory(Path.Combine(root, "Game")).FullName;
+            File.WriteAllBytes(Path.Combine(install, "Game.exe"), new byte[100]);
+            const string up = @"..\..\..\..\..\..\..\..\XboxGames\Demo\Content";
+
+            var manifests = Directory.CreateDirectory(Path.Combine(root, "Manifests")).FullName;   // Epic: the manifest's AppName
+            File.WriteAllText(Path.Combine(manifests, "a.item"), System.Text.Json.JsonSerializer.Serialize(new { AppName = @"x\" + up, InstallLocation = install }));
+            File.WriteAllText(Path.Combine(manifests, "b.item"), System.Text.Json.JsonSerializer.Serialize(new { AppName = @"C:\Windows", InstallLocation = install }));
+            Directory.CreateDirectory(Path.Combine(install, "__Installer"));   // EA: the installer's contentID
+            File.WriteAllText(Path.Combine(install, "__Installer", "installerdata.xml"),
+                $"<DiPManifest><contentIDs><contentID>x/{up.Replace('\\', '/')}</contentID></contentIDs><runtime><launcher><filePath>Game.exe</filePath></launcher></runtime></DiPManifest>");
+            var ids = new EpicSource(manifests).Discover().Concat(new EaSource([install], _ => null).Discover()).Select(g => g.Id).ToList();
+            Assert.Equal(3, ids.Count);
+
+            // Xbox: Identity.Name when the manifest has no Publisher; the rest are what a GameDir caller may pass
+            string[] unsafeIds = [.. ids, $@"xbox:x\{up}", "xbox:..", "xbox:x. ", "..", ".", @"\\server\share", "steam:1/../../x", "epic:Demo/A", "%x", ""];
+            string[] plainIds = ["epic:Demo_A", "epic:Demo:A", "epic:a:b", "epic:a%3Ab", "a_b"];
+            foreach (var id in unsafeIds.Concat(plainIds))
+            {
+                var dir = Path.GetFullPath(store.GameDir(id));
+                Assert.Equal(games, Path.GetDirectoryName(dir), StringComparer.OrdinalIgnoreCase);
+                Assert.Equal(store.GameDir(id), store.GameDir(Core.App.AppStore.GameId(Path.GetFileName(dir))));   // the uninstall hook's way back
+                Assert.Equal(unsafeIds.Contains(id), Path.GetFileName(dir).StartsWith('%'));
+            }
+            Assert.Equal(unsafeIds.Length, unsafeIds.Select(id => store.GameDir(id).ToUpperInvariant()).Distinct().Count());
+            // the folders main used, whenever they are plain names; two ids main gave one folder still share it
+            Assert.Equal(Path.Combine(games, "steam_1245620"), store.GameDir("steam:1245620"));
+            Assert.Equal(Path.Combine(games, "xbox_Pub.Game_8wekyb3d8bbwe"), store.GameDir("xbox:Pub.Game_8wekyb3d8bbwe"));
+            Assert.Equal(Path.Combine(games, "ea_Origin.OFR.50.0004321"), store.GameDir("ea:Origin.OFR.50.0004321"));
+            Assert.Equal(Path.Combine(games, "epic_Demo_A"), store.GameDir("epic:Demo:A"));
+            Assert.Equal(store.GameDir("epic:Demo_A"), store.GameDir("epic:Demo:A"));
+            Assert.NotEqual(store.GameDir("epic:Demo/A"), store.GameDir("epic:Demo_A"));
+            Assert.Equal(Path.Combine(games, "epic_a_b"), store.GameDir("epic:a:b"));
+            Assert.Equal(Path.Combine(games, "epic_a%3Ab"), store.GameDir("epic:a%3Ab"));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
     [Trait("Needs", "Game")]
     [Fact]
     public void Ea_finds_jedi_survivor_once_its_download_is_done()
