@@ -2311,7 +2311,7 @@ public class AppTests : IDisposable
         var bin = Directory.CreateDirectory(Path.Combine(install, "bin", "x64_dx12", "D3D12_0")).Parent!.FullName;
         var launcher = Path.Combine(install, "REDprelauncher.exe");
         File.WriteAllBytes(launcher, DiscoveryAndVendorTests.Exe("Qt5Core.dll", 100));
-        File.WriteAllBytes(Path.Combine(bin, "witcher3.exe"), DiscoveryAndVendorTests.Exe("sl.interposer.dll", 5000));
+        File.WriteAllBytes(Path.Combine(bin, "w3fake.exe"), DiscoveryAndVendorTests.Exe("sl.interposer.dll", 5000));
         File.WriteAllBytes(Path.Combine(bin, "D3D12_0", "D3D12Core.dll"), new byte[64]);
         var was = new Game("steam:292030", "The Witcher 3", Store.Steam, install, launcher);
         var before = RecordKiller([was]);
@@ -2322,7 +2322,7 @@ public class AppTests : IDisposable
         using (var f = File.Create(Path.Combine(install, "scskiller.db"))) PsoDb.Write(f, 'C', Pso('a').Payload);   // left by a launch, not imported
         // the session the recorder there saw, moved by hand into the root: the game page shows it after the move too
         const long at = 1_700_000_000_000;
-        File.WriteAllLines(Path.Combine(install, "scskiller_creates.csv"), [$"#session,{at},witcher3.exe", "#clock,10.0", "20.0,G,0,0,250.0", $"#end,{at + 60_000},60010.0"]);
+        File.WriteAllLines(Path.Combine(install, "scskiller_creates.csv"), [$"#session,{at},w3fake.exe", "#clock,10.0", "20.0,G,0,0,250.0", $"#end,{at + 60_000},60010.0"]);
         File.WriteAllBytes(Path.Combine(install, FrameLog.FileName), FrameLogTests.Launch(at, 10_000, Enumerable.Range(1, 5000).Select(i => 10.0 + i * 10)));
         File.WriteAllText(Path.Combine(install, "scskiller.log"), "the root's log");
         if (handCopy)
@@ -2334,10 +2334,10 @@ public class AppTests : IDisposable
             File.SetLastWriteTimeUtc(Path.Combine(bin, "scskiller.log"), DateTime.UtcNow.AddDays(1));
         }
 
-        File.WriteAllText(Path.Combine(install, "launcher-configuration.json"), DiscoveryAndVendorTests.RedConfig());
+        File.WriteAllText(Path.Combine(install, "launcher-configuration.json"), DiscoveryAndVendorTests.RedConfig().Replace("witcher3.exe", "w3fake.exe"));
         var game = was with { ExePath = Core.Games.GameFiles.FindExe(install)! };
-        Assert.Equal(Path.Combine(bin, "witcher3.exe"), game.ExePath);
-        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" };
+        Assert.Equal(Path.Combine(bin, "w3fake.exe"), game.ExePath);
+        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "w3fake" };
         var k = RecordKiller([game], running: () => running);
         await k.ScanAsync(default);
         k.ReconcileRecorders();
@@ -2352,8 +2352,8 @@ public class AppTests : IDisposable
             Assert.False(File.Exists(Path.Combine(install, f)), f);
         Assert.Equal(handCopy ? "a later launch's" : "the root's log", File.ReadAllText(Path.Combine(bin, "scskiller.log")));
         var csv = Path.Combine(bin, "scskiller_creates.csv");
-        Assert.Equal(1, SessionLog.Read(csv, "witcher3.exe").Last!.Compiles);
-        Assert.Equal(4999, FrameLog.Read(Path.Combine(bin, FrameLog.FileName), csv, "witcher3.exe")!.Frames);
+        Assert.Equal(1, SessionLog.Read(csv, "w3fake.exe").Last!.Compiles);
+        Assert.Equal(4999, FrameLog.Read(Path.Combine(bin, FrameLog.FileName), csv, "w3fake.exe")!.Frames);
         var s = k.Games.Single();
         Assert.Equal((1L, 4999L), (s.LastSession!.Compiles, s.LastFrames!.Frames));
         Assert.Equal(File.ReadAllBytes(_proxy), File.ReadAllBytes(Path.Combine(bin, "d3d12.dll")));
@@ -2376,7 +2376,7 @@ public class AppTests : IDisposable
         var install = Path.Combine(_root, "The Witcher 3");
         var bin = Directory.CreateDirectory(Path.Combine(install, "bin", "x64_dx12")).FullName;
         File.WriteAllBytes(Path.Combine(install, "REDprelauncher.exe"), DiscoveryAndVendorTests.Exe("Qt5Core.dll", 100));
-        File.WriteAllBytes(Path.Combine(bin, "witcher3.exe"), DiscoveryAndVendorTests.Exe("sl.interposer.dll", 5000));
+        File.WriteAllBytes(Path.Combine(bin, "w3fake.exe"), DiscoveryAndVendorTests.Exe("sl.interposer.dll", 5000));   // not witcher3.exe: the folder checks see real processes
         var was = new Game("steam:292030", "The Witcher 3", Store.Steam, install, Path.Combine(install, "REDprelauncher.exe"));
         if (mod != null) File.WriteAllBytes(Path.Combine(install, "d3d12.dll"), mod);
         var before = RecordKiller([was]);
@@ -2384,7 +2384,7 @@ public class AppTests : IDisposable
         if (mod != null) before.SetRecordAlongsideMod(was.Id, true);
         before.InstallRecorder(was.Id);
         using (var f = File.Create(Path.Combine(install, "scskiller.db"))) PsoDb.Write(f, 'C', Rec('a').Payload);
-        File.WriteAllText(Path.Combine(install, "launcher-configuration.json"), DiscoveryAndVendorTests.RedConfig());
+        File.WriteAllText(Path.Combine(install, "launcher-configuration.json"), DiscoveryAndVendorTests.RedConfig().Replace("witcher3.exe", "w3fake.exe"));
         return (install, bin, was, was with { ExePath = Core.Games.GameFiles.FindExe(install)! });
     }
 
@@ -2439,14 +2439,14 @@ public class AppTests : IDisposable
         {
             move = Task.Run(() => k.ReconcileRecorders());
             Assert.True(SpinWait.SpinUntil(() => !File.Exists(Path.Combine(install, "d3d12.dll")), TimeSpan.FromSeconds(10)));   // the proxy went, the import waits
-            running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" };
+            running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "w3fake" };
         }
         await move.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.Equal("moves when the game exits", k.Games.Single().RecorderNote);
         Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);   // neither emptied nor deleted while it runs
         Assert.False(File.Exists(Path.Combine(bin, "d3d12.dll")));
         Assert.Equal((was.ExePath, game.ExePath), (k.Store.LoadGame(game.Id).RecorderMoveFrom, k.Store.LoadGame(game.Id).RecorderMoveTo));
-        ScsKiller.RemoveAllRecorders(k.Store, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" });   // the uninstall hook: it runs from the new folder
+        ScsKiller.RemoveAllRecorders(k.Store, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "w3fake" });   // the uninstall hook: it runs from the new folder
         Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);
 
         running = new HashSet<string>();
@@ -2460,7 +2460,7 @@ public class AppTests : IDisposable
     public async Task A_move_put_off_because_the_game_runs_is_guarded_by_the_uninstall_hook()
     {
         var (install, bin, was, game) = await RecorderNextToALauncher();
-        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" };
+        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "w3fake" };
         var k = RecordKiller([game], running: () => running);
         await k.ScanAsync(default);
         k.ReconcileRecorders();
@@ -2478,7 +2478,7 @@ public class AppTests : IDisposable
     {
         var (install, bin, was, game) = await RecorderNextToALauncher();
         Directory.CreateDirectory(Path.Combine(install, "EasyAntiCheat"));
-        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" };
+        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "w3fake" };
         var k = RecordKiller([game], running: () => running);
         await k.ScanAsync(default);   // the removal waits for the game
         Assert.True(k.Store.LoadGame(game.Id).RecorderRollback);
@@ -2488,7 +2488,7 @@ public class AppTests : IDisposable
             foreach (var f in new[] { "d3d12.dll", "scskiller.ini", "scskiller.db" }) Assert.True(File.Exists(Path.Combine(install, f)), f);
             Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);
         }
-        Untouched();   // before any reconcile: the install's tree has witcher3.exe
+        Untouched();   // before any reconcile: the install's tree has w3fake.exe
 
         k.ReconcileRecorders();
         Assert.Equal((was.ExePath, game.ExePath), (k.Store.LoadGame(game.Id).RecorderMoveFrom, k.Store.LoadGame(game.Id).RecorderMoveTo));
@@ -2507,7 +2507,7 @@ public class AppTests : IDisposable
         var dll = Path.Combine(install, "d3d12.dll");
         // the game starts once the hook took the proxy out, before it deletes the data files
         ScsKiller.RemoveAllRecorders(RecordKiller([game]).Store,
-            () => File.Exists(dll) ? new HashSet<string>() : new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" }, null);
+            () => File.Exists(dll) ? new HashSet<string>() : new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "w3fake" }, null);
         Assert.False(File.Exists(dll));
         Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);
         Assert.Contains("the game started: the recorder's data files left", RecordersLog());
@@ -2525,7 +2525,7 @@ public class AppTests : IDisposable
     public async Task Anti_cheat_found_after_the_exe_moved_with_the_game_stopped_still_imports_and_cleans_the_old_folder()
     {
         var (install, bin, was, game) = await RecorderNextToALauncher();
-        File.WriteAllText(Path.Combine(install, "scskiller_creates.csv"), "#session,1,witcher3.exe");
+        File.WriteAllText(Path.Combine(install, "scskiller_creates.csv"), "#session,1,w3fake.exe");
         Directory.CreateDirectory(Path.Combine(install, "EasyAntiCheat"));
         var k = RecordKiller([game]);
         await k.ScanAsync(default);   // taken out right away
@@ -2552,7 +2552,7 @@ public class AppTests : IDisposable
         {
             move = Task.Run(() => k.ReconcileRecorders());
             Thread.Sleep(500);   // waiting to save the move's record
-            running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" };
+            running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "w3fake" };
         }
         await move.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.Equal("moves when the game exits", k.Games.Single().RecorderNote);
@@ -5837,6 +5837,36 @@ public class AppTests : IDisposable
         k.RefreshGame(_game.Id);   // the retry adds nothing new to the copy
         Assert.NotNull(k.Store.LoadGame(_game.Id).RecordingImportedAt);
         Assert.Equal(0, new FileInfo(inbox).Length);
+    }
+
+    /// <summary>Synthesized PSOs take the NVAPI state of the recordings, the community's too (PlanBuilder.RasterNv): an
+    /// import that stores an 'N' record the recording lacked re-plans, whatever this recording alone would infer; one whose
+    /// 'N' records it has already doesn't.</summary>
+    [Fact]
+    public async Task An_import_of_new_NVAPI_state_alone_re_plans()
+    {
+        var k = Killer(new FakeReader(Unreal));
+        k.ProcessNames = () => new HashSet<string>();
+        await k.ScanAsync(default);
+        var inbox = Path.Combine(_exeDir, "scskiller.db");
+        var recs = Enumerable.Range(0, 100).Select(i => new PsoDb.Rec('C', PsoDb.Compute(PsoDb.Zero, $"{i:x40}"))).ToList();
+        PsoDb.Rec N(PsoDb.Rec r, uint slot, uint options = 0) => new PsoDb.NvState(r.Key, slot, 1, 1, options).ToRec();
+        var imported = k.Store.LoadGame(_game.Id).RecordingImportedAt;
+        bool Import(IEnumerable<PsoDb.Rec> rs)
+        {
+            using (var f = File.Create(inbox)) foreach (var r in rs) PsoDb.Write(f, r.Tag, r.Payload);
+            k.RefreshGame(_game.Id);
+            Assert.Equal(0, new FileInfo(inbox).Length);
+            var now = k.Store.LoadGame(_game.Id).RecordingImportedAt;
+            (var bumped, imported) = (now > imported || imported == null && now != null, now);
+            return bumped;
+        }
+
+        Assert.True(Import(recs));
+        Assert.True(Import(recs.Take(1).Select(r => N(r, 12))));   // 1 of 100 here; a community recording may hold the other 99
+        Assert.True(Import(recs.Skip(1).Select(r => N(r, 12))));
+        Assert.True(Import(recs.Take(2).Select(r => N(r, uint.MaxValue, 17))));   // the last state of 2: no slot, options
+        Assert.False(Import(recs.Take(50).Select(r => N(r, 12))));   // all stored already
     }
 
     sealed class ThrowingSizeCache : IAppCache

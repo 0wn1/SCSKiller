@@ -600,11 +600,12 @@ public sealed class ScsKiller : IScsKiller
 
     public static string PausedNote(Settings s) => $"Recording paused: limit reached ({LimitText(s.RecordingLimitMB)})";
 
-    /// <summary>The last build can't compile the game's ray tracing: more than 10% of its DXIL libraries have no synthesized
-    /// collection and no recorded state object (<see cref="PlanStats.RtUncovered"/>): AMD (its driver caches only the exact
-    /// objects a game builds), or an engine whose collection layout SCSKiller can't rebuild from its files (Unreal 5). Known
-    /// only after a build, like <see cref="IsPartial"/>.</summary>
-    public static bool NeedsRtRecording(PlanStats? p) => p is { RtUncovered: > 0 } && p.RtUncovered > 0.1 * p.RtLibraries;
+    /// <summary>The last build can't compile the game's ray tracing and no recording has any: more than 10% of its DXIL
+    /// libraries have no synthesized collection and no recorded state object (<see cref="PlanStats.RtUncovered"/>): AMD (its
+    /// driver caches only the exact objects a game builds), or an engine whose collection layout SCSKiller can't rebuild from
+    /// its files (Unreal 5). A recording with ray tracing in it already is one: what it left uncovered shows as a count only.
+    /// Known only after a build, like <see cref="IsPartial"/>.</summary>
+    public static bool NeedsRtRecording(PlanStats? p) => p is { RtUncovered: > 0, RtStateObjects: 0 } && p.RtUncovered > 0.1 * p.RtLibraries;
 
     /// <summary>The status reason of a game whose ray tracing needs a recording (<see cref="NeedsRtRecording"/>).</summary>
     public static string RtNote(bool? inCommunityDb) => RtNeedsRecording + (inCommunityDb == null ? ", or a community recording for this version" : DbNote(inCommunityDb));
@@ -1444,13 +1445,18 @@ public sealed class ScsKiller : IScsKiller
     /// unknown baseline (<paramref name="Unknown"/>): everything counts, as for a warm from before warms kept one.</summary>
     readonly record struct Pending(long Recorded, long? Planned, bool Unknown = false);
 
+    /// <summary>Crash keys as warm inputs: the warm names a crashed PSO by its record key, and a plan input is keyed by its
+    /// 'N' record when it has one (<see cref="Planner.PlanInputs"/>).</summary>
+    internal static IReadOnlySet<string> CrashInputs(IReadOnlySet<string> crash, string? planFile) => crash.Count == 0 ? crash
+        : crash.Union(Planner.PlanInputs(Planner.PlanBody(planFile)).Where(x => crash.Contains(x.Rec.Key)).Select(x => x.Key)).ToHashSet();
+
     Pending PendingOf(Game g, GameRecord r)
     {
         if (r.WarmedAt == null) return new(0, null);
         var dir = Store.GameDir(g.Id);
         var warmed = r.WarmKeysFile is { } wf ? KeyFiles.Set(Path.Combine(dir, wf)) : null;
         var made = r.PlanKeysFile is { } pf ? KeyFiles.Set(Path.Combine(dir, pf)) : null;
-        var crash = CrashKeysNow(r);
+        var crash = CrashInputs(CrashKeysNow(r), r.Plan?.FilePath);
         var fresh = InputsNow(g, r).Where(i => !crash.Contains(WarmInputs.Key(i)) && (warmed == null || !WarmInputs.Taken(warmed, i))).Select(WarmInputs.Key).ToList();
         return new(fresh.Count(k => made?.Contains(k) != true), made == null ? null : fresh.Count(made.Contains), warmed == null);
     }
@@ -1460,7 +1466,7 @@ public sealed class ScsKiller : IScsKiller
     {
         var rec = Path.Combine(work, "recording.db");
         var recorded = File.Exists(rec) ? PipelineKeys(rec) : [];
-        return [.. Planner.PlanBody(plan.FilePath).Where(r => r.Tag is not ('B' or 'M')).Select(r => r.Key).Where(k => !recorded.Contains(k))];
+        return [.. Planner.PlanInputs(Planner.PlanBody(plan.FilePath)).Where(x => x.Rec.Tag != 'M').Select(x => x.Key).Where(k => !recorded.Contains(k))];
     }
 
     /// <summary>The keys of what a plan replays, the pack entries' own keys included (not their 'M' wrappers'); empty when unreadable.</summary>
@@ -1598,14 +1604,15 @@ public sealed class ScsKiller : IScsKiller
             {
                 Directory.CreateDirectory(Store.GameDir(g.Id));
                 var shipped = Shipped(g, rec);
-                var keys = Recordings.Merge(store, pending ? inbox.FullName : null, shipped == null ? null : shipped.Contains);
+                var keys = Recordings.Merge(store, pending ? inbox.FullName : null, shipped == null ? null : shipped.Contains, out var nvAdded);
                 File.Delete(all);
                 File.Delete(all + ".key");
                 added = keys.Count;
                 (rec.RecordingInbox, rec.RecordingIndexHash) = (stamp, shipped != null ? rec.IndexContentHash : null);
                 // an inbox whose records the copy already has (not a migration's: it imported them as a copy): merged by an
                 // import that ended before its record was saved
-                if (keys.Count > 0 || pending && !legacy && PsoDb.Read(inbox.FullName).Any(r => r.Tag is not ('B' or 'N' or 'L'))) rec.RecordingImportedAt = DateTimeOffset.Now;
+                // NVAPI state alone counts: synthesized PSOs take the recording's (PlanBuilder.RasterNv)
+                if (keys.Count > 0 || nvAdded || pending && !legacy && PsoDb.Read(inbox.FullName).Any(r => r.Tag is not ('B' or 'N' or 'L'))) rec.RecordingImportedAt = DateTimeOffset.Now;
                 WriteKeys(g, rec);
                 // emptied: what it gets next is new, whatever its size and write time. The import is saved first: a crash
                 // after an emptied inbox would leave the record (and the scan's cached readiness) without it

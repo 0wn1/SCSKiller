@@ -236,6 +236,9 @@ public static class Busy
 
     public static void ClearApplying(string dataDir) => File.Delete(Marker(dataDir));
 
+    /// <summary>A marker of any age: a handover whose new version never started.</summary>
+    public static bool Marked(string dataDir) => File.Exists(Marker(dataDir));
+
     public static bool Applying(string dataDir, DateTimeOffset now)
     {
         try

@@ -5,6 +5,29 @@ All notable changes to the SCSKiller app and command line. The format follows
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-10-03
+
+### Added
+
+- The Witcher 3: Wild Hunt's ray tracing on NVIDIA: once a recording has a session with ray tracing on, SCSKiller also
+  compiles the hit groups of the game's materials, so the materials the game adds while you play stutter far less. The
+  game page counts the ray-tracing shaders a compile can't cover (it showed 0 whenever a recording had any ray
+  tracing).
+
+### Changed
+
+- A downloaded update also installs when SCSKiller starts, for example after the PC was shut down with the app still
+  open: the app restarts into the new version within seconds, unless a compile is running.
+
+### Fixed
+
+- With the internal update channel chosen, SCSKiller kept offering the version already installed.
+- About links to the website, the source code and the Patreon page; it still said they were coming.
+- A game's last session could show no frame-time graph and count only its last few minutes of shader compiles, when
+  two pipelines finished creating at the same moment (seen in The Witcher 3).
+- On NVIDIA, games that create their pipelines with NVIDIA's shader extensions (The Witcher 3) now find the pipelines
+  SCSKiller plans in the cache; before, only the recorded ones hit. These games ask for one more compile.
+
 ## [1.1.1] - 2026-10-03
 
 ### Added

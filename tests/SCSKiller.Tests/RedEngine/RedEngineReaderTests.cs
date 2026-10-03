@@ -165,6 +165,20 @@ public class RedEngineReaderTests
         var work = Path.Combine(dir, "work");
         planner.Materialize(plan, d.Game, engine, reader, null, work, CancellationToken.None);
         Ff7.CheckWarmReady(work);
+
+        // NVIDIA: every synthesized PSO is created with REDengine 3's NVAPI slot (12, space 1), in the plan and the work folder,
+        // and keyed by it as a plan input; AMD gets none
+        var synthesized = body.Where(r => r.Tag is 'S' or 'P').Select(r => r.Key).ToHashSet();
+        var nv = body.Where(r => r.Tag == 'N').Select(PsoDb.NvState.Parse).ToList();
+        Assert.Equal(synthesized, nv.Select(n => n.Target).ToHashSet());
+        Assert.All(nv, n => Assert.Equal((12u, 1u, 0u), (n.Slot, n.Space, n.Options)));
+        Assert.Equal(synthesized, PsoDb.Read(Path.Combine(work, "scskiller_gen.db")).Where(r => r.Tag == 'N').Select(r => PsoDb.NvState.Parse(r).Target).ToHashSet());
+        Assert.Equal(body.Where(r => r.Tag == 'N').Select(r => r.Key).ToHashSet(), Planner.PlanInputs(body).Select(x => x.Key).ToHashSet());
+        var crashed = synthesized.First();   // the warm reports a crash by the record's key: the input's key ('N') counts as crashed too
+        Assert.Contains(nv.Select(n => n.Target).Zip(body.Where(r => r.Tag == 'N'), (t, r) => (t, r.Key)).Single(x => x.t == crashed).Key,
+            SCSKiller.Core.App.ScsKiller.CrashInputs(new HashSet<string> { crashed }, plan.FilePath));
+        var amd = planner.Build(d.Game, engine, index, null, Ff7.Amd with { StateIndependentCache = true }, Ff7.TempDir("redengine-plan-amd"), null, CancellationToken.None);
+        Assert.DoesNotContain(PlanFile.Read(amd.FilePath).Records, r => r.Tag == 'N');
     }
 
     [Fact]
@@ -340,6 +354,27 @@ public class RedEngineReaderTests
         Assert.True(plan.Stats.RootSigRuleVerified);
     }
 
+    /// <summary>The NVAPI state synthesized PSOs get from a recording: the slot and space at least 99% of its raster records
+    /// share, with their most common options; none below that, none on AMD, none without a recording but for REDengine 3.</summary>
+    [Fact]
+    public void SynthesizedPsosTakeTheRecordingsNvapiState()
+    {
+        var recs = Enumerable.Range(0, 200).Select(i => new PsoDb.Rec('C', PsoDb.Compute(new string('a', 40), $"{i:x40}"))).ToList();
+        PsoDb.Rec N(PsoDb.Rec r, uint slot, uint options = 0) => new PsoDb.NvState(r.Key, slot, 1, 1, options).ToRec();
+        var nv = recs.Take(199).Select((r, i) => N(r, 12, i < 150 ? 0u : 17u)).ToList();   // one record without a state: 199 of 200
+        Assert.Equal(new RtCollections.Nv(12, 1, 0), PlanBuilder.RasterNv(Ff7.Nvidia, RootSig.Rule.Ue426, recs, nv));
+        Assert.Null(PlanBuilder.RasterNv(Ff7.Amd, RootSig.Rule.Ue426, recs, nv));
+        Assert.Null(PlanBuilder.RasterNv(Ff7.Nvidia, RootSig.Rule.Ue426, recs, nv.Take(197)));                    // 197 of 200: under 99%
+        Assert.Null(PlanBuilder.RasterNv(Ff7.Nvidia, RootSig.Rule.Ue426, recs, [.. nv.Take(150), .. recs.Skip(150).Take(49).Select(r => N(r, 5))])); // two slots
+        Assert.Null(PlanBuilder.RasterNv(Ff7.Nvidia, RootSig.Rule.Ue426, recs, [.. nv, .. recs.Select(r => N(r, uint.MaxValue, 17))]));   // each one's last state: no slot
+        Assert.Equal(new RtCollections.Nv(12, 1, 0), PlanBuilder.RasterNv(Ff7.Nvidia, RootSig.Rule.Ue426, recs, [.. recs.Select(r => N(r, 5)), .. nv]));   // nor an earlier one
+        Assert.Equal(new RtCollections.Nv(12, 1, 0), PlanBuilder.RasterNv(Ff7.Nvidia, RootSig.Rule.Red3, [], []));
+        Assert.Equal(new RtCollections.Nv(12, 1, 0), PlanBuilder.RasterNv(Ff7.Nvidia, RootSig.Rule.Red3, recs, []));   // a recording made on AMD: none recorded
+        Assert.Equal(new RtCollections.Nv(12, 1, 0), PlanBuilder.RasterNv(Ff7.Nvidia, RootSig.Rule.Red3, recs, nv));
+        Assert.Null(PlanBuilder.RasterNv(Ff7.Nvidia, RootSig.Rule.Ue426, [], []));
+        Assert.Null(PlanBuilder.RasterNv(Ff7.Amd, RootSig.Rule.Red3, [], []));
+    }
+
     /// <summary>A cache replaced by a shorter one after the index: its shaders are unavailable, never an exception.</summary>
     [Fact]
     public void ShadersGoneSinceTheIndexAreSkipped()
@@ -360,5 +395,112 @@ public class RedEngineReaderTests
         Assert.Equal([Sha(d.Vs[0])], got); // the one still where the index found it
         File.Delete(cache);
         reader.ReadShaders(game, engine, all, (h, _) => got.Add(h), CancellationToken.None);
+    }
+
+    /// <summary>A material addition as The Witcher 3 records it: global root signature, shader config, pipeline config 1,
+    /// state object config, the closest and any hit libraries, the hit group, the local root signature and its association.</summary>
+    static PsoDb.Rec Addition(string global, uint payload, uint pipelineFlags)
+    {
+        var s = new MemoryStream();
+        var w = new BinaryWriter(s);
+        void Str(string? x) { if (x == null) { w.Write(uint.MaxValue); return; } w.Write((uint)x.Length); w.Write(Encoding.Unicode.GetBytes(x)); }
+        w.Write(new byte[20]); w.Write(3u); w.Write(9u);
+        w.Write(1u); w.Write(Convert.FromHexString(global));
+        w.Write(9u); w.Write(payload); w.Write(8u);
+        w.Write(12u); w.Write(1u); w.Write(pipelineFlags);
+        w.Write(0u); w.Write(4u);
+        w.Write(5u); w.Write(new byte[20]); w.Write(1u); Str("CH_LRS"); Str("ClosestHit"); w.Write(0u);
+        w.Write(5u); w.Write(new byte[20]); w.Write(1u); Str("AH_LRS"); Str("AnyHit"); w.Write(0u);
+        w.Write(11u); Str("HitGroup_0x1"); w.Write(0u); Str("AH_LRS"); Str("CH_LRS"); Str(null);
+        w.Write(2u); w.Write(new byte[20]);
+        w.Write(7u); w.Write(7u); w.Write(1u); Str("HitGroup_0x1");
+        return new('A', s.ToArray());
+    }
+
+    /// <summary>The material hit groups' collections take the shape most recorded additions share; the local root signature
+    /// is the fixed prefix, the hit group's space-0 SRV runs (always a table) and CBV runs (a table when any), registers the
+    /// global one gives left out; an 'H' item round-trips.</summary>
+    [Fact]
+    public void MaterialHitGroupsTakeTheRecordedAdditionsShape()
+    {
+        var global = new string('9', 40);
+        Assert.Null(RedRayTracing.Learn([]));
+        Assert.Equal(new RedRayTracing.Shape(global, 32, 8, 1, 0x200),
+            RedRayTracing.Learn([Addition(global, 32, 0x200), Addition(global, 32, 0x200), Addition(new string('8', 40), 16, 0)]));
+
+        ShaderInfo Lib(params Binding[] b) => new("", Stage.Library, "lib_6_5", 0, new(0, 0, 0, 0), b, [], []);
+        var g = new RootSig.Ranges(0, [(0, 2, 12, 1, 0), (0, 0, 4, 40, 0)]);   // the global root signature gives b12 and t4-t43 in space 0
+        var d = RedRayTracing.Local([Lib(new("srv", 0, 0, 2), new("cbv", 0, 12, 1), new("cbv", 0, 2, 1)), Lib(new("srv", 0, 3, 1), new("srv", 0, 5, 1), new("srv", 1, 0, 1))], g);
+        Assert.Equal((0x80u, true), (d.Flags, d.AppendRanges));
+        Assert.Equal([[3, 0, 1, 1, 2], [3, 0, 2, 1, 2], [1, 0, 3, 1, 22], [0, 0, 0, 2, 0, 0, 3, 0, 1, 3, 0, 3], [0, 0, 2, 1, 2, 0, 3]], d.Rows);   // runs t0-t1 and t3 (t5 is the global's), b2
+        Assert.Equal([[3, 0, 1, 1, 2], [3, 0, 2, 1, 2], [1, 0, 3, 1, 22], [0, 0]], RedRayTracing.Local([Lib()], g).Rows);   // nothing bound: an empty SRV table
+        Assert.NotEmpty(RootSig.Serialize(d, []));
+        var g47 = new RootSig.Ranges(0, [(0, 0, 4, 4, 0), (0, 0, 20, uint.MaxValue, 0)]);   // t4-t7, and t20 on unbounded
+        Assert.Null(RedRayTracing.Local([Lib(new Binding("srv", 0, 0, 8))], g47));   // t0-t7: a local t0-t7 would overlap t4-t7
+        Assert.Null(RedRayTracing.Local([Lib(new Binding("srv", 0, 18, 4))], g47));   // t18-t21: partly in the unbounded one
+        Assert.Null(RedRayTracing.Local([Lib(new Binding("srv", 0, 0, -1))], g47));   // unbounded
+        Assert.Equal([0, 0, 0, 4, 0, 0, 3], RedRayTracing.Local([Lib(new("srv", 0, 0, 4), new("srv", 0, 5, 2), new("srv", 0, 30, 1000))], g47)!.Rows[3]);   // t5-t6 and t30 on: the global's
+        var huge = RedRayTracing.Local([Lib(new("srv", 0, 100, 100_000_000), new("srv", 0, 50, 60))], new RootSig.Ranges(0, []))!;
+        Assert.Equal([0, 0, 0, 100_000_050, 50, 0, 3], huge.Rows[3]);   // one run, never register by register
+
+        var shape = new RedRayTracing.Shape(global, 32, 8, 1, 0x200);
+        var item = RedRayTracing.ParseItem(RedRayTracing.Item(new string('1', 40), new string('2', 40), new string('3', 40), shape, new RtCollections.Nv(12, 1, 0)));
+        Assert.Equal(new RedRayTracing.ItemFields(new string('1', 40), new string('2', 40), new string('3', 40), shape, new RtCollections.Nv(12, 1, 0)), item);
+        Assert.Null(RedRayTracing.ParseItem(RedRayTracing.Item(new string('1', 40), null, new string('3', 40), shape, null)).AnyHit);
+        Assert.Equal([new string('1', 40), new string('2', 40), new string('3', 40), global],
+            Rehydrate.References([new PsoDb.Rec('H', RedRayTracing.Item(new string('1', 40), new string('2', 40), new string('3', 40), shape, null))]).Order());
+    }
+
+    /// <summary>An 'H' item's collection: the global root signature, shader config, pipeline config 1, the two libraries with
+    /// their hit shader exported, the hit group of the two, the local root signature and its association with the hit group;
+    /// none when a library exports no hit shader of its kind.</summary>
+    [Fact]
+    public void AHitGroupsCollectionHasTheAdditionsSubobjects()
+    {
+        byte[] chLib = Planning.RtCollectionTests.Library((10, "MatCHS", 32)), ahLib = Planning.RtCollectionTests.Library((9, "MatAHS", 32));
+        string ch = PsoDb.Hex(System.Security.Cryptography.SHA1.HashData(chLib)), ah = PsoDb.Hex(System.Security.Cryptography.SHA1.HashData(ahLib));
+        string global = new('9', 40), local = new('3', 40);
+        var f = RedRayTracing.ParseItem(RedRayTracing.Item(ch, ah, local, new RedRayTracing.Shape(global, 32, 8, 1, 0x200), null));
+        var so = RedRayTracing.Collection(chLib, f, ahLib)!;
+
+        var r = new BinaryReader(new MemoryStream(so));
+        string H() => PsoDb.Hex(r.ReadBytes(20));
+        string? S() => r.ReadUInt32() is var n && n == uint.MaxValue ? null : System.Text.Encoding.Unicode.GetString(r.ReadBytes(2 * (int)n));
+        Assert.Equal((0u, 8u), (r.ReadUInt32(), r.ReadUInt32()));   // a collection of 8 subobjects
+        Assert.Equal((1u, global), (r.ReadUInt32(), H()));
+        Assert.Equal((9u, 32u, 8u), (r.ReadUInt32(), r.ReadUInt32(), r.ReadUInt32()));
+        Assert.Equal((12u, 1u, 0x200u), (r.ReadUInt32(), r.ReadUInt32(), r.ReadUInt32()));
+        Assert.Equal((5u, ch, 1u, "MatCHS", (string?)null, 0u), (r.ReadUInt32(), H(), r.ReadUInt32(), S(), S(), r.ReadUInt32()));
+        Assert.Equal((5u, ah, 1u, "MatAHS", (string?)null, 0u), (r.ReadUInt32(), H(), r.ReadUInt32(), S(), S(), r.ReadUInt32()));
+        var hitGroup = $"HitGroup_{ch[..16]}";
+        Assert.Equal((11u, hitGroup, 0u, "MatAHS", "MatCHS", (string?)null), (r.ReadUInt32(), S(), r.ReadUInt32(), S(), S(), S()));
+        Assert.Equal((2u, local), (r.ReadUInt32(), H()));
+        Assert.Equal((7u, 6u, 1u, hitGroup), (r.ReadUInt32(), r.ReadUInt32(), r.ReadUInt32(), S()));   // the local root signature's subobject, 0-based
+        Assert.Equal(so.Length, r.BaseStream.Position);
+        var parsed = PsoDb.ParseStateObject(new PsoDb.Rec('R', so));
+        Assert.Equal([ch, ah], parsed.Libraries);
+        Assert.Equal([global, local], parsed.RootSignatures);
+
+        Assert.Null(RedRayTracing.Collection(ahLib, f, ahLib));   // no closest hit shader
+        Assert.Null(RedRayTracing.Collection(chLib, f, chLib));   // no any hit shader
+        Assert.NotNull(RedRayTracing.Collection(chLib, f with { AnyHit = null }, []));
+    }
+
+    /// <summary>A technique's ray tracing keys name its hit group: the closest hit library, then the any hit one; none when a
+    /// key isn't a library of the cache.</summary>
+    [Fact]
+    public void TechniquesNameTheirHitGroups()
+    {
+        var shaders = new Dictionary<string, ShaderInfo>
+        {
+            ["ch"] = new("ch", Stage.Library, "lib_6_5", 0, new(0, 0, 0, 0), [], [], []), ["ah"] = new("ah", Stage.Library, "lib_6_5", 0, new(0, 0, 0, 0), [], [], []),
+            ["vs"] = new("vs", Stage.Vertex, "vs_6_0", 0, new(0, 0, 0, 0), [], [], []),
+        };
+        var shaOf = new Dictionary<ulong, string> { [1] = "ch", [2] = "ah", [3] = "vs" };
+        Assert.Equal(["ch", "ah"], RedEngineReader.HitGroup([3, 0, 0, 0, 0, 0, 1, 2], shaOf, shaders));
+        Assert.Equal(["ch"], RedEngineReader.HitGroup([3, 0, 0, 0, 0, 0, 1, 0], shaOf, shaders));
+        Assert.Null(RedEngineReader.HitGroup([3, 0, 0, 0, 0, 0, 0, 0], shaOf, shaders));
+        Assert.Null(RedEngineReader.HitGroup([3, 0, 0, 0, 0, 0, 3, 2], shaOf, shaders));   // a VS where the closest hit library goes
+        Assert.Null(RedEngineReader.HitGroup([3, 0, 0, 0, 0, 0, 1, 9], shaOf, shaders));
     }
 }

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using SCSKiller.Core.App;
 using SCSKiller.Core;
 using SCSKiller.Core.Planning;
 using SCSKiller.Core.Unreal;
@@ -61,6 +62,70 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         }
         // a recording without state objects (ray tracing off as played): the no-recording rule, as without one
         Assert.Single(Items(new Planner().Build(Ff7.Game, Ue427, Index(), new Recording(db), Nvidia, Path.Combine(dir, "rec"), null, CancellationToken.None)));
+    }
+
+    /// <summary>The uncovered count is what neither a synthesized collection nor a recorded state object compiles, also when
+    /// the recording has ray tracing: on AMD (nothing synthesized) a recorded pipeline with one of the two libraries leaves
+    /// the other uncovered. The game then doesn't need a recording for its ray tracing: it has one.</summary>
+    [Fact]
+    public void UncoveredLibrariesAreThePlansGapWithARecordingToo()
+    {
+        var dir = Ff7.TempDir("rt-gap");
+        var db = Path.Combine(dir, "rec.db");
+        var (rs, blob) = RtCollections.Serialize(RtCollections.Ue426Global, RootSig.Ue426Samplers);
+        using (var f = File.Create(db))
+        {
+            WriteBlob(f, rs, blob);
+            var so = new MemoryStream();
+            var w = new BinaryWriter(so);
+            w.Write(3u); w.Write(2u);
+            w.Write(1u); w.Write(Convert.FromHexString(rs));
+            w.Write(5u); w.Write(Convert.FromHexString(Chs.Sha1)); w.Write(0u);
+            Write(f, 'R', so.ToArray());
+        }
+        var amd = new Planner().Build(Ff7.Game, Ue427, Index(), new Recording(db), Ff7.Amd, Path.Combine(dir, "amd"), null, CancellationToken.None);
+        Assert.Equal((2L, 1L, 1L), (amd.Stats.RtLibraries, amd.Stats.RtUncovered, amd.Stats.RtStateObjects)); // the bindless library: in no state object
+        Assert.False(ScsKiller.NeedsRtRecording(amd.Stats));
+        // what the plan counts as replayable comes out of Materialize: the library from the install, the recording without it
+        long Replayed(Plan plan, string db, string name)
+        {
+            var work = Path.Combine(dir, name);
+            new Planner().Materialize(plan, Ff7.Game, Ue427, new Shaders(new() { [Chs.Sha1] = HitLib }), new Recording(db), work, CancellationToken.None);
+            var main = Read(Path.Combine(work, "scskiller.db")).ToList();
+            Assert.All(main.Where(r => IsStateObject(r.Tag)).SelectMany(r => Core.Planning.Rehydrate.References([r])),
+                h => Assert.Contains(main.Concat(Read(Path.Combine(work, "scskiller_gen.db"))), r => r.Tag == 'B' && Hex(r.Payload.AsSpan(0, 20)) == h));
+            return main.Count(r => IsStateObject(r.Tag));
+        }
+        Assert.Equal(amd.Stats.RtStateObjects, Replayed(amd, db, "amd-work"));
+        var none = new Planner().Build(Ff7.Game, Ue427, Index(), null, Ff7.Amd, Path.Combine(dir, "none"), null, CancellationToken.None);
+        Assert.Equal((2L, 2L, 0L), (none.Stats.RtLibraries, none.Stats.RtUncovered, none.Stats.RtStateObjects));
+        Assert.True(ScsKiller.NeedsRtRecording(none.Stats));
+
+        // a base naming a library neither the recording nor the install has, and an addition on it with the indexed one: the
+        // warm replays neither, so neither covers anything
+        var shared = Path.Combine(dir, "shared.db");
+        var runtime = new string('7', 40);
+        byte[] So(string lib, string? on)
+        {
+            var so = new MemoryStream();
+            var w = new BinaryWriter(so);
+            if (on != null) w.Write(Convert.FromHexString(on));
+            w.Write(3u); w.Write(2u);
+            w.Write(1u); w.Write(Convert.FromHexString(rs));
+            w.Write(5u); w.Write(Convert.FromHexString(lib)); w.Write(0u);
+            return so.ToArray();
+        }
+        using (var f = File.Create(shared))
+        {
+            WriteBlob(f, rs, blob);
+            var b = new Rec('R', So(runtime, null));
+            Write(f, b.Tag, b.Payload);
+            Write(f, 'A', So(Chs.Sha1, b.Key));
+        }
+        var gone = new Planner().Build(Ff7.Game, Ue427, Index(), new Recording(shared), Ff7.Amd, Path.Combine(dir, "gone"), null, CancellationToken.None);
+        Assert.Equal((2L, 2L, 0L), (gone.Stats.RtLibraries, gone.Stats.RtUncovered, gone.Stats.RtStateObjects));
+        Assert.Equal(0, Replayed(gone, shared, "gone-work"));
+        Assert.True(ScsKiller.NeedsRtRecording(gone.Stats));
     }
 
     /// <summary>A DXIL container with just an SFI0 part of these feature flags.</summary>

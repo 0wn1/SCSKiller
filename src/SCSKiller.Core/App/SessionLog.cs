@@ -172,7 +172,7 @@ public static class SessionLog
                 long ms = f.Length > 1 && long.TryParse(f[1], CultureInfo.InvariantCulture, out var x) ? x : 0;
                 if (f[0] == "#session")
                 {
-                    if (cur != null) yield return cur;
+                    if (cur != null) yield return Sorted(cur);
                     cur = new CsvLaunch { Start = ms, Exe = f.Length > 2 ? string.Join(',', f[2..]).Trim() : "" };   // the name may hold commas
                 }
                 else if (f[0] == "#clock" && cur is { Start: not null, Creates.Count: 0 } && double.TryParse(f.Length > 1 ? f[1] : "", CultureInfo.InvariantCulture, out var st))
@@ -186,14 +186,22 @@ public static class SessionLog
             }
             if (f.Length < 5 || f[1].Length != 1 || !double.TryParse(f[0], CultureInfo.InvariantCulture, out var t)
                 || !double.TryParse(f[4], CultureInfo.InvariantCulture, out var ms2)) continue;
-            if (cur == null || cur.End != null || cur.Creates.Count > 0 && t < cur.Creates[^1].T)
+            // t_ms is taken as the create returns, before the row's lock: concurrent creates can land a little out of order
+            // (The Witcher 3: 68718.7 after 68718.8), so only a launch without a #session (an older proxy) splits on it
+            if (cur == null || cur.End != null || cur.Start == null && cur.Creates.Count > 0 && t < cur.Creates[^1].T)
             {
-                if (cur != null) yield return cur;
+                if (cur != null) yield return Sorted(cur);
                 cur = new CsvLaunch();
             }
             cur.Creates.Add((t, f[1][0], ms2, f.Length > 5 ? f[5] : null));
         }
-        if (cur != null) yield return cur;
+        if (cur != null) yield return Sorted(cur);
+
+        static CsvLaunch Sorted(CsvLaunch l)
+        {
+            l.Creates.Sort((a, b) => a.T.CompareTo(b.T));
+            return l;
+        }
     }
 
     /// <summary>Writes the keys of the recording's PSOs with a shader that traces rays inline (SFI0's RayQuery flag), one

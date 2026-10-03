@@ -37,6 +37,7 @@ public partial class App : Application
 
     public App() => InitializeComponent();
 
+    public static bool Quitting => quitting;
     /// <summary>Closing the window hides it to the notification area (the tray's Quit really quits).</summary>
     public static bool HidesOnClose => tray is { Added: true };   // also while quitting waits: closing must not end the process
 
@@ -122,6 +123,7 @@ public partial class App : Application
             if (Core is ScsKiller gpu) gpu.GpuChanged += () => Main.DispatcherQueue.TryEnqueue(OnGpuChanged);
             ApplyStartWithWindows();
             Updater.Start();
+            if (activation.Kind == ExtendedActivationKind.Launch) _ = Updater.ApplyAtStartAsync(args[1..]);
             if (Core is ScsKiller k && !driverUpdated)
             {
                 var check = new Coalesced(Main.DispatcherQueue, () => NotifyNewShaders(k.Store));

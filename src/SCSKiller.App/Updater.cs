@@ -9,7 +9,7 @@ namespace SCSKiller.App;
 
 /// <summary>Velopack in the app (docs/patreon-and-updates.md §4.5). Checks at start and every 6 h and downloads in the
 /// background (nothing touches the install); applies only while no queue item runs anywhere (<see cref="Busy"/>): at
-/// exit, or on "Restart to update". A build Velopack didn't install (dev, the zip) never checks.</summary>
+/// exit, at the next start, or on "Restart to update". A build Velopack didn't install (dev, the zip) never checks.</summary>
 public static class Updater
 {
     static readonly TimeSpan Every = TimeSpan.FromHours(6);
@@ -79,9 +79,9 @@ public static class Updater
     /// <summary>The one way an update is applied (Quit, "Restart to update"), in order: the check's lock (a check may be
     /// replacing the download; <paramref name="wait"/> at most); the ready download read again; its file whole on disk,
     /// else deleted so the next check downloads it again; every other package deleted, so Update.exe has nothing else to
-    /// fall back on; then, last, no compile running anywhere and the channel still the chosen one; then
-    /// <paramref name="apply"/>.</summary>
-    static async Task<bool> ApplyAsync(TimeSpan wait, Action<Velo, VelopackAsset> apply)
+    /// fall back on; then, last, no compile running anywhere, the channel still the chosen one and <paramref name="still"/>;
+    /// then <paramref name="apply"/>.</summary>
+    static async Task<bool> ApplyAsync(TimeSpan wait, Action<Velo, VelopackAsset> apply, Func<bool>? still = null)
     {
         if (!await One.WaitAsync(wait)) return false;
         try
@@ -100,6 +100,7 @@ public static class Updater
             Busy.MarkApplying(DataDir, DateTimeOffset.UtcNow);
             if (Busy.IsHeld()) return Undo("A compile started meanwhile. The update installs when SCSKiller quits after it has finished.");
             if (Usable(ready) is null) return Undo("The update channel changed meanwhile. Restart to update again once it is ready.");
+            if (still?.Invoke() == false) return Undo(null);
             apply(m, r);   // its preparation too (the resume file): a failure anywhere is undone below
             return true;
         }
@@ -110,14 +111,14 @@ public static class Updater
             Changed?.Invoke();
         }
 
-        static bool Fail(string why)
+        static bool Fail(string? why)
         {
             Problem = why;
             return false;
         }
 
         // this process goes on: no marker stops the compiles, no resume file replays a queue that is still here
-        static bool Undo(string why)
+        static bool Undo(string? why)
         {
             try { Busy.ClearApplying(DataDir); }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }   // it expires (Busy.ApplyingFor)
@@ -136,6 +137,23 @@ public static class Updater
     {
         if (!Installed) return;
         timer = new Timer(_ => _ = CheckAsync(), null, TimeSpan.FromSeconds(30), Every);   // not in the start's busy first seconds
+    }
+
+    /// <summary>App start (a launch, not a toast: its activation wouldn't survive the restart): an update downloaded in an
+    /// earlier run (the PC shut down with the app still open) installs now, once the chosen channel's feed confirms it
+    /// (nothing is downloaded), and the app restarts into it with <paramref name="args"/>. Not after a handover whose new
+    /// version never started: a failed apply must not restart the app in a loop. Once the user has queued a game or
+    /// quits, the update waits for a quit as before.</summary>
+    public static async Task ApplyAtStartAsync(string[] args)
+    {
+        if (!Installed || Busy.Marked(DataDir)) return;
+        await CheckAsync(download: false);
+        if (Usable(ready) is not null && Untouched())
+            await ApplyAsync(TimeSpan.Zero, (m, r) => m.ApplyUpdatesAndRestart(r, args), Untouched);   // exits this process
+        if (Usable(ready) is null) await CheckAsync();   // the timer's first check skips while this one runs
+
+        // on the UI thread, like Quit and the queue's changes: nothing slips in between this and the handover
+        static bool Untouched() => !App.Quitting && !App.Core.Queue.Any(q => q.Stage is not (Core.QueueStage.Done or Core.QueueStage.Failed) && !q.PlanCheck);
     }
 
     /// <summary>Checks the effective channel's signed feed and downloads a newer version. <paramref name="backToStable"/>:
@@ -162,7 +180,9 @@ public static class Updater
             var m = Manager(channel, backToStable);
             var found = await m.CheckForUpdatesAsync();
             failures = 0;
-            if (found is { } info && (download || await m.OnDisk(info.TargetFullRelease)))
+            // not the installed version again: the internal channel lists stable's packages, and Velopack offers the same
+            // version while the channels differ
+            if (found is { } info && info.TargetFullRelease.Version != m.CurrentVersion && (download || await m.OnDisk(info.TargetFullRelease)))
             {
                 await m.DownloadUpdatesAsync(info);
                 if (channel == Chosen()) ready = new(m, info.TargetFullRelease, channel);   // the choice may have changed meanwhile

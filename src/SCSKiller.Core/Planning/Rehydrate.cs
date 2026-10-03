@@ -40,6 +40,7 @@ public static class Rehydrate
                 case '2': refs.Add(Hex(r.Payload.AsSpan(0, 20))); refs.Add(Hex(r.Payload.AsSpan(20, 20))); break;
                 case 'R' or 'A': { var so = ParseStateObject(r); refs.UnionWith(so.Libraries); refs.UnionWith(so.RootSignatures); break; } // not Depends: records, not blobs
                 case 'Y': { var y = RtCollections.ParseItem(r.Payload); refs.UnionWith([y.Library, y.Global, y.LocalRayGen, y.LocalOther]); break; }
+                case 'H': { var h = RedEngine.RedRayTracing.ParseItem(r.Payload); refs.UnionWith([h.ClosestHit, h.AnyHit ?? Zero, h.Shape.Global, h.Local]); break; }
             }
         refs.Remove(Zero);
         return refs;

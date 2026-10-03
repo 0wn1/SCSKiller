@@ -150,11 +150,12 @@ public sealed record PlanStats(long Recorded, long Generated, long SynthesizedTe
                                   // collection may be created once per payload, RtCollections.Payloads)
     long Uncovered = 0,           // stage sets left out: no root signature SCSKiller can build covers their shaders (rs_uncovered)
     long RtLibraries = 0,         // DXIL libraries (ray tracing shaders) in the game's index on the plan's platform
-    long RtUncovered = 0,         // of those, the ones this plan can't compile: no collection synthesized for them and no recorded
-                                  // ray tracing state object (0 when the recording has some, or has RayQuery shaders and none: inline ray tracing)
+    long RtUncovered = 0,         // of those, the ones this plan can't compile: in no synthesized collection and no recorded ray
+                                  // tracing state object (0 when the recording has RayQuery shaders and no state object: inline ray tracing)
     long StageSets = 0,           // distinct stage sets the planner found in the game files (0 = a plan from before this was counted)
     long LeftOut = 0,             // of those, the ones not in the plan for any reason (no root signature, no template, Uncovered)
-    long MiddlewareSharedItems = 0); // of MiddlewareItems, the ones only a shared pack (downloaded from the community database) had
+    long MiddlewareSharedItems = 0, // of MiddlewareItems, the ones only a shared pack (downloaded from the community database) had
+    long RtStateObjects = 0);     // ray tracing state objects of the recording the plan replays (0 = none recorded, or a plan from before this was counted)
 
 /// <summary>Hash-only plan (no game bytes), persisted at <see cref="FilePath"/> in the planner's format.</summary>
 public sealed record Plan(string GameId, string IndexContentHash, string Platform, string VendorProfile, PlanStats Stats, string FilePath);

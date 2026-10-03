@@ -710,15 +710,38 @@ static const NvExt* nvext_of(char tag, const std::string& payload) {
 
 // Every scope is replayed on the creating thread: NVIDIA's key doesn't hold the scope (selftest nvext), and a device-wide
 // slot would reach the other workers' creates.
+static int nv_slot(uint32_t slot, uint32_t space) { return g_nv_set_thread ? g_nv_set_thread(g_warm_dev, slot, space) : 0; }
+static int nv_opts(uint32_t opts) {
+    uint32_t o[2] = {8 | 1 << 16, opts};
+    return g_nv_set_opts && g_warm_dev5 ? g_nv_set_opts(g_warm_dev5, o) : 0;
+}
+// what: 1 the slot, 2 the options. Returns what is still set.
+static int nv_reset(int what) {
+    if (what & 1 && !nv_slot(~0u, 0)) what &= ~1;
+    if (what & 2 && !nv_opts(0)) what &= ~2;
+    return what;
+}
+static thread_local int t_nv_stale;  // left set on this thread by a failed reset: every create here fails until a reset succeeds
+
+// why: set when nothing may be created. A create without its own state would fill another cache key.
 struct NvScope {
-    const NvExt* x;
-    explicit NvScope(const NvExt* e) : x(e) { set(true); }
-    ~NvScope() { set(false); }
-    void set(bool on) {
+    const char* why = nullptr;
+    int set = 0;
+    explicit NvScope(const NvExt* x) {
+        if (t_nv_stale && (t_nv_stale = nv_reset(t_nv_stale))) {
+            why = "an NVAPI state reset failed on its thread";
+            return;
+        }
         if (!x) return;
-        if (x->slot != ~0u && g_nv_set_thread) g_nv_set_thread(g_warm_dev, on ? x->slot : ~0u, on ? x->space : 0);
-        uint32_t o[2] = {8 | 1 << 16, on ? x->opts : 0};
-        if (x->opts && g_nv_set_opts && g_warm_dev5) g_nv_set_opts(g_warm_dev5, o);
+        if (x->slot != ~0u && g_nv_set_thread && (set |= 1, nv_slot(x->slot, x->space))) why = "its NVAPI state could not be set";
+        else if (x->opts && g_nv_set_opts && g_warm_dev5 && (set |= 2, nv_opts(x->opts))) why = "its NVAPI state could not be set";
+    }
+    ~NvScope() {
+        if (int left = set ? nv_reset(set) : 0) {
+            t_nv_stale |= left;
+            static std::atomic<bool> logged;
+            if (!logged.exchange(true)) logf("warm: an NVAPI state reset failed: that thread creates nothing more until one succeeds");
+        }
     }
 };
 
@@ -756,6 +779,7 @@ static HRESULT build(const Rec& rec, Reader& r, ID3D12PipelineState** pso, const
         if (g_roundtrip == 2) return same ? S_OK : E_FAIL;  // "only": compare, create nothing
     }
     NvScope scope(nv);
+    if (scope.why) return r.fail(scope.why), E_INVALIDARG;
     if (rec.tag == 'G') return o_gfx(g_warm_dev, &g, IID_PPV_ARGS(pso));
     if (rec.tag == 'C') return o_cs(g_warm_dev, &c, IID_PPV_ARGS(pso));
     return g_warm_dev2 ? o_stream(g_warm_dev2, &sd, IID_PPV_ARGS(pso)) : E_NOINTERFACE;
@@ -1183,7 +1207,8 @@ static void so_create(size_t j, SoSlot& s) {
         std::shared_lock gate(g_rt_gate);  // taken out here: so_call catches any fault, so this always unlocks
         if (g_rt_sem) WaitForSingleObject(g_rt_sem, INFINITE);
         NvScope nv(nvext_of(rec.tag, rec.payload));
-        s.hr = so_call(rec, &desc, base, &obj, j);
+        if (!nv.why) s.hr = so_call(rec, &desc, base, &obj, j);
+        else s.hr = E_INVALIDARG, s.why = nv.why;
         if (g_rt_sem) ReleaseSemaphore(g_rt_sem, 1, nullptr);
     }
     if (SUCCEEDED(s.hr) && obj) {

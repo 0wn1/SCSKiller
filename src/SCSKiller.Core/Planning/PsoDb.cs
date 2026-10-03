@@ -11,7 +11,7 @@ namespace SCSKiller.Core.Planning;
 /// root sig[20], u32 n, n x (u32 stage, sha1[20]), then u32 0xFFFFFFFF (keep the template's input layout) or a canonical
 /// input layout. '1' D3D11 item = u32 stage (1 VS, 2 PS, 3 DS, 4 HS, 5 GS, 6 CS) + sha1[20] of a 'B' blob in the same db:
 /// the warmer creates that shader and draws/dispatches it once. '2' D3D11 tessellation pair = HS sha1[20] + DS sha1[20]: the warmer draws them together,
-/// behind a generated VS. 'Y' (plan only) = a ray tracing collection to synthesize at materialize (<see cref="RtCollections.Item"/>).
+/// behind a generated VS. 'Y' (plan only) = a ray tracing collection to synthesize at materialize (<see cref="RtCollections.Item"/>); 'H' (plan only) = a REDengine 3 hit group's (<see cref="RedEngine.RedRayTracing.Item"/>).
 /// A stream output declaration: <see cref="SoDecl"/>. 'R' / 'A' = ray tracing state objects
 /// (<see cref="ParseStateObject"/>), replayed exactly as recorded. 'N' = the NVAPI state another record was created with
 /// (<see cref="NvState"/>). Hashes are lowercase hex here; all-zero = none.</summary>

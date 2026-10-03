@@ -46,10 +46,15 @@ public static class Recordings
     /// order, as a compact recording at <paramref name="store"/>. A shader blob that a record names and <paramref name="shipped"/>
     /// has is left out: the install gives it back (<see cref="Rehydrate"/>); root signatures and every other blob stay. Returns
     /// the keys of the pipeline and state object records it added.</summary>
-    public static HashSet<string> Merge(string store, string? inbox, Func<string, bool>? shipped)
+    public static HashSet<string> Merge(string store, string? inbox, Func<string, bool>? shipped) => Merge(store, inbox, shipped, out _);
+
+    /// <param name="nvAdded">an 'N' record the store lacked was added: the plan may take another NVAPI state for the PSOs it
+    /// synthesizes (<see cref="PlanBuilder.RasterNv"/>)</param>
+    public static HashSet<string> Merge(string store, string? inbox, Func<string, bool>? shipped, out bool nvAdded)
     {
         var hasStore = File.Exists(store);
         var hasInbox = inbox != null && File.Exists(inbox);
+        var nv = false;
         IEnumerable<Rec> Sources() => (hasStore ? Read(store) : []).Concat(hasInbox ? Read(inbox!) : []);
         var named = shipped == null ? [] : Rehydrate.References(Sources().Where(r => r.Tag != 'B'));
         var seen = new HashSet<string>();
@@ -61,7 +66,8 @@ public static class Recordings
                 foreach (var r in Read(inbox!))
                     if (seen.Add(Id(r)))
                     {
-                        if (r.Tag is not ('B' or 'N')) added.Add(r.Key);
+                        if (r.Tag == 'N') nv = true;
+                        else if (r.Tag != 'B') added.Add(r.Key);
                         yield return r;
                     }
         }
@@ -69,6 +75,7 @@ public static class Recordings
                                && !Dxbc.IsRootSignatureOnly(r.Payload.AsSpan(20));
         WriteCompact(store, Union().Where(r => !Dropped(r)));
         KeyFiles.Forget(store);
+        nvAdded = nv;
         return added;
     }
 

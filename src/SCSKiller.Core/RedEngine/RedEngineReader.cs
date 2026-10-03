@@ -18,6 +18,10 @@ namespace SCSKiller.Core.RedEngine;
 public sealed class RedEngineReader : IEngineReader
 {
     public const string Family = "REDengine 3", Version = "DX12";
+
+    /// <summary>The library name of a technique's ray tracing hit group map: its closest hit library, then its any hit library
+    /// when it has one (<see cref="RedRayTracing"/>).</summary>
+    public const string HitGroups = "hitgroups";
     const string Materials = @"content\content0\shaderdx12_0.cache", Static = @"content\content0\staticshaderDx12_0.cache";
 
     /// <summary>Techniques whose shaders Detect inflates, at most, to find one usable pipeline.</summary>
@@ -110,16 +114,19 @@ public sealed class RedEngineReader : IEngineReader
                 seen.Add(h);
                 maps.Add(new ShaderMap(h, Materials, shas.Select(PlatformOf).FirstOrDefault(p => p != CarvedReader.Platform, CarvedReader.Platform), shas, IsPipeline: true));
             }
+            var groups = new HashSet<string>();
             for (var i = 0; i < m.Techniques.Count; i++)
             {
                 if (i % 4096 == 0) ct.ThrowIfCancellationRequested();
                 var t = m.Techniques[i];
+                if (HitGroup(t, shaOf, shaders) is { } hg && groups.Count < RedShaderCache.MaxPipelines && groups.Add(string.Join(',', hg)))
+                    maps.Add(new ShaderMap(CarvedReader.Sha1Hex($"{HitGroups}|{string.Join(',', hg)}"), HitGroups, CarvedReader.Platform, hg));
                 if (Graphics(t, shaOf, shaders) is not { } g) { rejected++; continue; }
                 if (g.Count > 0) Pipeline(g);
                 if (t[5] != 0) Pipeline([shaOf[t[5]]]); // a technique's compute pass is a pipeline of its own
                 pipelines++;
             }
-            // DXIL libraries are in no technique: one pool, for ray tracing collections
+            // DXIL libraries outside the hit groups: one pool
             var libs = shaOf.Values.Distinct().Where(h => shaders.TryGetValue(h, out var s) && s.Stage == Stage.Library).ToList();
             libraries = libs.Count;
             if (libs.Count > 0) maps.Add(new ShaderMap(CarvedReader.Sha1Hex($"{Materials}|libraries"), Materials, CarvedReader.Platform, libs));
@@ -137,6 +144,16 @@ public sealed class RedEngineReader : IEngineReader
 
     /// <summary>A technique's graphics stages (slots VS, PS, GS, HS, DS) as SHA-1s, empty when it has none; null when it
     /// isn't a pipeline the engine's root signatures are confirmed for, or a key isn't a shader of its slot's stage.</summary>
+    /// <summary>A technique's ray tracing hit group: its closest hit library, then its any hit library when it names one;
+    /// null when it names none, or a key isn't a library of the cache.</summary>
+    internal static List<string>? HitGroup(ulong[] t, IReadOnlyDictionary<ulong, string> shaOf, IReadOnlyDictionary<string, ShaderInfo> shaders)
+    {
+        bool Lib(ulong k, out string sha) => shaOf.TryGetValue(k, out sha!) && shaders.TryGetValue(sha, out var s) && s.Stage == Stage.Library;
+        if (t.Length < 8 || t[6] == 0 || !Lib(t[6], out var ch)) return null;
+        if (t[7] == 0) return [ch];
+        return Lib(t[7], out var ah) ? [ch, ah] : null;
+    }
+
     internal static List<string>? Graphics(ulong[] t, IReadOnlyDictionary<ulong, string> shaOf, IReadOnlyDictionary<string, ShaderInfo> shaders)
     {
         Stage[] slots = [Stage.Vertex, Stage.Pixel, Stage.Geometry, Stage.Hull, Stage.Domain, Stage.Compute];

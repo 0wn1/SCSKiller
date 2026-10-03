@@ -50,7 +50,7 @@ public class FrameLogTests(ITestOutputHelper output) : IDisposable
         for (int i = 0; i < 120; i++) csv.Add($"{24100 + i:0.0},S,1,1,1.000,{i + 1000:x40},0.010,9,0");   // a load
         for (int i = 0; i < 110; i++) csv.Add($"{25100 + i:0.0},S,1,1,150.000,{i + 3000:x40},0.010,9,0");   // a load in play that compiles
         for (int i = 0; i < 150; i++) csv.Add($"{7100 + i * 0.5:0.0},S,1,1,1.000,{i + 2000:x40},0.010,9,0");   // a second startup burst
-        // the recorder writes rows in time order (one lock around the clock and the write)
+        // rows in time order here; out-of-order rows: Rows_slightly_out_of_order_stay_in_their_launch
         File.WriteAllLines(Path.Combine(_dir, "scskiller_creates.csv"),
             [csv[0], .. csv.Skip(1).OrderBy(r => double.Parse(r.Split(',')[0], System.Globalization.CultureInfo.InvariantCulture)), "#session,1000000000,Other.exe"]);
 
@@ -445,6 +445,28 @@ public class FrameLogTests(ITestOutputHelper output) : IDisposable
         var r = FrameLog.Read(bin, csv)!;
         Assert.Equal(TimeSpan.FromSeconds(90), r.Duration);
         Assert.Equal(r.Duration, SessionLog.Read(csv, frames: r).Last!.Duration);
+    }
+
+    /// <summary>The recorder stamps a row when its create returns, before the row's lock, so concurrent creates land a
+    /// little out of order (The Witcher 3's csv: 68718.7 after 68718.8). A launch with a #session stays one launch: its
+    /// frames still match it and every create counts.</summary>
+    [Fact]
+    public void Rows_slightly_out_of_order_stay_in_their_launch()
+    {
+        var csv = Path.Combine(_dir, "scskiller_creates.csv");
+        File.WriteAllLines(csv, ["#session,1000000,Game.exe", "#clock,0.0", "10.0,S,1,1,0.500,aa", "60000.2,S,0,0,30.000,bb", "60000.1,S,0,0,40.000,cc",
+            "60000.3,S,1,1,0.500,dd", "#end,1090000,90000.0"]);
+        var bin = Path.Combine(_dir, FrameLog.FileName);
+        File.WriteAllBytes(bin, Launch(1_000_000, 0, Every10Ms(0, 80_000)));
+        var r = FrameLog.Read(bin, csv, "game.exe")!;
+        var last = SessionLog.Read(csv, out var framesMatch, "game.exe", frames: r).Last!;
+        Assert.True(framesMatch);
+        Assert.Equal((4L, 2L), (last.Requests, last.Compiles));
+        Assert.Equal(TimeSpan.FromSeconds(90), last.Duration);
+        File.AppendAllLines(csv, ["#session,2000000,Other.exe"]);
+        Assert.Equal([10.0, 60000.1, 60000.2, 60000.3], SessionLog.Launches(csv).First().Creates.Select(c => c.T));
+        File.WriteAllLines(csv, ["10.0,S,1,1,0.500", "20.0,S,1,1,0.500", "5.0,S,1,1,0.500"]); // an older proxy's restart, no markers: two launches
+        Assert.Equal(1L, SessionLog.Read(csv).Last!.Requests);
     }
 
     /// <summary>SILENT HILL: Townfall's recorder files, read only: the last launch has frames and at least one hitch.</summary>

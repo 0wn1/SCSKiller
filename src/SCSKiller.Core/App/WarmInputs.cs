@@ -48,8 +48,9 @@ public static class WarmInputs
             seen.Add(key);
             inputs.Add(missing.All(Has) ? key : key + "!");
         }
-        foreach (var r in body.Where(r => r.Tag != 'B').Select(r => r.Tag == 'M' ? MiddlewarePacks.Unwrap(r).Entry : r).Concat(packEntries))
-            if (seen.Add(r.Key)) inputs.Add(Missing(r, Has).Count == 0 ? r.Key : r.Key + "!");
+        foreach (var (key, r) in Planner.PlanInputs(body).Select(x => x.Rec.Tag == 'M' ? (MiddlewarePacks.Unwrap(x.Rec).Entry.Key, MiddlewarePacks.Unwrap(x.Rec).Entry) : x)
+                     .Concat(packEntries.Select(r => (r.Key, r))))
+            if (seen.Add(key)) inputs.Add(Missing(r, Has).Count == 0 ? key : key + "!");
         return inputs;
     }
 

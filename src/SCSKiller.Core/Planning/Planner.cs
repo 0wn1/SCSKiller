@@ -49,7 +49,7 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
     /// <summary>Bump when the plan for the same game and inputs changes (new pipeline kinds, root-signature rules, D3D11):
     /// the app then rebuilds plans (warmed games' when idle, ScsKiller.CheckPlans) and offers a re-warm only where the new
     /// plan has records the warm didn't replay.</summary>
-    public const int Version = 22;
+    public const int Version = 24;
 
     /// <summary>The vendor's D3D11 driver cache persists across processes, is keyed on the exe file name and caches per
     /// shader, whatever the state or the other stages (measured on NVIDIA, proxy/probe11.cpp): a staged warm
@@ -142,6 +142,15 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
         catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException or System.Text.Json.JsonException) { return []; }
     }
 
+    /// <summary>What a plan compiles, one per pipeline: each record but root signatures and NVAPI states, keyed by its 'N'
+    /// record's key when it has one (the NVAPI state is in NVIDIA's cache key: the same PSO without it is another compile).</summary>
+    public static IEnumerable<(string Key, Rec Rec)> PlanInputs(IReadOnlyList<Rec> body)
+    {
+        var nv = new Dictionary<string, string>();
+        foreach (var r in body.Where(r => r.Tag == 'N')) nv[NvState.Parse(r).Target] = r.Key;
+        return body.Where(r => r.Tag is not ('B' or 'N')).Select(r => (nv.GetValueOrDefault(r.Key, r.Key), r));
+    }
+
     public void Materialize(Plan plan, Game game, EngineInfo engine, IEngineReader reader, Recording? recording, string workDir, CancellationToken ct)
     {
         Directory.CreateDirectory(workDir);
@@ -154,12 +163,14 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
         var body = PlanFile.Read(plan.FilePath).Records.ToList();
         var templates = body.Where(r => r.Tag is 'G' or 'C' or 'S' && !inMain.Contains(r.Key)).ToList();
         var rt = body.Where(r => r.Tag == 'Y').Select(r => RtCollections.ParseItem(r.Payload)).ToList(); // ray tracing collections: need their library's exports
-        var rtLibs = rt.Select(y => y.Library).ToHashSet();
+        var hitGroups = body.Where(r => r.Tag == 'H').Select(r => RedEngine.RedRayTracing.ParseItem(r.Payload)).ToList(); // REDengine 3's: need both libraries' exports
+        var rtLibs = rt.Select(y => y.Library).Concat(hitGroups.SelectMany(h => new[] { h.ClosestHit, h.AnyHit }).OfType<string>()).ToHashSet();
         var rtBytes = new Dictionary<string, byte[]>();
         if (rtLibs.Count > 0) foreach (var r in Read(mainDb)) if (r.Tag == 'B' && rtLibs.Contains(Hex(r.Payload.AsSpan(0, 20)))) rtBytes[Hex(r.Payload.AsSpan(0, 20))] = r.Payload[20..];
         var shaders = templates.Select(Parse).SelectMany(t => t.Stages.Values.Append(t.Rs))
             .Concat(body.Where(r => r.Tag == 'P').Select(r => ParseItem(r.Payload)).SelectMany(i => i.Stages.Values.Append(i.Rs)))
-            .Concat(rt.Select(y => y.Library)).ToHashSet();
+            .Concat(rtLibs)
+            .Concat(Rehydrate.References(Read(mainDb).Where(r => IsStateObject(r.Tag)))).ToHashSet();   // the recorded state objects' libraries: a recording may leave out the install's
         shaders.ExceptWith(inMain);
         shaders.ExceptWith(body.Where(r => r.Tag == 'B').Select(r => Hex(r.Payload.AsSpan(0, 20)))); // root signatures the plan doesn't carry are the game's own (RTS0): pulled like shaders
         shaders.UnionWith(Rehydrate.References(body.Where(r => r.Tag is '1' or '2'))); // a D3D11 item's blobs are in gen.db itself
@@ -214,6 +225,8 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
         skipped += main.Count - flags.Count - keptMain.Count + templates.Count - keptTemplates.Count + items.Count - keptItems.Count;
         foreach (var r in keptTemplates) Write(gen, r.Tag, r.Payload);
         foreach (var r in keptItems) Write(gen, r.Tag, r.Payload);
+        var keptPsos = keptTemplates.Concat(keptItems).Select(r => r.Key).ToHashSet();
+        foreach (var r in body.Where(r => r.Tag == 'N' && keptPsos.Contains(NvState.Parse(r).Target))) Write(gen, r.Tag, r.Payload); // the NVAPI state they're created with
         // a ray tracing collection per library ('Y'), its exports read from the library: an 'R' record the warm creates like a
         // recorded one; a library not in this install, or without a ray tracing entry point, is skipped. With rule payload 0 a
         // ray generation library gets one per payload the other libraries have (RtCollections.Payloads), the recorded ones'
@@ -233,6 +246,16 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
                         n++;
                     }
             if (n == 0) skipped++;
+        }
+        foreach (var h in hitGroups)
+        {
+            if (rtBytes.TryGetValue(h.ClosestHit, out var ch) && (h.AnyHit == null || rtBytes.ContainsKey(h.AnyHit))
+                && RedEngine.RedRayTracing.Collection(ch, h, h.AnyHit != null ? rtBytes[h.AnyHit] : []) is { } so)
+            {
+                Write(gen, 'R', so);
+                if (h.Nv is { } nv) { var r = new NvState(new Rec('R', so).Key, nv.Slot, nv.Space, 2, nv.Options).ToRec(); Write(gen, r.Tag, r.Payload); }
+            }
+            else skipped++;
         }
         File.WriteAllText(Path.Combine(workDir, SkippedFile), $"{skipped} {needsRecording}");
         if (skipped > 0) Log?.Report($"{skipped} PSO{(skipped == 1 ? "" : "s")} skipped: a shader not in this install (not replayed, not counted as failed)"
@@ -349,7 +372,7 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
 }
 
 /// <summary>plan.bin: "SCSKPLAN", u32 version, u32 header length, header (the <see cref="Plan"/> as JSON), then a
-/// Brotli-compressed body of proxy db records: 'B' root signatures, 'G'/'C'/'S' templates, 'P' items, '1' D3D11 shaders, '2' D3D11 HS+DS pairs, 'Y' ray tracing collections (<see cref="RtCollections.Item"/>), 'M' middleware pack entries (<see cref="MiddlewarePacks.Wrap"/>). Hash-only: shader
+/// Brotli-compressed body of proxy db records: 'B' root signatures, 'G'/'C'/'S' templates, 'P' items, '1' D3D11 shaders, '2' D3D11 HS+DS pairs, 'Y' ray tracing collections (<see cref="RtCollections.Item"/>), 'H' REDengine 3 hit group collections (<see cref="RedEngine.RedRayTracing.Item"/>), 'N' NVAPI states, 'M' middleware pack entries (<see cref="MiddlewarePacks.Wrap"/>). Hash-only: shader
 /// bytes are pulled from the game at materialize time.</summary>
 public static class PlanFile
 {

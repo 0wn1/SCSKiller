@@ -221,6 +221,29 @@ sealed class PlanBuilder
         void Add(string shape, (string, string, bool) t) { if (!templates.TryGetValue(shape, out var l)) templates[shape] = l = []; l.Add(t); }
     }
 
+    RtCollections.Nv? rasterNv;   // the NVAPI state every synthesized PSO is created with (an 'N' record each); null = none
+
+    /// <summary>The NVAPI state a game creates its PSOs with: NVIDIA keys a compile on the shader-extension slot (selftest
+    /// nvext), so a PSO warmed without the game's slot is a miss. From a recording: the slot and space at least 99% of its
+    /// raster records ('G' / 'C' / 'S') share, with their most common creation options (The Witcher 3: 841 of 843 at slot
+    /// 12 space 1, options 0 on 789 and 17 on 52). Otherwise, for REDengine 3, its slot 12 space 1, as its recording has it:
+    /// also when the recording has none (made on AMD, where the recorder captures no NVAPI state). NVIDIA only: AMD's
+    /// runtime has no NVAPI state.</summary>
+    internal static RtCollections.Nv? RasterNv(VendorCaps caps, RootSig.Rule rule, IReadOnlyCollection<Rec> recs, IEnumerable<Rec> nvRecs) =>
+        !caps.Profile.StartsWith("nvidia") ? null : LearnedRasterNv(recs, nvRecs) ?? (rule == RootSig.Rule.Red3 ? new RtCollections.Nv(12, 1, 0) : null);
+
+    /// <summary>The recording's part of <see cref="RasterNv"/>: the slot and space at least 99% of the raster records' final
+    /// states share (a record's last 'N' is what the warm applies), with their most common options; null otherwise.</summary>
+    internal static RtCollections.Nv? LearnedRasterNv(IEnumerable<Rec> recs, IEnumerable<Rec> nvRecs)
+    {
+        var keys = recs.Where(r => r.Tag is 'G' or 'C' or 'S').Select(r => r.Key).ToHashSet();
+        var states = nvRecs.Where(r => r.Tag == 'N').Select(NvState.Parse).Where(n => keys.Contains(n.Target))
+            .GroupBy(n => n.Target).Select(g => g.Last()).Where(n => n.Slot != uint.MaxValue).ToList();
+        var top = states.GroupBy(n => (n.Slot, n.Space)).MaxBy(g => g.Count());
+        return top != null && top.Count() >= 0.99 * keys.Count
+            ? new RtCollections.Nv(top.Key.Slot, top.Key.Space, top.GroupBy(n => n.Options).MaxBy(g => g.Count())!.Key) : null;
+    }
+
     void Decide()
     {
         var fromRecording = builtN > 0;
@@ -232,6 +255,8 @@ sealed class PlanBuilder
         plat = !dx12 ? "" : plats.Count > 0 ? plats.MaxBy(p => p.Value).Key // "": no map matches, no PSOs
             : new[] { "PCD3D_SM6", "PCD3D_SM5" }.FirstOrDefault(index.Platforms.Contains) ?? index.Platforms.FirstOrDefault() ?? "";
         embeddedRs = bc.Values.Count(s => s.RootSignature != null);
+        rasterNv = RasterNv(caps, rule, recs, nvRecs);
+        if (rasterNv is { } nvs) log?.Report($"NVAPI: synthesized PSOs get shader-extension slot {nvs.Slot} space {nvs.Space} (options {nvs.Options})");
         if (dx12) log?.Report($"recorded: {recs.Count} PSOs{(stateObjects.Count > 0 ? $" + {stateObjects.Count} ray tracing state objects (replayed as recorded)" : "")}, platform {plat}; root sigs rebuilt from shader counts: {builtOk}/{builtN} exact -> "
             + (build ? "building" : "learned lookup") + (maxSrvs > 0 ? $" (SRV tables of {maxSrvs}, not Unreal {engine.Version}'s {RootSig.MaxSrvs(rule)}: {(maxSrvs == 128 ? "the bindless fork's" : "its shaders bind more")})" : "")
             + (embeddedRs > 0 ? $"; {embeddedRs} shaders carry their own" : "") + (synth ? ", synthesized templates allowed" : ""));
@@ -650,6 +675,7 @@ sealed class PlanBuilder
     {
         var libs = maps.Where(m => m.Platform == plat).SelectMany(m => m.Shas).Distinct().Where(h => bc.TryGetValue(h, out var s) && s.Stage == Stage.Library).ToList();
         if (libs.Count == 0) return;
+        if (this.rule == RootSig.Rule.Red3) { Red3HitGroups(libs.Count); return; }
         var learned = stateObjects.Select(RtCollections.Read).OfType<RtCollections.Recorded>().ToList();
         RtCollections.Rule rule;
         string? guessedLocal = null; // a guessed rule's one local root signature (else UE's, per library)
@@ -738,6 +764,49 @@ sealed class PlanBuilder
             + $", {stats.GetValueOrDefault("rt_recorded")} already recorded, {stats.GetValueOrDefault("rt_uncovered")} uncovered");
     }
 
+    readonly List<byte[]> hitGroupItems = [];
+
+    /// <summary>REDengine 3: one collection per material hit group of the index ('H', <see cref="RedEngine.RedRayTracing"/>),
+    /// in the shape of the recording's additions; none without a recorded addition (its global root signature is a version
+    /// 1.0 blob only the recording has).</summary>
+    void Red3HitGroups(int libraries)
+    {
+        if (RedEngine.RedRayTracing.Learn(stateObjects) is not { } shape || !recBlobs.TryGetValue(shape.Global, out var gb))
+        {
+            log?.Report($"ray tracing: {libraries} DXIL libraries; REDengine 3's material collections need a recording with ray tracing on: none synthesized");
+            return;
+        }
+        var global = RootSig.Parse(gb);
+        foreach (var m in index.Maps.Where(m => m.Library == RedEngine.RedEngineReader.HitGroups && m.Shaders.All(bc.ContainsKey)))
+        {
+            var group = m.Shaders.Select(h => bc[h]).ToList();
+            if (RedEngine.RedRayTracing.Local(group, global) is not { } desc)
+            {
+                Count("rt_uncovered");
+                uncoveredExample.TryAdd("ray tracing: a binding unbounded or partly in a global range", m.Shaders[0]);
+                continue;
+            }
+            if (!rsCache.TryGetValue(desc.Key, out var local))
+            {
+                try { (local, var b) = RtCollections.Serialize(desc, []); rsBlobs[local] = b; }
+                catch (RootSig.SerializeException e) { unserializable ??= e.Message; }
+                rsCache[desc.Key] = local;
+            }
+            if (local == null) { Count("rt_unserializable"); continue; }
+            var ranges = new RootSig.Ranges(0, [.. global.Slots, .. RootSig.Parse(rsBlobs[local]).Slots]);
+            if (group.Select(l => RootSig.Uncovered(ranges, Stage.Library, l)).FirstOrDefault(w => w != null) is { } why)
+            {
+                Count("rt_uncovered");
+                uncoveredExample.TryAdd("ray tracing " + why, m.Shaders[0]);
+                continue;
+            }
+            hitGroupItems.Add(RedEngine.RedRayTracing.Item(m.Shaders[0], m.Shaders.ElementAtOrDefault(1), local, shape, rasterNv));
+            usedRs.UnionWith([shape.Global, local]);
+        }
+        log?.Report($"ray tracing: {libraries} DXIL libraries, {hitGroupItems.Count} material hit group collections synthesized (the recorded additions' global root signature "
+            + $"{shape.Global[..8]}, shader config ({shape.Payload}, {shape.Attributes}), pipeline config ({shape.Depth}, 0x{shape.PipelineFlags:x})), {stats.GetValueOrDefault("rt_uncovered")} uncovered");
+    }
+
     /// <summary>A library's local root signature (<see cref="RtCollections.LocalRs"/>), serialized once per shape; null when
     /// the runtime won't serialize it (that library is left out).</summary>
     string? LocalRs(ShaderInfo lib, bool rayGen)
@@ -757,6 +826,17 @@ sealed class PlanBuilder
         return h;
     }
 
+    /// <summary>The recorded state objects the warm replays (<see cref="Planner.Materialize"/>'s rule): every blob each names in
+    /// the recording or the install, and every record it builds on replayable too (a record follows the ones it builds on).</summary>
+    List<Rec> ReplayableStateObjects()
+    {
+        var kept = new HashSet<string>();
+        foreach (var r in stateObjects)
+            if (Rehydrate.References([r]).All(h => h == Zero || recBlobs.ContainsKey(h) || bc.ContainsKey(h)) && ParseStateObject(r).Depends.All(kept.Contains))
+                kept.Add(r.Key);
+        return stateObjects.Where(r => kept.Contains(r.Key)).ToList();
+    }
+
     /// <summary>The plan file: root signatures, templates, items, D3D11 shaders (proxy db records, no shader bytes).</summary>
     Plan Write()
     {
@@ -768,24 +848,32 @@ sealed class PlanBuilder
         body.AddRange(usedTemplates.Select(t => recByKey[t]));
         body.AddRange(synthesized);
         body.AddRange(items.Select(i => new Rec('P', i)));
+        if (rasterNv is { } nv)
+            body.AddRange(synthesized.Concat(items.Select(i => new Rec('P', i))).Select(r => new NvState(r.Key, nv.Slot, nv.Space, 1, nv.Options).ToRec()));
         body.AddRange(rtItems.Select(i => new Rec('Y', i)));
+        body.AddRange(hitGroupItems.Select(i => new Rec('H', i)));
         body.AddRange(d3d11.Select(h => new Rec('1', D3D11Item(bc[h].Stage, h))));
         body.AddRange(tess11.Select(p => new Rec('2', D3D11Pair(p.Hs, p.Ds))));
         body.AddRange(packEntries);
         var n11 = d3d11.Count + tess11.Count;
         // ray tracing libraries: every DXIL library but lib_6_8 (work graphs: Reunion's and Windrose's one each).
         // ponytail: a DXR library built for SM 6.8 would be missed; read the RDAT function kinds into the index when one shows up
-        var rtLibs = dx12 ? maps.Where(m => m.Platform == plat).SelectMany(m => m.Shas).Distinct().Count(h => bc.TryGetValue(h, out var s) && s.Stage == Stage.Library && s.ShaderModel != "lib_6_8") : 0;
-        var rtPlanned = rtItems.Count(i => bc.TryGetValue(RtCollections.ParseItem(i).Library, out var s) && s.ShaderModel != "lib_6_8");
+        var rtLibSet = dx12 ? maps.Where(m => m.Platform == plat).SelectMany(m => m.Shas).Where(h => bc.TryGetValue(h, out var s) && s.Stage == Stage.Library && s.ShaderModel != "lib_6_8").ToHashSet() : [];
+        var rtLibs = rtLibSet.Count;
+        // what the plan compiles of them: the libraries of its synthesized collections and of the recorded state objects that replay
+        var replayable = ReplayableStateObjects();
+        var rtCovered = rtItems.Select(i => RtCollections.ParseItem(i).Library)
+            .Concat(hitGroupItems.Select(RedEngine.RedRayTracing.ParseItem).SelectMany(h => new[] { h.ClosestHit, h.AnyHit }).OfType<string>())
+            .Concat(replayable.SelectMany(r => ParseStateObject(r).Libraries)).Count(rtLibSet.Remove);
         // traced rays inline (RayQuery) and built no state object: the game's ray tracing is in its PSOs, a recording adds nothing
         var inlineOnly = rtLibs > 0 && stateObjects.Count == 0 && recBlobs.Values.Any(b => Carved.Dxbc.InlineRayTracing(b));
         if (inlineOnly) log?.Report($"ray tracing: the recording traces rays inline and builds no state object: the {rtLibs} DXIL libraries aren't used as played");
         var plan = new Plan(game.Id, index.ContentHash, string.Join(" + ", new[] { plat, n11 > 0 ? $"D3D11 {plat11 ?? "DXBC"}" : "" }.Where(p => p != "")), caps.Profile,
-            new PlanStats(recs.Count + stateObjects.Count, items.Count + synthesized.Count + rtItems.Count, synthesized.Count, usedRs.Count, dx12 && (verified || embeddedRs > 0),
+            new PlanStats(recs.Count + stateObjects.Count, items.Count + synthesized.Count + rtItems.Count + hitGroupItems.Count, synthesized.Count, usedRs.Count, dx12 && (verified || embeddedRs > 0),
                 unitsBy[(int)Provenance.Exact], unitsBy[(int)Provenance.Inferred], unitsBy[(int)Provenance.Guessed], layoutCoverage, n11, packNew,
-                stats.GetValueOrDefault("rs_uncovered"), rtLibs, stateObjects.Count > 0 || inlineOnly ? 0 : rtLibs - rtPlanned,
+                stats.GetValueOrDefault("rs_uncovered"), rtLibs, inlineOnly ? 0 : rtLibs - rtCovered,
                 StageSets: seen.Count, LeftOut: new[] { "no_rs", "no_template", "no_gs_template", "rs_uncovered" }.Sum(stats.GetValueOrDefault),
-                MiddlewareSharedItems: packShared),
+                MiddlewareSharedItems: packShared, RtStateObjects: replayable.Count),
             Path.Combine(outDir, "plan.bin"));
         PlanFile.Write(plan, body);
         log?.Report($"plan: {items.Count + synthesized.Count} PSOs{(rtItems.Count > 0 ? $" + {rtItems.Count} ray tracing collections" : "")} ({string.Join(", ", stats.Select(s => $"{s.Key} {s.Value}"))}), "

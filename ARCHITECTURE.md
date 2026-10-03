@@ -110,6 +110,9 @@ pipelines, not taken from documentation. `VendorCaps` holds the result per vendo
 - **An NVAPI shader-extension slot is part of the key**: a PSO or ray tracing collection compiled with a slot set misses
   when created without it, and the reverse. How the slot was set (device-wide, per thread, or a PSO extension) is not
   part of the key. The recorder captures it and the warm recreates it (see [`'N'` records](#ray-tracing-state-objects)).
+  When at least 99% of a recording's raster PSOs share one slot and space, every synthesized PSO of the plan gets it too
+  (an `'N'` record each, with the most common creation options; `PlanBuilder.RasterNv`), and a plan input is keyed by that
+  record. REDengine 3 without a recording gets slot 12, space 1, as The Witcher 3's recording has it. Never on AMD.
 - **Per stage, on shaders + root signature only** (`StateIndependentCache`, `PerStageCache`). Blend, rasterizer,
   depth-stencil, render-target formats, MSAA, topology type, input layout and stream output don't change the compiled
   result; any change to the root signature's bytes recompiles every stage. A VS and a PS compiled with other partners
@@ -334,6 +337,15 @@ Rules exist for UE 4.26/4.27, UE 5.1 and the forks the root-signature rules cove
 rule is used if at least 99% of them rebuild. FromSoftware games get a guessed rule (`RtCollections.GuessedFamilies`),
 and the plan log says so.
 
+REDengine 3 adds its materials to a pipeline with `AddToStateObject`, many at once at startup. NVIDIA caches an addition
+whole: it hits only as an exact repeat, or for a hit group compiled before as a collection (selftest dxr: `add C` 1.6 ms
+against 12.3 cold; `add B`, the hit group inside another pipeline, 12.4). So the plan has one collection per material hit
+group the techniques name (`'H'`, `RedEngine.RedRayTracing`): the closest and any hit libraries, the hit group, the local
+root signature rebuilt from their bindings (The Witcher 3: 66 of 66 recorded byte for byte), and the global root
+signature, shader config and pipeline config of the recording's additions; without a recorded addition, none (the
+global root signature is a version 1.0 blob only the recording has). Measured on The Witcher 3's recorded additions under
+fake exe names: single-material additions 30.2 -> 6.4 ms at the median, batches of 4 and more barely change.
+
 ### Middleware packs
 
 Middleware (FidelityFX, OptiScaler, XeSS, DirectStorage, Streamline plugins) creates pipelines from shaders embedded in
@@ -393,7 +405,9 @@ After a build:
   reason says a recording compiles the rest (`ScsKiller.IsPartial`).
 - **Ray tracing**: when more than 10% of the index's DXIL libraries have no synthesized collection and no recording has
   ray tracing, the game needs a recording for ray-traced effects; the rest still compiles (`ScsKiller.NeedsRtRecording`).
-  On AMD this always applies, since only recorded objects can be warmed.
+  On AMD this always applies, since only recorded objects can be warmed. The plan's uncovered count
+  (`PlanStats.RtUncovered`) is the libraries in neither a synthesized collection nor a recorded state object, also when
+  the recording has ray tracing; the game page shows it.
 - **New pipelines since the warm** (`ScsKiller.PendingOf`), derived whenever the game is evaluated, never counted up.
   After a complete warm, nothing that was an input to it counts; anything new, or newly given a blob it names, counts;
   a pipeline that won't compile here may count once, until the next warm takes it as an input.

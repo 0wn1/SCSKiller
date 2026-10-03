@@ -75,7 +75,8 @@ public static unsafe class RootSig
         return MemoryMarshal.AsBytes(s.ToArray().AsSpan()).ToArray();
     }
 
-    const uint Unbounded = uint.MaxValue, Append = uint.MaxValue;
+    internal const uint Unbounded = uint.MaxValue;
+    const uint Append = uint.MaxValue;
     static readonly Stage[] Order = [Stage.Pixel, Stage.Vertex, Stage.Mesh, Stage.Amplification, Stage.Geometry, Stage.Hull, Stage.Domain]; // compute is alone
     static uint Vis(Stage s) => s switch { Stage.Vertex => 1, Stage.Hull => 2, Stage.Domain => 3, Stage.Geometry => 4, Stage.Pixel => 5, Stage.Amplification => 6, Stage.Mesh => 7, _ => 0 };
     static readonly (Stage, uint)[] Deny = [(Stage.Vertex, 0x2), (Stage.Geometry, 0x10), (Stage.Pixel, 0x20), (Stage.Amplification, 0x100), (Stage.Mesh, 0x200)]; // hull/domain never denied
@@ -84,11 +85,11 @@ public static unsafe class RootSig
     /// <summary>A 1.1 root signature: flags + parameters. Each row is a table (0, vis, then per range: range type, count, base,
     /// space, flags), root constants (1, vis, register, space, count) or a root CBV/UAV (2/4, vis, register, space, flags).
     /// A single-range table's range is at OFFSET_APPEND unless the row carries an explicit offset as an 8th value; a multi-range
-    /// table's ranges all start at offset 0 (they alias one heap region, see <see cref="BindlessTables"/>). <see cref="Key"/>
-    /// identifies it.</summary>
-    public sealed record Desc(uint Flags, List<uint[]> Rows)
+    /// table's ranges all start at offset 0 (they alias one heap region, see <see cref="BindlessTables"/>), or with
+    /// <paramref name="AppendRanges"/> each at OFFSET_APPEND (one after the other). <see cref="Key"/> identifies it.</summary>
+    public sealed record Desc(uint Flags, List<uint[]> Rows, bool AppendRanges = false)
     {
-        public string Key => $"{Flags}|{string.Join(';', Rows.Select(r => string.Join(',', r)))}";
+        public string Key => $"{Flags}|{string.Join(';', Rows.Select(r => string.Join(',', r)))}{(AppendRanges ? "|append" : "")}";
     }
 
     /// <param name="meshTier">the RHI runs at feature level SM6 (the game's PCD3D_SM6 shaders), where UE 5 sets
@@ -339,7 +340,7 @@ public static unsafe class RootSig
                     for (var j = 0; j < count; j++, next += 6)
                     {
                         for (var k = 0; k < 5; k++) next[k] = r[2 + 5 * j + k];
-                        next[5] = count == 1 ? r.Length == 8 ? r[7] : Append : 0;
+                        next[5] = count == 1 ? r.Length == 8 ? r[7] : Append : d.AppendRanges ? Append : 0;
                     }
                 }
                 else for (var k = 0; k < 3; k++) ((uint*)(p + 8))[k] = r[2 + k];

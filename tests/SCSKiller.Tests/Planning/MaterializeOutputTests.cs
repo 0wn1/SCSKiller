@@ -14,7 +14,7 @@ namespace SCSKiller.Tests.Planning;
 public class MaterializeOutputTests
 {
     const int Cases = 200;
-    const string Written = "7811075feb62b7ee5bebb4a7bbfdcf2b201ececa1c2be66c841100cc6b32ddd8";
+    const string Written = "92728aa256df72678c5a8707f16e4c7e97675384ea3cca09b9e52fe0ed4c6a2a";
 
     static readonly EngineInfo Engine = new("Fake", "1", null, "D3D12", false, null);
 
