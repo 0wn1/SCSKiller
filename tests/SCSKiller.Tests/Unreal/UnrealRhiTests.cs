@@ -1,4 +1,5 @@
 using SCSKiller.Core;
+using SCSKiller.Core.App;
 using SCSKiller.Core.Games;
 using SCSKiller.Core.Planning;
 using SCSKiller.Core.Unreal;
@@ -68,6 +69,89 @@ public class UnrealRhiTests(ITestOutputHelper output)
         Assert.Equal(UnrealRhi.Ambiguous, Api(5, Both, new())); // encrypted paks, no log
         Assert.Equal("D3D12 (last run)", Api(5, Both, new(), UserDir("", "[2026.03.04-18.43.38:621][  0]LogRHI: Using Default RHI: D3D12\n")));
         Assert.Equal("D3D11 (last run)", Api(4, Sm5, new(), UserDir("", "LogD3D11RHI: Chosen D3D11 Adapter:\n")));
+    }
+
+    static readonly Game Drg = new("steam:548430", "Deep Rock Galactic", Store.Steam, @"C:\Steam\steamapps\common\Deep Rock Galactic",
+        @"C:\Steam\steamapps\common\Deep Rock Galactic\FSD\Binaries\Win64\FSD-Win64-Shipping.exe");
+
+    static Dictionary<string, object> Entry(string? args, string desc, Dictionary<string, object>? config = null, string exe = "FSD.exe")
+    {
+        var e = new Dictionary<string, object> { ["executable"] = exe, ["description"] = desc };
+        if (args != null) e["arguments"] = args;
+        if (config != null) e["config"] = config;
+        return e;
+    }
+
+    static Dictionary<string, object> App(params Dictionary<string, object>[] entries) => new()
+    {
+        ["config"] = new Dictionary<string, object> { ["launch"] = entries.Select((e, i) => (e, i)).ToDictionary(x => x.i.ToString(), x => (object)x.e) },
+    };
+
+    /// <summary>An editor entry passing -dx12 is not a way to play: the playable entry runs the project's DX11.</summary>
+    [Fact]
+    public void LaunchMenuKeepsOnlyEntriesThatStartTheGame()
+    {
+        var (menu, _) = UnrealRhi.LaunchMenu(App(Entry(null, "Play Deep Rock Galactic"), Entry("-dx12", "Editor", exe: @"Engine\Binaries\Win64\UE4Editor.exe"),
+            Entry("-dx12", "VR", exe: @"..\Other Game\FSD.exe")), Drg);
+        Assert.Equal([" Play Deep Rock Galactic"], menu);
+        Assert.Equal("D3D11", UnrealRhi.Resolve(4, Sm5, Config("[/Script/Engine.RendererSettings]\n"), "Game", null, "", menu).Api);
+    }
+
+    /// <summary>Deep Rock Galactic: UE4, SM5 only, no DefaultGraphicsRHI (UE4 default DX11), and a Steam launch menu
+    /// "Play ... (DirectX 12)" -dx12 / "Play ... (DirectX 11)" -dx11.</summary>
+    [Fact]
+    public void SteamLaunchMenu()
+    {
+        var win = new Dictionary<string, object> { ["oslist"] = "windows" };
+        var app = App(
+            Entry("-dx12", "Play Deep Rock Galactic (DirectX 12)", win),
+            Entry("-dx11", "Play Deep Rock Galactic (DirectX 11)", win, @"FSD\Binaries\Win64\FSD-Win64-Shipping.exe"),
+            Entry("-vulkan", "Linux", new() { ["oslist"] = "linux" }),
+            Entry("-dx11 -test", "Beta", new() { ["oslist"] = "windows", ["BetaKey"] = "experimental" }),
+            Entry("-dx11", "Benchmark (DirectX 11)", win, "Benchmark.exe"));
+        var (menu, def) = UnrealRhi.LaunchMenu(app, Drg);
+        Assert.Equal(2, menu.Count);
+        Assert.Null(def);
+        var drg = Config("[/Script/Engine.RendererSettings]\n");
+
+        Assert.Equal(UnrealRhi.Ambiguous, UnrealRhi.Resolve(4, Sm5, drg, "Game", null, "", menu).Api); // the recorder may go in
+        Assert.Equal("D3D12 (last run)", UnrealRhi.Resolve(4, Sm5, drg, "Game", UserDir("", "LogRHI: Using Default RHI: D3D12\n"), "", menu).Api);
+        Assert.Equal("D3D11 (last run)", UnrealRhi.Resolve(4, Sm5, drg, "Game", UserDir("", "LogD3D11RHI: Chosen D3D11 Adapter:\n"), "", menu).Api);
+        Assert.Equal("D3D12 (launch option)", UnrealRhi.Resolve(4, Sm5, drg, "Game", null, "-dx12", menu).Api); // the user's own launch option
+        Assert.Equal("D3D12 (launch option)", UnrealRhi.Resolve(4, Sm5, drg, "Game", null, "", [menu[0]]).Api);
+        Assert.Equal("D3D12 (launch option)", UnrealRhi.Resolve(4, Sm5, drg, "Game", null, "", [" Play (DX12)"]).Api); // description only
+        Assert.Equal(UnrealRhi.Ambiguous, UnrealRhi.Resolve(4, Sm5, drg, "Game", null, "", ["-dx12 DX12", " Play"]).Api); // the other entry runs the project's DX11
+        Assert.Equal("D3D11", UnrealRhi.Resolve(4, Sm5, drg, "Game", null, "", [" Play", "-windowed Windowed"]).Api); // no API in the menu
+        ((Dictionary<string, object>)((Dictionary<string, object>)((Dictionary<string, object>)app["config"])["launch"])["0"])["type"] = "default";
+        (menu, def) = UnrealRhi.LaunchMenu(app, Drg);
+        Assert.Equal(menu[0], def);
+        Assert.Equal("D3D12 (launch option)", UnrealRhi.Resolve(4, Sm5, drg, "Game", null, "", menu, def).Api); // Steam's default entry runs DX12
+        Assert.Equal("D3D11 (last run)", UnrealRhi.Resolve(4, Sm5, drg, "Game", UserDir("", "LogD3D11RHI: Chosen D3D11 Adapter:\n"), "", menu, def).Api);
+        Assert.Equal(UnrealRhi.Ambiguous, UnrealRhi.Resolve(4, Sm5, drg, "Game", null, "", menu, menu[1]).Api); // a DX11 default doesn't decide
+        // SAND LAND: the default entry has no flag, the other forces DX11
+        string[] sandLand = ["-DefaultOnlineSubsystem=Steam ", "-DefaultOnlineSubsystem=Steam -dx11 force use DirectX11"];
+        Assert.Equal("D3D12", UnrealRhi.Resolve(4, Sm5, Config(Rhi("DefaultGraphicsRHI_DX12")), "Game", null, "", sandLand, sandLand[0]).Api);
+        Assert.Equal(UnrealRhi.Ambiguous, UnrealRhi.Resolve(4, Sm5, Config(Rhi("DefaultGraphicsRHI_DX12")), "Game", null, "", sandLand).Api);
+        Assert.Equal(UnrealRhi.Ambiguous, UnrealRhi.Resolve(4, Sm5, drg, "Game", UserDir("[D3DRHIPreference]\nbUseD3D12InGame=True\n"), "", sandLand).Api); // the flagless entry runs the user setting
+        Assert.Equal("D3D11", UnrealRhi.Resolve(4, Sm5, drg, "Game", null, "", sandLand).Api); // both entries run DX11
+
+        var state = new GameState(Ff7.Game, new EngineInfo("Unreal", "4.27", null, UnrealRhi.Ambiguous, false, null), AntiCheat.None, GameStatus.Ready, "", null, null, null, null, null, null, null, false, null);
+        Assert.Null(ScsKiller.RecorderSkip(state, null));
+        Assert.Equal(ScsKiller.SkipNotDx12, ScsKiller.RecorderSkip(state with { Engine = state.Engine! with { GraphicsApi = "D3D11" } }, null));
+    }
+
+    /// <summary>An install whose paks aren't there yet (mid-update) gets a stamp once they are: a miss isn't kept.</summary>
+    [Fact]
+    public void DetectStampFindsTheProjectOnceThePaksAppear()
+    {
+        var install = Ff7.TempDir("rhi-stamp-" + Guid.NewGuid().ToString("N")[..8]);
+        var game = new Game("epic:stamp", "Stamp", Store.Epic, install, Path.Combine(install, "Proj", "Binaries", "Win64", "Proj-Win64-Shipping.exe"));
+        var reader = new UnrealReader(Ff7.TempDir("rhi-stamp-data"));
+        var engine = new EngineInfo("Unreal", "4.27", null, "D3D11", false, null);
+        Assert.Equal("", reader.DetectStamp(game, engine));
+        var paks = Directory.CreateDirectory(Path.Combine(install, "Proj", "Content", "Paks")).FullName;
+        File.WriteAllBytes(Path.Combine(paks, "Proj-Windows.pak"), new byte[16]);
+        Assert.NotEqual("", reader.DetectStamp(game, engine));
     }
 
     [Fact]

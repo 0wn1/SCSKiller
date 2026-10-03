@@ -31,13 +31,22 @@
                     <TextBlock Text="{x:Bind Vm.Summary, Mode=OneWay}" Style="{StaticResource Secondary}" />
                     <TextBlock Text="{x:Bind Vm.RefreshNote, Mode=OneWay}" Visibility="{x:Bind Vm.HasRefreshNote, Mode=OneWay}" Style="{StaticResource Secondary}" />
                 </StackPanel>
-                <Button Grid.Column="1" VerticalAlignment="Bottom" Click="OnRefresh"
-                        ToolTipService.ToolTip="Re-reads every game's cache size, recordings and status, and finds new games. Shift+click also re-checks every game's engine and anti-cheat (slower).">
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <ProgressRing Width="16" Height="16" IsActive="{x:Bind Vm.Refreshing, Mode=OneWay}" Visibility="{x:Bind Vm.Refreshing, Mode=OneWay}" />
-                        <TextBlock Text="Refresh" />
-                    </StackPanel>
-                </Button>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12" VerticalAlignment="Bottom">
+                    <Button Click="OnRefresh"
+                            ToolTipService.ToolTip="Re-reads every game's cache size, recordings and status, and finds new games. Shift+click also re-checks every game's engine and anti-cheat (slower).">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <ProgressRing Width="16" Height="16" IsActive="{x:Bind Vm.Refreshing, Mode=OneWay}" Visibility="{x:Bind Vm.Refreshing, Mode=OneWay}" />
+                            <TextBlock Text="Refresh" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="OnAddGame" AutomationProperties.Name="Add a game"
+                            ToolTipService.ToolTip="Add a game no store lists (another launcher, or a game in a folder of its own) by picking its .exe">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <FontIcon Glyph="&#xE710;" FontSize="14" />
+                            <TextBlock Text="Add a game…" />
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
                 <Grid Grid.Column="3" VerticalAlignment="Bottom">
                     <Button Click="OnAddRecommended" Visibility="{x:Bind Vm.CanAddRecommended, Mode=OneWay}"
                             BorderBrush="{ThemeResource AccentFillColorDefaultBrush}" BorderThickness="1.5"
@@ -67,6 +76,8 @@
                 </Button>
             </Grid>
             <InfoBar Severity="Error" IsOpen="{x:Bind Vm.HasError, Mode=OneWay}" Visibility="{x:Bind Vm.HasError, Mode=OneWay}" Message="{x:Bind Vm.Error, Mode=OneWay}" IsClosable="False" />
+            <InfoBar Severity="Informational" IsOpen="{x:Bind Vm.HasGpuNotice, Mode=OneWay}" Visibility="{x:Bind Vm.HasGpuNotice, Mode=OneWay}"
+                     Message="{x:Bind Vm.GpuNotice, Mode=OneWay}" CloseButtonClick="OnDismissGpuNotice" />
         </StackPanel>
 
         <Grid Grid.Row="1" ColumnSpacing="12">

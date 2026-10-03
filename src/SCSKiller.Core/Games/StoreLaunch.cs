@@ -6,11 +6,12 @@ namespace SCSKiller.Core.Games;
 
 /// <summary>Starts a game the way its store's own Play and desktop shortcut do, never by its exe: Steam, Epic and Ubisoft
 /// Connect by their URI, Xbox by the package's app id, GOG through GOG Galaxy's run command. The EA app's own shortcuts run
-/// the game exe and discovery has no EA offer id; Battle.net games count as anti-cheat: neither has a launch.</summary>
+/// the game exe and discovery has no EA offer id; Battle.net games count as anti-cheat: neither has a launch. A game the
+/// user added has no store: its exe runs from its own folder, with no arguments.</summary>
 public static class StoreLaunch
 {
     /// <summary>The game's store has a launch; no file read beyond whether GOG Galaxy is installed.</summary>
-    public static bool Supported(Game g) => Prefix(g) switch
+    public static bool Supported(Game g) => g.Store == Store.Manual || Prefix(g) switch
     {
         "steam" or "epic" or "xbox" or "ubisoft" => true,
         "gog" => GalaxyExe() != null,
@@ -30,6 +31,7 @@ public static class StoreLaunch
             _ => null,
         };
         if (uri != null) return new ProcessStartInfo(uri) { UseShellExecute = true };
+        if (g.Store == Store.Manual) return new ProcessStartInfo(g.ExePath) { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(g.ExePath) };
         // Galaxy's own desktop shortcut; a trailing backslash would escape the closing quote
         if (Prefix(g) == "gog" && ulong.TryParse(id, out _) && (galaxyExe ?? GalaxyExe()) is { } galaxy)
             return new ProcessStartInfo(galaxy, $"/command=runGame /gameId={id} /path=\"{g.InstallDir.TrimEnd('\\')}\"");

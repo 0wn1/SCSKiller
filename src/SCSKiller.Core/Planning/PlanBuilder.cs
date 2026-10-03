@@ -114,7 +114,8 @@ sealed class PlanBuilder
     {
         var dlls = Middleware.Detect(game);
         if (dlls.Count == 0) return;
-        if (recs.Count > 0 && packs != null)
+        // a game the user added never fills a pack: packs are shared, and its recording's origin is unknown
+        if (recs.Count > 0 && packs != null && game.Store != Store.Manual)
             foreach (var p in packs.Promote(recs, recBlobs, bc, dlls, game.Id, caps.Profile.StartsWith("amd") ? "amd" : caps.Profile.StartsWith("nvidia") ? "nvidia" : null))
                 log?.Report($"middleware: {p.Records} recorded PSOs are {p.Dll.Name}'s ({p.Dll.Vendor}, {p.ContentHash[..12]}), {p.New} new in its pack");
         var seen = new HashSet<string>();
@@ -521,7 +522,9 @@ sealed class PlanBuilder
             {
                 var st = new SortedDictionary<int, string>();
                 foreach (var d in ds) st[(int)d.Stage] = d.Sha1;
-                if (st.Count > 0) sink(st, Planner.Shape(st), PsOut(st));
+                if (st.Count > 0 && Planner.Positioned(st.ToDictionary(x => (Stage)x.Key, x => bc[x.Value]))) sink(st, Planner.Shape(st), PsOut(st));
+                else if (st.Count > 0 && seen.Add(Tuple("", st)))   // a stage set like any other, counted once
+                    Count(RootSigOf(st) is { } rs && have.Contains(Tuple(rs, st)) ? "already_recorded" : "stream_output");
                 continue;
             }
             var srcs = new Dictionary<string, List<ShaderInfo>>();
@@ -783,7 +786,7 @@ sealed class PlanBuilder
             if (RedEngine.RedRayTracing.Local(group, global) is not { } desc)
             {
                 Count("rt_uncovered");
-                uncoveredExample.TryAdd("ray tracing: a binding unbounded or partly in a global range", m.Shaders[0]);
+                uncoveredExample.TryAdd("ray tracing: no local root signature for the hit group (RedRayTracing.Local)", m.Shaders[0]);
                 continue;
             }
             if (!rsCache.TryGetValue(desc.Key, out var local))
@@ -872,7 +875,7 @@ sealed class PlanBuilder
             new PlanStats(recs.Count + stateObjects.Count, items.Count + synthesized.Count + rtItems.Count + hitGroupItems.Count, synthesized.Count, usedRs.Count, dx12 && (verified || embeddedRs > 0),
                 unitsBy[(int)Provenance.Exact], unitsBy[(int)Provenance.Inferred], unitsBy[(int)Provenance.Guessed], layoutCoverage, n11, packNew,
                 stats.GetValueOrDefault("rs_uncovered"), rtLibs, inlineOnly ? 0 : rtLibs - rtCovered,
-                StageSets: seen.Count, LeftOut: new[] { "no_rs", "no_template", "no_gs_template", "rs_uncovered" }.Sum(stats.GetValueOrDefault),
+                StageSets: seen.Count, LeftOut: new[] { "no_rs", "no_template", "no_gs_template", "rs_uncovered", "stream_output" }.Sum(stats.GetValueOrDefault),
                 MiddlewareSharedItems: packShared, RtStateObjects: replayable.Count),
             Path.Combine(outDir, "plan.bin"));
         PlanFile.Write(plan, body);

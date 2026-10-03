@@ -45,7 +45,8 @@ public class FrameLogTests(ITestOutputHelper output) : IDisposable
         for (int i = 0; i < 5; i++) csv.Add($"{600 + 20 * i:0.0},S,1,1,200.000,{i + 4000:x40},0.010,7,0");   // cold compiles in its first slow frame
         csv.Add("15040.0,S,1,1,60.000,aa,0.010,8,0");    // compile inside the 15000 ms frame
         csv.Add("18040.0,C,1,1,40.000,bb,0.010,8,0");    // RayQuery floor inside the 18000 ms frame
-        csv.Add("27040.0,R,1,1,50.000,cc,0.010,8,0");    // a cached state object inside the 27000 ms frame
+        csv.Add("27040.0,R,1,1,23.500,cc,0.010,8,0");    // a cached state object inside the 27000 ms frame
+        csv.Add("28040.0,A,0,0,57.500,ee,0.010,8,0");    // a single-material addition compiled inside the 28000 ms frame (The Witcher 3)
         csv.Add("23040.0,A,1,1,70.000,dd,0.010,8,0");    // a state object compiled inside the 23000 ms frame
         for (int i = 0; i < 120; i++) csv.Add($"{24100 + i:0.0},S,1,1,1.000,{i + 1000:x40},0.010,9,0");   // a load
         for (int i = 0; i < 110; i++) csv.Add($"{25100 + i:0.0},S,1,1,150.000,{i + 3000:x40},0.010,9,0");   // a load in play that compiles
@@ -58,7 +59,7 @@ public class FrameLogTests(ITestOutputHelper output) : IDisposable
         void Frame(double ms) => ends.Add(ends[^1] + ms);
         ends.Add(500);
         Frame(500);                                             // at 500: startup
-        foreach (var (at, ms) in new[] { (8500.0, 700.0), (15000, 80), (18000, 70), (21000, 120), (23000, 90), (24000, 300), (25000, 400), (27000, 60), (29000, 400_000), (429_500, 80) })
+        foreach (var (at, ms) in new[] { (8500.0, 700.0), (15000, 80), (18000, 70), (21000, 120), (23000, 90), (24000, 300), (25000, 400), (27000, 60), (28000, 58), (29000, 400_000), (429_500, 80) })
         {
             foreach (var t in Every10Ms(ends[^1] + 10, at + 0.5)) ends.Add(t);
             ends[^1] = at;
@@ -74,7 +75,7 @@ public class FrameLogTests(ITestOutputHelper output) : IDisposable
         Assert.Equal(ends.Count - 1, r.Frames);
         Assert.Equal(TimeSpan.FromMilliseconds(ends[^1]), r.Duration);
         Assert.Equal([(500.0, 500.0, HitchCause.LoadingShaders), (8500, 700, HitchCause.Other), (15000, 80, HitchCause.Shader), (18000, 70, HitchCause.Other),
-            (21000, 120, HitchCause.Other), (23000, 90, HitchCause.Shader), (24000, 300, HitchCause.Loading), (25000, 400, HitchCause.Shader), (27000, 60, HitchCause.Other),
+            (21000, 120, HitchCause.Other), (23000, 90, HitchCause.Shader), (24000, 300, HitchCause.Loading), (25000, 400, HitchCause.Shader), (27000, 60, HitchCause.Other), (28000, 58, HitchCause.Shader),
             (429_500, 80, HitchCause.Quitting)],
             r.Hitches.Select(h => (Math.Round(h.At.TotalMilliseconds, 3), Math.Round(h.Ms, 3), h.Cause)));
         var play = ends.Zip(ends.Skip(1), (a, b) => (a, ms: b - a)).Where(f => f.a >= 8000 && f.a < ends[^1] - 10_000 && f.ms < 5000).Select(f => f.ms).OrderDescending().ToList();

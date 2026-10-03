@@ -5,6 +5,39 @@ All notable changes to the SCSKiller app and command line. The format follows
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-10-03
+
+### Added
+
+- On an Intel GPU (or another that isn't NVIDIA or AMD), the Library says SCSKiller can't compile there yet and why,
+  instead of only marking every game "Not supported on this GPU yet". Close it and it stays closed for that GPU.
+- Add a game no store lists, such as one from another launcher or in a folder of its own: "Add a game…" in the Library
+  asks for its .exe. A launcher picked by mistake is followed to the game it starts, and an exe of a game already listed
+  opens that game. Added games get their own Library section and compile from their game files, with a community
+  recording once one matches their files. Recording isn't available for games added by hand yet, so a game that needs
+  a recording shows as not supported. Play starts the exe. "Remove from library" on the game page forgets the game and
+  touches nothing in its folder.
+
+### Changed
+
+- Games whose ReShade HDR mod adds to every root signature they create (most RenoDX mods) aren't compiled or recorded:
+  every pipeline changes, so a compile wouldn't match. The Library and the game page say so, the recorder comes out of
+  the game folder, and its recordings aren't shared. Mods that only replace some shaders (some RenoDX mods, Luma) are
+  noted on the game page and still compile. Plain ReShade and add-ons that leave the game's shaders alone
+  (renodx-dlss5) change nothing. Removing the mod lifts the block at the next scan.
+- The recorder records only in games SCSKiller has fully checked for anti-cheat. Any change in the game folder switches
+  it off until the next clean check, and a game updated while SCSKiller was closed isn't recorded until SCSKiller has
+  checked it again.
+- In the frame-time graph, a ray-tracing state object counts as a shader stutter when it takes 25 ms or more to create,
+  not 60 ms.
+
+### Fixed
+
+- Unreal games that choose DirectX 12 from Steam's launch menu, such as Deep Rock Galactic, were detected as DirectX 11,
+  so the recorder wasn't offered. Detection reads the game's Steam launch menu and its last log.
+- The Witcher 3's compile no longer tries the ray-tracing materials and the one pipeline NVIDIA's driver rejects (92
+  failures per compile); the game page counts them as not covered.
+
 ## [1.1.2] - 2026-10-03
 
 ### Added

@@ -143,9 +143,11 @@ only reads their files.
 
 **What does it write, and where?** Its settings and per-game plans go in `%LOCALAPPDATA%\SCSKiller\`, and the compiled
 pipelines go in your driver's own shader cache. Game files are never modified. The one exception is the optional
-recorder: it adds `d3d12.dll` and `scskiller.ini` to the folder of the game you turn it on for, and turning it off
-removes exactly those two files. Uninstalling SCSKiller removes them, and the recording it wrote there, from every game
-folder.
+recorder: it adds `d3d12.dll`, `scskiller.ini` and `scskiller.armed` to the folder of the game you turn it on for, and
+turning it off removes exactly those files. `scskiller.armed` says the game's install was checked for anti-cheat; SCSKiller
+deletes it as soon as anything in the install changes. The recorder decides when the game starts: it records that session
+only if the file is there then, and a session already running keeps recording until the game exits. Uninstalling SCSKiller
+removes these files, and the recording it wrote there, from every game folder.
 
 **Does it touch my drivers or their settings?** No. It compiles through DirectX, the way the game would.
 

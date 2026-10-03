@@ -181,7 +181,7 @@ public class StateObjectTests
     {
         var csv = Path.Combine(Ff7.TempDir("rt-session"), "creates.csv");
         // a cached state object still takes well over a PSO's 3 ms: compiled only from StateObjectCompileMs, and never the worst PSO compile
-        File.WriteAllText(csv, "1.0,R,0,0,80.0\n2.0,A,1,1,14.0\n3.0,R,1,1,59.9\n4.0,A,0,0,60.0\n5.0,G,0,0,9.0\n");
+        File.WriteAllText(csv, "1.0,R,0,0,80.0\n2.0,A,1,1,14.0\n3.0,R,1,1,24.9\n4.0,A,0,0,25.0\n5.0,G,0,0,9.0\n");
         Assert.Equal(new SessionStats(TimeSpan.FromMilliseconds(5), 5, 0, 0, 1, 9.0, StateObjectsReady: 2, StateObjectsCompiled: 2), SessionLog.Read(csv).Last);
     }
 }

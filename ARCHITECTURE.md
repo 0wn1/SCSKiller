@@ -22,7 +22,15 @@ session), plans which pipelines to create, and replays them in a separate proces
 
 ## How it works
 
-1. **Discover.** An `IGameSource` per store finds installed games and flags anti-cheat.
+1. **Discover.** An `IGameSource` per store finds installed games and flags anti-cheat. `ManualSource` lists the games
+   the user added by their exe (`manual-games.json` in the data folder): the pick is resolved like a store's install
+   (a launcher stub to its Shipping exe, the install root above `Engine\` or `bin\`) and checked for anti-cheat like
+   any game. Such a game never gets the recorder, since its install root is a guess that may miss the game's
+   anti-cheat: it compiles from its files, plus a community recording found by its content hash once it has been
+   indexed, and needs-a-recording games show as not supported. It yields to a store's game whose install holds its
+   exe, has no build id (the exe's size and write time mark a patch), starts its exe directly, uploads nothing and
+   fills no middleware pack (the upload key is a public store build alias, which a game added on one PC doesn't have).
+   Removing it forgets the entry and touches nothing in its folder.
 2. **Index.** An `IEngineReader` per engine family detects the engine and lists every shader the build ships (stage,
    SHA-1, signatures, root signature if embedded), grouped in shader maps that say which shaders can be drawn together.
 3. **Plan.** The planner (`IPlanner`) turns the index, a recording if there is one, and the GPU vendor's `VendorCaps`
@@ -43,7 +51,7 @@ Everything vendor- or engine-specific sits behind one interface: a new GPU vendo
 | Path | What |
 |---|---|
 | `src/SCSKiller.Core/Contracts.cs` | Shared interfaces and records |
-| `src/SCSKiller.Core/Games/` | `IGameSource` for Steam, Epic Games, EA app, GOG, Ubisoft Connect, Xbox (PC) and Battle.net; anti-cheat detection |
+| `src/SCSKiller.Core/Games/` | `IGameSource` for Steam, Epic Games, EA app, GOG, Ubisoft Connect, Xbox (PC), Battle.net and games the user added; anti-cheat detection |
 | `src/SCSKiller.Core/Unreal/` | `IEngineReader` for Unreal Engine (through CUE4Parse) |
 | `src/SCSKiller.Core/Unity/` | `IEngineReader` for Unity |
 | `src/SCSKiller.Core/FromSoft/` | `IEngineReader` for FromSoftware games |
@@ -478,6 +486,27 @@ The recorder is `proxy/`'s `d3d12.dll`, placed next to the game's exe with a `sc
   exist in no game file, so this PC's recording is their only source. Removal renames the mod back and never
   overwrites another file that took its place. OptiScaler, Special K (they pick their role from their file name) and
   vkd3d-proton (it runs the game on Vulkan) are refused.
+- **Shader mods** (`Games.ReShade.Detect`): ReShade in the exe's folder, else the install root: any DLL there whose
+  version resource names ReShade, or one of its usual names (dxgi.dll, d3d12.dll, ...) holding its description or its
+  add-on export. Only the build with full add-on support loads add-on files; the standard one is known by its "only
+  limited add-on functionality" warning, and its add-ons never count. Its add-ons (`*.addon`, `*.addon64`) are the ones
+  in ReShade.ini's `[ADDON] AddonPath`, else its folder, less `DisabledAddons`; each is classed by what it does to the
+  game's pipelines. One that replaces shaders is known by a string its release builds always log where they register
+  their pipeline hooks: RenoDX's `utils::shader attached.`, Luma's config-version warning; others (renodx-dlss5,
+  dlssfix) are NotPipeline. Most RenoDX add-ons add a constant to every root signature the game creates
+  (LayoutInjecting): the driver's cache keys on the root signature, so a compile of the shipped ones matches nothing,
+  and the recorder, above ReShade, records the game's descriptions, not the ones that reach the driver. The rest only
+  replace shaders (ReplacesShaders), as Luma does: only those shaders' pipelines miss. Both RenoDX paths are in every
+  build and a runtime flag picks one, so a RenoDX add-on is classed by ReShade.log when the log was written after the
+  add-on file and attributes a line to it (the file a "Registered add-on" name was loaded from, then that name's
+  `mods::shader::OnCreatePipelineLayout(will insert` or layout cloning); else by its build folder in
+  `Games/shader-mods.json` (its file name, or its version resource's OriginalFilename); else, as is an add-on that can't
+  be read, ReplacesShaders. A LayoutInjecting add-on (`GameState.ShaderModBlocks`) makes the game Unsupported with the
+  mod's name in its reason: never queued, planned or compiled, and checked again right before each warm starts. Each
+  evaluation that finds one takes the recorder out at once, as anti-cheat does (`TakeOutNow`), so also in the command
+  line, which doesn't reconcile; the recorder stays skipped, and a sharing pass reads the folder again and shares none
+  of its recording. A ReplacesShaders one only adds a note to the game page. Each file is read once per size and write
+  time, up to 128 MB; anti-cheat installs aren't read.
 - **Import** (`Recordings`): the game folder's `scskiller.db` is an inbox. When it changed since the last import
   (`GameRecord.RecordingInbox`, its size and write time), its records are merged into `recording.db` by record key,
   after the ones already there. Once `recording.db` is written, the inbox is emptied, but only while nothing has it
@@ -555,7 +584,7 @@ The recorder is `proxy/`'s `d3d12.dll`, placed next to the game's exe with a `sc
   - cold-filled: a **shader stutter**, however many creates overlap it (a level load that compiles is shader cost);
   - overlapped by 100 creates or more: **loading** (a load whose creates are fast);
   - overlapped by a compile of 10 ms or more (not a library load or a RayQuery PSO at the floor, a ray tracing state
-    object only from 60 ms): a **shader stutter**;
+    object only from 25 ms): a **shader stutter**;
   - else an **other hitch**, left out from 5 s when nothing compiled under it (a pause).
 
   Startup comes from create timing alone, which can't tell a menu's background compiles from play: when in doubt it

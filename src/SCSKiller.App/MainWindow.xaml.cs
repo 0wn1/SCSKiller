@@ -7,7 +7,9 @@ using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.UI.Xaml.Navigation;
 using SCSKiller.App.Design;
 using SCSKiller.App.Pages;
+using SCSKiller.Core;
 using SCSKiller.Core.App;
+using SCSKiller.Core.Vendors;
 using Windows.Graphics;
 using Windows.Graphics.Imaging;
 
@@ -220,7 +222,8 @@ public sealed partial class MainWindow : Window
                 }
                 foreach (var (name, id) in new[] { ("hogwarts", "steam:990080"), ("ff7", ff7), ("ghostrunner", "steam:1139900"),
                                                    ("palworld", "xbox:1623730"), ("eldenring", "steam:1245620"),
-                                                   ("atomicheart", "xbox:Sample.AtomicHeart"), ("darwin", "epic:3300000") })
+                                                   ("atomicheart", "xbox:Sample.AtomicHeart"), ("darwin", "epic:3300000"),
+                                                   ("added", "manual:5f1c0e9a2b7d4c30") })
                 {
                     Navigate(typeof(DetailPage), id);
                     string file = $"d-{name}-{size}";
@@ -270,6 +273,18 @@ public sealed partial class MainWindow : Window
             Root.RequestedTheme = theme;
             Navigate(typeof(LibraryPage));
             await Shot("library-min", part: "-end");
+        }
+
+        // An Intel GPU: the Library says it can't compile there.
+        Resize(1280);
+        fake.Vendor = new UnsupportedVendor(new GpuInfo(GpuVendor.Intel, "Intel Graphics", "32.0.101.6881", 0, 128UL << 20));
+        ShowGpu();
+        foreach (var theme in themes)
+        {
+            Root.RequestedTheme = theme;
+            Navigate(typeof(LibraryPage));
+            ((LibraryPage)ContentFrame.Content).Vm.Refresh();
+            await Shot("library-intel");
         }
         Application.Current.Exit();
     }

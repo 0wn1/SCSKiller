@@ -118,6 +118,11 @@ public sealed class AppStore(string dataDir)
     public Dictionary<string, Evaluation> LoadScan() => Load<Dictionary<string, Evaluation>>(Path.Combine(DataDir, "scan.json")) ?? [];
     public void SaveScan(Dictionary<string, Evaluation> scan) => Save(Path.Combine(DataDir, "scan.json"), scan);
 
+    /// <summary>Entry by entry: one that doesn't parse (null, another shape) is left out, the others kept.</summary>
+    public List<Games.ManualEntry> LoadManualGames() => (Load<List<JsonElement>>(Path.Combine(DataDir, "manual-games.json")) ?? [])
+        .Select(e => { try { return e.Deserialize<Games.ManualEntry>(Json); } catch (JsonException) { return null; } }).OfType<Games.ManualEntry>().ToList();
+    public void SaveManualGames(List<Games.ManualEntry> games) => Save(Path.Combine(DataDir, "manual-games.json"), games);
+
     /// <summary>Game id -> the stale key the user skipped (driver + game version).</summary>
     public Dictionary<string, string> LoadDismissed() => Load<Dictionary<string, string>>(Path.Combine(DataDir, "dismissed.json")) ?? [];
     public void SaveDismissed(Dictionary<string, string> dismissed) => Save(Path.Combine(DataDir, "dismissed.json"), dismissed);

@@ -21,6 +21,9 @@
 #define NOMINMAX
 #include <windows.h>
 #include <initguid.h>
+#include <bcrypt.h>
+#include <shlobj.h>
+#include <knownfolders.h>
 #include <d3d12.h>
 #include <d3d12shader.h>
 #include <dxgi1_4.h>
@@ -45,6 +48,9 @@
 #include <vector>
 
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 extern "C" __declspec(dllexport) const int SCSKiller_WarmHost = 1;  // the proxy warms only in a process exporting it
 
@@ -3007,10 +3013,77 @@ static int frames_held(const std::wstring& dir) {
     return 0;
 }
 
-// `selftest factory`: a device from ID3D12DeviceFactory (the proxy's D3D12GetInterface, CLSID_D3D12DeviceFactory) on WARP,
-// and a compute PSO on it. The proxy is freed once before the device: its factory hook keeps it loaded. Prints
-// "loaded <0|1>" and "created 0x<hr>", or "no factory" where the runtime has none.
-static int factory_rows(const std::wstring& dir) {
+// A compute PSO with root signature rs on dev; k makes the shader (and so the record) its own.
+static HRESULT compute_pso(ID3D12Device* dev, ID3D12RootSignature* rs, int k) {
+    ID3DBlob* cs = compile("RWByteAddressBuffer b : register(u0); [numthreads(1,1,1)] void main() { b.Store(0, " + std::to_string(k) + "); }", "cs_5_0");
+    if (!cs) return E_FAIL;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC c = {};
+    c.pRootSignature = rs, c.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+    ID3D12PipelineState* p = nullptr;
+    return dev->CreateComputePipelineState(&c, IID_PPV_ARGS(&p));
+}
+
+// `selftest anticheat <client dll | ->`: a compute PSO on a device made through the proxy d3d12.dll next to the exe (WARP),
+// then the client dll is loaded (an anti-cheat client's module name; "-": none) and a second PSO. Prints
+// "created 0x<hr> 0x<hr>". The proxy decided admission at the device: a client loaded after it doesn't change the run.
+static int anticheat_rows(const std::wstring& dir, const wchar_t* client) {
+    SetEnvironmentVariableW(L"SCSKILLER_MODE", L"record");
+    HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str());
+    CHECK(m);
+    auto create = (decltype(&D3D12CreateDevice))GetProcAddress(m, "D3D12CreateDevice");
+    auto ser = (decltype(&D3D12SerializeRootSignature))GetProcAddress(m, "D3D12SerializeRootSignature");
+    IDXGIFactory4* f = nullptr;
+    IDXGIAdapter* warp = nullptr;
+    CHECK(create && ser && SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&f))) && SUCCEEDED(f->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
+    ID3D12Device* dev = nullptr;
+    CHECK(SUCCEEDED(create(warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))));
+    D3D12_ROOT_PARAMETER up = {D3D12_ROOT_PARAMETER_TYPE_UAV};
+    D3D12_ROOT_SIGNATURE_DESC rd = {1, &up};
+    ID3DBlob *rb = nullptr, *err = nullptr;
+    ID3D12RootSignature* rs = nullptr;
+    CHECK(SUCCEEDED(ser(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err)) && SUCCEEDED(dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(&rs))));
+    HRESULT a = compute_pso(dev, rs, GetTickCount());
+    if (wcscmp(client, L"-")) CHECK(LoadLibraryW(client));
+    HRESULT b = compute_pso(dev, rs, GetTickCount() + 1);
+    printf("created 0x%08x 0x%08x\n", (unsigned)a, (unsigned)b);
+    return 0;
+}
+
+// `selftest factoryrejected` (run unarmed): a device factory both through an SDK configuration the proxy got before its first
+// device (its CreateDeviceFactory hook) and straight from D3D12GetInterface, each after that first device was rejected.
+// Prints "config factory hooked <0|1>" (or "no config factory") and "factory hooked <0|1>": a rejected run hooks neither.
+static int factory_rejected_rows(const std::wstring& dir) {
+    HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str());
+    CHECK(m);
+    auto create = (decltype(&D3D12CreateDevice))GetProcAddress(m, "D3D12CreateDevice");
+    auto get_interface = (decltype(&D3D12GetInterface))GetProcAddress(m, "D3D12GetInterface");
+    IDXGIFactory4* f = nullptr;
+    IDXGIAdapter* warp = nullptr;
+    CHECK(create && get_interface && SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&f))) && SUCCEEDED(f->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
+    ID3D12SDKConfiguration1* cfg = nullptr;
+    bool has_cfg = SUCCEEDED(get_interface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&cfg)));
+    ID3D12Device* dev = nullptr;
+    CHECK(SUCCEEDED(create(warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))));
+    dev->Release();
+    auto hooked = [&](ID3D12DeviceFactory* fac) {
+        HMODULE owner = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)(*(void***)fac)[9], &owner);
+        return owner == m;
+    };
+    ID3D12DeviceFactory* fac = nullptr;
+    HRESULT chr = has_cfg ? cfg->CreateDeviceFactory(0, "", IID_PPV_ARGS(&fac)) : E_NOINTERFACE;  // 0, "": the system runtime's own
+    if (SUCCEEDED(chr) && fac) printf("config factory hooked %d\n", hooked(fac)), fac->Release(), fac = nullptr;
+    else printf("no config factory (0x%08x)\n", (unsigned)chr);
+    if (SUCCEEDED(get_interface(CLSID_D3D12DeviceFactory, IID_PPV_ARGS(&fac)))) printf("factory hooked %d\n", hooked(fac)), fac->Release();
+    else printf("no factory\n");
+    return 0;
+}
+
+// `selftest factory [client dll]`: a device from ID3D12DeviceFactory (the proxy's D3D12GetInterface, CLSID_D3D12DeviceFactory)
+// on WARP, and a compute PSO on it. The proxy is freed once before the device: its factory hook keeps it loaded. With a
+// client dll, it is loaded (an anti-cheat client's module name) just before the device. Prints "loaded <0|1>" and
+// "created 0x<hr>", or "no factory" where the runtime has none.
+static int factory_rows(const std::wstring& dir, const wchar_t* client = nullptr) {
     SetEnvironmentVariableW(L"SCSKILLER_MODE", L"record");
     HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str());
     CHECK(m);
@@ -3024,6 +3097,7 @@ static int factory_rows(const std::wstring& dir) {
     FreeLibrary(m);
     printf("loaded %d\n", GetModuleHandleW((dir + L"d3d12.dll").c_str()) != nullptr);
     fflush(stdout);
+    if (client) CHECK(LoadLibraryW(client));
     ID3D12Device* dev = nullptr;
     CHECK(SUCCEEDED(fac->CreateDevice(warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))));
     D3D12_ROOT_PARAMETER up = {D3D12_ROOT_PARAMETER_TYPE_UAV};
@@ -3070,16 +3144,57 @@ static int unload_rows(const std::wstring& dir) {
     return SUCCEEDED(hr) ? 0 : 1;
 }
 
+// The app's attestation for this exe, as ScsKiller.WriteAttestation writes it: scskiller.armed here (its nonce kept when it
+// has one, so copies of this exe running from the same folder share it) and the ledger entry
+// %LOCALAPPDATA%\SCSKiller\armed\<SHA-1 of the exe's path, UTF-16LE, A-Z lowered>, removed when this process exits.
+static std::wstring g_ledger;
+static void arm_self(const std::wstring& dir, std::wstring exe) {
+    WIN32_FILE_ATTRIBUTE_DATA self;
+    if (!GetFileAttributesExW(exe.c_str(), GetFileExInfoStandard, &self)) return;
+    const std::wstring armed = dir + L"scskiller.armed";
+    wchar_t nonce[64] = {};
+    if (GetPrivateProfileStringW(L"scskiller", L"nonce", L"", nonce, 64, armed.c_str()) != 32) {
+        std::random_device rd;
+        for (int i = 0; i < 32; ++i) nonce[i] = L"0123456789abcdef"[rd() & 15];
+        nonce[32] = 0;
+    }
+    WritePrivateProfileStringW(L"scskiller", L"armed", L"1", armed.c_str());
+    WritePrivateProfileStringW(L"scskiller", L"checked", L"selftest", armed.c_str());
+    WritePrivateProfileStringW(L"scskiller", L"nonce", nonce, armed.c_str());
+    WritePrivateProfileStringW(L"scskiller", L"exe_size", std::to_wstring((uint64_t)self.nFileSizeHigh << 32 | self.nFileSizeLow).c_str(), armed.c_str());
+    WritePrivateProfileStringW(L"scskiller", L"exe_time", std::to_wstring((uint64_t)self.ftLastWriteTime.dwHighDateTime << 32 | self.ftLastWriteTime.dwLowDateTime).c_str(), armed.c_str());
+    for (auto& c : exe)
+        if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
+    uint8_t h[20];
+    PWSTR local = nullptr;
+    if (BCryptHash(BCRYPT_SHA1_ALG_HANDLE, nullptr, 0, (PUCHAR)exe.data(), (ULONG)(exe.size() * sizeof(wchar_t)), h, 20) || FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)))
+        return CoTaskMemFree(local);
+    std::wstring ledger = std::wstring(local) + L"\\SCSKiller";
+    CoTaskMemFree(local);
+    CreateDirectoryW(ledger.c_str(), nullptr);
+    CreateDirectoryW((ledger += L"\\armed").c_str(), nullptr);
+    wchar_t hex[41] = {};
+    for (int i = 0; i < 20; ++i) swprintf(hex + 2 * i, 3, L"%02x", h[i]);
+    g_ledger = ledger + L"\\" + hex;
+    WritePrivateProfileStringW(L"scskiller", L"nonce", nonce, g_ledger.c_str());
+    atexit([] { DeleteFileW(g_ledger.c_str()); });
+}
+
 int wmain(int argc, wchar_t** argv) {
     wchar_t p[MAX_PATH];
     GetModuleFileNameW(nullptr, p, MAX_PATH);
     std::wstring a = p, dir = a.substr(0, a.find_last_of(L'\\') + 1);
+    // The proxy records only under the app's attestation (ScsKiller.ArmedFile); here the selftest is the app. Kept when
+    // there already, none with SCSKILLER_SELFTEST_UNARMED set.
+    if (!GetEnvironmentVariableW(L"SCSKILLER_SELFTEST_UNARMED", nullptr, 0)) arm_self(dir, a);
     if (argc > 1 && !wcscmp(argv[1], L"layoutrules")) return layout_rules();
     if (argc > 2 && !wcscmp(argv[1], L"so")) return so_rows(dir, (unsigned)_wtoi(argv[2]));
     if (argc > 2 && !wcscmp(argv[1], L"frames")) return frames_rows(dir, _wtoi(argv[2]));
     if (argc > 1 && !wcscmp(argv[1], L"unload")) return unload_rows(dir);
     if (argc > 1 && !wcscmp(argv[1], L"framesheld")) return frames_held(dir);
-    if (argc > 1 && !wcscmp(argv[1], L"factory")) return factory_rows(dir);
+    if (argc > 1 && !wcscmp(argv[1], L"factory")) return factory_rows(dir, argc > 2 ? argv[2] : nullptr);
+    if (argc > 2 && !wcscmp(argv[1], L"anticheat")) return anticheat_rows(dir, argv[2]);
+    if (argc > 1 && !wcscmp(argv[1], L"factoryrejected")) return factory_rejected_rows(dir);
     if (argc > 2 && !wcscmp(argv[1], L"chain")) return chain_rows(dir, (unsigned)_wtoi(argv[2]), argc > 3 && !wcscmp(argv[3], L"swap"));
     if (argc > 1 && !wcscmp(argv[1], L"warpluid")) {  // for scskiller_warm --adapter-luid: WARP (the runtime's checks, no GPU cache)
         IDXGIFactory4* f = nullptr;

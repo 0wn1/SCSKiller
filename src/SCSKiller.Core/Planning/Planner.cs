@@ -49,7 +49,7 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
     /// <summary>Bump when the plan for the same game and inputs changes (new pipeline kinds, root-signature rules, D3D11):
     /// the app then rebuilds plans (warmed games' when idle, ScsKiller.CheckPlans) and offers a re-warm only where the new
     /// plan has records the warm didn't replay.</summary>
-    public const int Version = 24;
+    public const int Version = 25;
 
     /// <summary>The vendor's D3D11 driver cache persists across processes, is keyed on the exe file name and caches per
     /// shader, whatever the state or the other stages (measured on NVIDIA, proxy/probe11.cpp): a staged warm
@@ -285,6 +285,11 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
     /// tessellation), and a pipeline where it is the last geometry stage fails to create (E_INVALIDARG; FF7: VSs that pass
     /// ATTRIBUTE0 on to a GS writing SV_RenderTargetArrayIndex).</summary>
     internal static bool Rasterizable(ShaderInfo s) => s.Outputs.Count == 0 || s.Outputs.Any(o => o.SysValue == 1); // no signature read: assume it does
+
+    /// <summary>The last stage before the rasterizer writes SV_Position, or there is none (compute): otherwise the game
+    /// streams the stage's output out, which a synthesized pipeline has no declaration for (the runtime: E_INVALIDARG).</summary>
+    internal static bool Positioned(IReadOnlyDictionary<Stage, ShaderInfo> st) =>
+        new[] { Stage.Geometry, Stage.Domain, Stage.Mesh, Stage.Vertex }.Where(st.ContainsKey).Select(x => st[x]).FirstOrDefault() is not { } last || Rasterizable(last);
 
     /// <summary>A pipeline's stages share one root signature: shaders that carry theirs (RTS0) must carry the same.</summary>
     internal static bool SameRs(params ShaderInfo[] s) => s.Select(x => x.RootSignature).OfType<string>().Distinct().Count() <= 1;

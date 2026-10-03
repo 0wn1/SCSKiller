@@ -532,6 +532,23 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
         finally { Directory.Delete(root, true); }
     }
 
+    /// <summary>A walk that runs out of time is not known to be clean; a missing install is.</summary>
+    [Fact]
+    public void An_anti_cheat_check_out_of_time_is_other()
+    {
+        var dir = Directory.CreateTempSubdirectory("scskiller-anticheat-budget-").FullName;
+        try
+        {
+            File.WriteAllBytes(Path.Combine(dir, "Game.exe"), new byte[100]);
+            var game = new Game("test:budget", "Budget", Store.Other, dir, Path.Combine(dir, "Game.exe"));
+            Assert.Equal(AntiCheat.None, GameFiles.DetectAntiCheat(game));
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(game, budget: TimeSpan.Zero));
+            var gone = game with { InstallDir = Path.Combine(dir, "gone"), ExePath = Path.Combine(dir, "gone", "Game.exe") };
+            Assert.Equal(AntiCheat.None, GameFiles.DetectAntiCheat(gone));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
     [Fact]
     public void Hidden_and_system_anti_cheat_markers_are_found()
     {

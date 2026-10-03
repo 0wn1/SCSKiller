@@ -87,10 +87,12 @@ public static class SessionLog
     public const double RayQueryFloorMs = 60.0;
 
     /// <summary>A ray tracing state object create this long or longer compiled; shorter, it came from the driver cache. A
-    /// cached one still costs about 1.5 ms per shader or collection (ARCHITECTURE.md). Hogwarts Legacy, the same objects in a
-    /// cold and a compiled run: cached creates p90 23 ms, p99 57 ms (3 of 875 over 60); cold ones 60 ms and more for 672
-    /// of 875. Small objects compile faster, so this undercounts compiles rather than calling a cached object compiled.</summary>
-    public const double StateObjectCompileMs = 60.0;
+    /// cached one still costs about 1.5 ms per shader or collection (ARCHITECTURE.md). The Witcher 3, 3 sessions: additions
+    /// and pipelines of 1-8 libraries repeated byte for byte from an earlier session (cached) took 6.5-23.5 ms (49 creates),
+    /// first ones 27.7 ms and more (30), single-material additions 28-80 ms. Hogwarts Legacy, the same objects in a cold
+    /// and a compiled run: cached p90 23 ms, p99 57 ms; cold ones 60 ms and more for 672 of 875, so about one cached
+    /// create in ten there counts as compiled.</summary>
+    public const double StateObjectCompileMs = 25.0;
 
     /// <summary>The last launch's stats and the exe name of the last <c>#session</c> marker (null without markers); with
     /// <paramref name="exeFileName"/>, of the last marker naming that exe apart from case (another exe of the folder may

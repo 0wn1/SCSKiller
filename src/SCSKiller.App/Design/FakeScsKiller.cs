@@ -35,7 +35,7 @@ public sealed class FakeScsKiller : IScsKiller
             bool encrypted = false, string? unsupported = null, PlanStats? plan = null, long? cache = null, TimeSpan? time = null, string at = "steam", string? exePath = null)
         {
             bool warmable = status is GameStatus.Ready or GameStatus.Stale && shaders != null;
-            var store = at switch { "steam" => Store.Steam, "epic" => Store.Epic, "xbox" => Store.Xbox, "ea" => Store.EA, _ => Store.Other };   // gog/ubisoft/battlenet: Other, like the real sources
+            var store = at switch { "steam" => Store.Steam, "epic" => Store.Epic, "xbox" => Store.Xbox, "ea" => Store.EA, "manual" => Store.Manual, _ => Store.Other };   // gog/ubisoft/battlenet: Other, like the real sources
             var game = new Game($"{at}:{id}", name, store, $@"X:\Sample\{name}", exePath ?? $@"X:\Sample\{name}\{exe}");
             return new(game,
                 new EngineInfo("Unreal", ver, null, "D3D12", encrypted, unsupported), AntiCheat.None, status, reason,
@@ -102,11 +102,17 @@ public sealed class FakeScsKiller : IScsKiller
             G("1245620", "ELDEN RING", "-", "eldenring.exe", null, GameStatus.Unsupported, "needs a recording, which EasyAntiCheat blocks") with { AntiCheat = AntiCheat.EasyAntiCheat,
                 Engine = new EngineInfo("FromSoft", "Dantelion", null, "D3D12", false, null) },
             G("293760", "Automation", "4.27", "Automation-Win64-Shipping.exe", null, GameStatus.Unsupported, packed, unsupported: packed, at: "gog"),
+            // added by the user from their exe: no store launches them
+            G("5f1c0e9a2b7d4c30", "The Talos Principle 2", "5.3", "Talos2-Win64-Shipping.exe", 71_244, GameStatus.Ready, Core.Planning.Planner.NoRecording, at: "manual"),
+            G("a93e4b1170cd2f86", "Satisfactory", "5.3", "FactoryGameSteam-Win64-Shipping.exe", 39_512, GameStatus.Unsupported,
+                "needs a recording, " + ScsKiller.ManualNoRecording, at: "manual") with { RecorderSkip = ScsKiller.SkipManual },
         ];
+        Vendor = vendor;
         timer = new Timer(_ => Tick(), null, 500, 500);
     }
 
-    public IGpuVendorBackend Vendor => vendor;
+    /// <summary>The sample NVIDIA GPU; screenshots swap in an Intel one for the Library's notice.</summary>
+    public IGpuVendorBackend Vendor { get; set; }
     public Settings Settings { get; set; } = new(30, WarmPriority.BelowNormal, DriverUpdateMode.Ask, 8, true);
     public IReadOnlyList<GameState> Games { get { lock (gate) return HideGames ? [] : games.ToList(); } }
 
@@ -253,6 +259,12 @@ public sealed class FakeScsKiller : IScsKiller
     }
     public void RefreshGame(string gameId) => GameChanged?.Invoke(Games.FirstOrDefault(g => g.Game.Id == gameId) ?? throw new ArgumentException($"unknown game '{gameId}'"));
     public void RefreshCacheSizes() { }   // sample data: nothing changes on disk
+    public ManualAdd AddManualGame(string exePath) => throw new ArgumentException("The sample library can't add games.");
+    public void RemoveManualGame(string gameId)
+    {
+        lock (gate) games.RemoveAll(g => g.Game.Id == gameId && g.Game.Store == Store.Manual);
+        GameChanged?.Invoke(Games[0]);
+    }
 
     /// <summary>Screenshots: put the running item at a given fraction of its compile.</summary>
     public void JumpTo(double fraction) => Update(() => SetCurrent(q =>

@@ -160,6 +160,22 @@
       "reason": "Major PSO stutters during play; SCSKiller measured 92 shader stutters on a cold run and 0 after one compile",
       "source": "https://www.dsogaming.com/pc-performance-analyses/silent-hill-f-benchmarks-pc-performance-analysis/",
       "date": "2026-10-02"
+    },
+    {
+      "name": "SAND LAND",
+      "ids": ["steam:1979440"],
+      "severity": "severe",
+      "reason": "Shader-compilation stutter remains during play; SCSKiller measured 38 shader stutters (worst 4.6 s) on a cold run and 1 after one compile",
+      "source": "https://www.dsogaming.com/news/sand-land-still-suffers-from-shader-compilation-traversal-stutters-on-pc/",
+      "date": "2026-10-03"
+    },
+    {
+      "name": "The Witcher 3: Wild Hunt",
+      "ids": ["steam:292030"],
+      "severity": "moderate",
+      "reason": "Its DirectX 12 build compiles shaders while you play; SCSKiller measured 9 shader stutters (worst 1.4 s) on a cold run and 0 after one compile",
+      "source": "SCSKiller measurement",
+      "date": "2026-10-03"
     }
   ]
 }

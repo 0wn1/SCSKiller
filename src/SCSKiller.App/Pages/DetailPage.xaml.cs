@@ -38,6 +38,21 @@ public sealed partial class DetailPage : Page
         DrawFrames();
     }
 
+    async void OnRemoveGame(object _, RoutedEventArgs __)
+    {
+        var id = Vm.Row.Id;
+        if (!await App.ConfirmAsync(this, $"Remove {Vm.Name} from the library?",
+                "SCSKiller forgets the game. Nothing in the game's folder is touched, and you can add it again any time.",
+                "Remove")) return;
+        try { await Task.Run(() => App.Core.RemoveManualGame(id)); }   // refused while a compile of it runs
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            await new ContentDialog { XamlRoot = XamlRoot, Title = "Couldn't remove the game", Content = ex.Message, CloseButtonText = "OK" }.ShowAsync();
+            return;
+        }
+        App.Main.Navigate(typeof(LibraryPage));
+    }
+
     void OnFrameGraphSize(object _, SizeChangedEventArgs __) => DrawFrames();
 
     FrameReport? _drawn;

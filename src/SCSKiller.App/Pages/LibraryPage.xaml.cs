@@ -53,6 +53,46 @@ public sealed partial class LibraryPage : Page
         Vm.Refresh();
     }
 
+    void OnDismissGpuNotice(InfoBar _, object __) => Vm.DismissGpuNotice();
+    // A launcher stub is resolved to the game's own exe; an exe of a listed game opens that game instead.
+    async void OnAddGame(object _, RoutedEventArgs __)
+    {
+        string? path;
+        try
+        {
+            var picker = new Microsoft.Windows.Storage.Pickers.FileOpenPicker(App.Main.AppWindow.Id)
+            {
+                SuggestedStartLocation = Microsoft.Windows.Storage.Pickers.PickerLocationId.ComputerFolder, CommitButtonText = "Add game",
+            };
+            picker.FileTypeFilter.Add(".exe");
+            path = (await picker.PickSingleFileAsync())?.Path;
+        }
+        catch (Exception ex) { await Message("Couldn't open the file picker", ex.Message); return; }
+        if (path == null) return;
+        ManualAdd added;
+        try { added = await Task.Run(() => App.Core.AddManualGame(path)); }   // reads the install's files
+        catch (Exception ex)   // a rejection's message, or a data folder SCSKiller couldn't read or write
+        {
+            await Message("Couldn't add this game", ex.Message);
+            return;
+        }
+        if (!added.Existed)
+        {
+            Vm.Rescan(force: false);   // lists it under "Added by you" once its engine and anti-cheat are checked
+            return;
+        }
+        var listed = App.Core.Games.Any(s => s.Game.Id == added.Game.Id);
+        var where = added.Game.Store == Store.Manual ? "you added it already" : $"SCSKiller found it in {Fmt.StoreName(added.Game)}";
+        if (listed && await App.ConfirmAsync(this, "Already in your library", $"{added.Game.Name} is in the list: {where}.", "Open", ContentDialogButton.Primary))
+            App.Main.Navigate(typeof(DetailPage), added.Game.Id);
+        else if (!listed) await Message("Already in your library", $"{added.Game.Name}: {where}. Refresh the library to see it.");
+    }
+
+    Task Message(string title, string text) => new ContentDialog
+    {
+        XamlRoot = XamlRoot, Title = title, Content = new TextBlock { Text = text, TextWrapping = TextWrapping.Wrap }, CloseButtonText = "OK",
+    }.ShowAsync().AsTask();
+
     void OnAddAll(object _, RoutedEventArgs __) => Vm.AddAllReady();
     void OnAddRecommended(object _, RoutedEventArgs __) => Vm.AddAllRecommended();
 

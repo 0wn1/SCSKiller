@@ -45,10 +45,11 @@ static class Fmt
     public static string? StutterTip(GameState s) => s.KnownStutter is { } k
         ? $"{(k.Severity == StutterSeverity.Severe ? "Severe" : "Moderate")} shader-compilation stutter: {k.Reason}.\nSource: {k.Source} (checked {k.Date})" : null;
     /// <summary>Library sections, in list order. GOG, Ubisoft and Battle.net games are Store.Other: told apart by their id prefix.</summary>
-    public static readonly string[] Stores = ["Steam", "Epic Games", "Xbox / Game Pass", "EA app", "GOG", "Ubisoft Connect", "Battle.net", "Other"];
+    public static readonly string[] Stores = ["Steam", "Epic Games", "Xbox / Game Pass", "EA app", "GOG", "Ubisoft Connect", "Battle.net", "Other", AddedByYou];
+    public const string AddedByYou = "Added by you";
     public static string StoreName(Game g) => g.Store switch
     {
-        Store.Steam => "Steam", Store.Epic => "Epic Games", Store.Xbox => "Xbox / Game Pass", Store.EA => "EA app",
+        Store.Steam => "Steam", Store.Epic => "Epic Games", Store.Xbox => "Xbox / Game Pass", Store.EA => "EA app", Store.Manual => AddedByYou,
         _ => g.Id[..Math.Max(0, g.Id.IndexOf(':'))] switch { "gog" => "GOG", "ubisoft" => "Ubisoft Connect", "battlenet" => "Battle.net", _ => "Other" },
     };
     /// <summary>Measured driver cache when known, else the estimate.</summary>
@@ -87,9 +88,12 @@ static class Fmt
         }
         catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException)
         {
-            return $"Couldn't start {g.Name} through {StoreName(g)}: {e.Message}";
+            return $"Couldn't start {g.Name}{(g.Store == Store.Manual ? "" : " through " + StoreName(g))}: {e.Message}";
         }
     }
+
+    /// <summary>The Play button's tooltip when it can start the game.</summary>
+    public static string PlayVia(Game g) => g.Store == Store.Manual ? $"Start {Path.GetFileName(g.ExePath)}" : $"Play through {StoreName(g)}";
 }
 
 /// <summary>Folds a burst of Core events into one run on the UI thread: a scan raises GameChanged once per game (62 at
@@ -263,7 +267,7 @@ public sealed class GameRow(GameState s, bool queued = false, bool compiling = f
         GameStatus.Ready => "Ready to compile",
         GameStatus.NeedsRecording => "Needs a 5-min recording",
         GameStatus.Stale => "Needs rebuilding",
-        _ => s.Engine?.Encrypted == true ? "Encrypted game files" : "Not supported yet",
+        _ => s.ShaderModBlocks ? "Not compiled" : s.Engine?.Encrypted == true ? "Encrypted game files" : "Not supported yet",
     };
     /// <summary>The whole reason: the row's tooltip and the game page's status text.</summary>
     public string FullNote => s.Status switch
@@ -274,7 +278,9 @@ public sealed class GameRow(GameState s, bool queued = false, bool compiling = f
         GameStatus.NeedsRecording when s.RecordingPaused => ScsKiller.PausedNote(App.Core.Settings),
         GameStatus.NeedsRecording when s.RecorderInstalled => "recorder on: play for about 5 minutes",
         _ => s.StatusReason,
-    };
+    } + ModNote(s);
+    /// <summary>A shader mod that doesn't block the game: "; RenoDX replaces some shaders: ...".</summary>
+    internal static string ModNote(GameState s) => s is { ShaderMod: { } m, ShaderModBlocks: false } ? "; " + ScsKiller.ShaderModNote(m) : "";
     /// <summary>The row's note under the status: a few words (<see cref="Format.ShortNote"/>); null when the status says it all.</summary>
     public string? Note => Format.ShortNote(s);
     public string RowNote => Playing ? "Playing now" + (Note is { } n ? " · " + n : "") : Note ?? "";
@@ -301,12 +307,12 @@ public sealed class GameRow(GameState s, bool queued = false, bool compiling = f
     public bool IsEncrypted => s.Engine?.Encrypted == true;
     public string Reason => s.StatusReason;
 
-    // Play goes through the store; never for an anti-cheat game (SCSKiller never launches them)
+    // Play goes through the store (a game the user added: its exe); never for an anti-cheat game (SCSKiller never launches them)
     public bool CanLaunch { get; } = s.AntiCheat == AntiCheat.None && StoreLaunch.Supported(s.Game);
     public bool Compiling => compiling;
     public bool CanPlay => !Playing && !compiling;
     public string PlayText => Playing ? "Running" : "Play";
-    public string PlayTip => Playing ? $"{Name} is running" : compiling ? Fmt.CompilingTip : $"Play through {StoreName}";
+    public string PlayTip => Playing ? $"{Name} is running" : compiling ? Fmt.CompilingTip : Fmt.PlayVia(s.Game);
 
     public override string ToString() => $"{Name}, {StatusText}, {RowTip}";   // list item name for screen readers
 }
@@ -352,6 +358,13 @@ public sealed class LibraryVm : Bindable
     public bool HasRefreshNote => RefreshNote != null;
     public string? Error { get; private set; }
     public bool HasError => Error != null;
+    public string? GpuNotice => Format.GpuNotice(App.Core.Vendor.Gpu, App.Core.Settings.GpuNoticeDismissed);
+    public bool HasGpuNotice => GpuNotice != null;
+    public void DismissGpuNotice()
+    {
+        App.Core.Settings = App.Core.Settings with { GpuNoticeDismissed = App.Core.Vendor.Gpu.Name };
+        Changed();
+    }
 
     public string Summary { get; private set; } = "";
     public int ReadyCount { get; private set; }     // ready and not queued yet
@@ -449,7 +462,7 @@ public sealed class LibraryVm : Bindable
         ReadyCount = Games.Count(r => r.IsAdd && !r.Queued);
         RecommendedCount = RecommendedToAdd().Count;
         WaitingCount = queue.Count(q => q.Stage == QueueStage.Waiting);
-        var stores = Fmt.Stores.Where(n => Games.Any(r => r.StoreName == n)).ToList();
+        var stores = Fmt.Stores.Where(n => n != Fmt.AddedByYou && Games.Any(r => r.StoreName == n)).ToList();
         var storeText = stores.Count > 2 ? $"{stores.Count} stores" : string.Join(" and ", stores);
         bool allUnreal = list.Count > 0 && list.All(g => g.Engine?.Family == "Unreal");
         Summary = Scanning && list.Count == 0 ? "Looking for games…"
@@ -545,6 +558,8 @@ public sealed class DetailVm(string id) : Bindable
     /// <summary>Needs a recording for its ray tracing only: the rest compiles (a partial compile, offered but not the primary action).</summary>
     bool RtPartial => s.Status == GameStatus.NeedsRecording && ScsKiller.NeedsRtRecording(s.Plan);
     public bool NoAntiCheat => s.AntiCheat == AntiCheat.None;
+    /// <summary>The recorder may go next to the game: no anti-cheat, and not a game the user added.</summary>
+    bool CanRecord => NoAntiCheat && !IsManual;
 
     public string Name => s.Game.Name;
     public string Sub => $"{Path.GetFileName(s.Game.ExePath)} · {Fmt.StoreName(s.Game)}";   // engine and API are tags
@@ -565,7 +580,7 @@ public sealed class DetailVm(string id) : Bindable
             + (Row.Note != null ? ". " + Sentence(s.StatusReason) : ""),
         GameStatus.NeedsRecording => HasDbTeaser ? Row.FullNote.Replace("; " + ScsKiller.InDbNote, "") : Row.FullNote,   // the teaser says it
         _ => s.StatusReason,
-    });
+    } + (s.Status == GameStatus.NeedsRecording ? "" : GameRow.ModNote(s)));   // FullNote has it
 
     // The manifest is public: a PC without "db" sees that the community database covers the game, and where to get it.
     // Shown, it is the page's only mention of the database.
@@ -581,7 +596,8 @@ public sealed class DetailVm(string id) : Bindable
     public bool ShowPlay => Row.CanLaunch;
     public bool CanPlay => !s.Playing && !CompilingSoon;
     public string PlayText => s.Playing ? "Running" : "Play";
-    public string PlayTip => s.Playing ? $"{s.Game.Name} is running" : CompilingSoon ? Fmt.CompilingTip : $"Play through {Row.StoreName}";
+    public string PlayTip => s.Playing ? $"{s.Game.Name} is running" : CompilingSoon ? Fmt.CompilingTip : Fmt.PlayVia(s.Game);
+    public bool IsManual => s.Game.Store == Store.Manual;
     public void Play()
     {
         Error = Fmt.Play(s.Game);
@@ -640,7 +656,7 @@ public sealed class DetailVm(string id) : Bindable
 
     // The one tip left: a game that can't compile before a recording, or not its ray tracing (a plan's other gaps are the
     // coverage card's "what's left").
-    public bool HasRecordTip => NoAntiCheat && s.Status == GameStatus.NeedsRecording && !RecordOn;
+    public bool HasRecordTip => CanRecord && s.Status == GameStatus.NeedsRecording && !RecordOn;
     public string RecordTipTitle => "Record 5 minutes of play";
     public string RecordTip => RtPartial ? "Turn on recording and play with ray tracing on for about 5 minutes. " + ScsKiller.RtWhy(App.Core.Vendor.Caps, s.Engine)
             + " Everything else compiles from the game files already."
@@ -680,7 +696,7 @@ public sealed class DetailVm(string id) : Bindable
         p.MiddlewareItems > 0 ? new(p.MiddlewareSharedItems == 0 ? "Its upscalers, learned from recordings"
             : p.MiddlewareSharedItems == p.MiddlewareItems ? "Its upscalers, from shared packs" : "Its upscalers, from recordings and shared packs", Fmt.N(p.MiddlewareItems)) : null,
         p.D3D11Shaders > 0 ? new("DirectX 11 shaders", Fmt.N(p.D3D11Shaders)) : null,
-        p.RtLibraries > 0 ? new("Ray-traced effects", p.RtUncovered == 0 ? "covered" : !Rt ? "mostly covered" : NoAntiCheat ? "need a recording" : "not compiled") : null,
+        p.RtLibraries > 0 ? new("Ray-traced effects", p.RtUncovered == 0 ? "covered" : !Rt ? "mostly covered" : CanRecord ? "need a recording" : "not compiled") : null,
     }.OfType<DetailRow>().ToList();
     public bool HasSources => Sources.Count > 0;
     /// <summary>The community database's line under the recording row; null = nothing to say.</summary>
@@ -693,7 +709,7 @@ public sealed class DetailVm(string id) : Bindable
     // Ray tracing the plan can't compile comes first, in the status's words (ScsKiller.RtNote).
     enum Left { AntiCheat, EngineSlots, UnknownSlots, NotSeen, Recording, PlayedClean, PlayedCompiles, NothingKnown, PlayOnly }
     long Missing => P is { } m ? Math.Max(m.LeftOut, m.Uncovered) : 0;   // a plan without LeftOut: Uncovered only
-    Left LeftCase => !NoAntiCheat ? Left.AntiCheat
+    Left LeftCase => !CanRecord ? Left.AntiCheat
         : Missing > 0 ? P!.Uncovered * 2 >= Missing ? P.Recorded == 0 ? Left.EngineSlots : Left.UnknownSlots : Left.NotSeen
         : RecordOn ? Left.Recording
         : L is { } l ? PlayCompiles(l) == 0 ? Left.PlayedClean : Left.PlayedCompiles   // what was measured beats what's likely
@@ -703,11 +719,12 @@ public sealed class DetailVm(string id) : Bindable
     /// <summary>tipAsks: the record tip already gives the ray tracing note and the recording advice.</summary>
     string LeftSentences(bool tipAsks) => string.Join(" ", new string?[]
     {
-        !Rt || tipAsks ? null : NoAntiCheat ? (HasDbTeaser ? ScsKiller.RtNeedsRecording : ScsKiller.RtNote(s.InCommunityDb)) + "."
-            : $"Ray-traced effects aren't compiled: they need a recording, which {Fmt.AntiCheatName(s.AntiCheat)} blocks.",
+        !Rt || tipAsks ? null : CanRecord ? (HasDbTeaser ? ScsKiller.RtNeedsRecording : ScsKiller.RtNote(s.InCommunityDb)) + "."
+            : $"Ray-traced effects aren't compiled: they need a recording, {(NoAntiCheat ? ScsKiller.ManualNoRecording : $"which {Fmt.AntiCheatName(s.AntiCheat)} blocks")}.",
         LeftCase switch
         {
-            Left.AntiCheat => $"Anything else compiles while you play: {Fmt.AntiCheatName(s.AntiCheat)} blocks the recording that would find it.",
+            Left.AntiCheat => NoAntiCheat ? "Anything else compiles while you play: recording, which would find it, isn't available for games added by hand yet."
+                : $"Anything else compiles while you play: {Fmt.AntiCheatName(s.AntiCheat)} blocks the recording that would find it.",
             Left.EngineSlots => "The rest use shader slots this game's engine adds." + (tipAsks ? "" : " A 5-minute recording lets SCSKiller rebuild them."),
             Left.UnknownSlots => "The rest use shader slots SCSKiller can't rebuild yet, so they still compile while you play.",
             Left.NotSeen => "SCSKiller hasn't seen how the game sets the rest up yet." + (tipAsks ? "" : " Playing longer with recording on teaches it."),
@@ -822,7 +839,7 @@ public sealed class DetailVm(string id) : Bindable
     // game's library or the driver cache; ray tracing state objects have their own line, so Requests isn't used.
     SessionStats? L => s.LastSession;
     public bool HasSession => L != null;
-    public bool ShowSessionHint => L == null && NoAntiCheat;
+    public bool ShowSessionHint => L == null && CanRecord;
     public string SessionHeader => L is { } l ? $"Last time you played · {Format.Duration(F?.Duration ?? l.Duration)}" : "";
     // ray tracing state objects included, so the headline agrees with the ray tracing line under it
     static long PlayCompiles(SessionStats l) => l.Compiles + l.StateObjectsCompiled;
@@ -907,12 +924,13 @@ public sealed class DetailVm(string id) : Bindable
     public string UseDefaultText => $"Use default ({(App.Core.Settings.RecordAllGames ? "on" : "off")})";
     public string RecordNote => !NoAntiCheat
         ? $"Not available: {Fmt.AntiCheatName(s.AntiCheat)} treats an extra d3d12.dll as tampering, so this game is compiled from its files only."
+        : s.RecorderSkip == ScsKiller.SkipManual ? "Not available: recording isn't available for games added by hand yet, so this game is compiled from its files only."
         : s.RecorderSkip is { } skip ? $"Not available: {skip}."
         : "Adds a small d3d12.dll next to the game to catch anything the plan missed and time each frame, so this page shows what stuttered. Remove any time."
           + (s.RecorderNote is { } note ? $" ({Sentence(note)})" : "");
 
     // A mod's d3d12.dll where the recorder goes (ReShade, a wrapper): off = the game isn't recorded; on = the recorder chains to it
-    public bool HasMod => s.RecorderMod != null && s.RecorderSkip is not (ScsKiller.SkipAntiCheat or ScsKiller.SkipUnsupported or ScsKiller.SkipNotDx12);
+    public bool HasMod => s.RecorderMod != null && s.RecorderSkip is not (ScsKiller.SkipAntiCheat or ScsKiller.SkipShaderMod or ScsKiller.SkipManual or ScsKiller.SkipUnsupported or ScsKiller.SkipNotDx12);
     public string AlongsideTitle => $"Record alongside {s.RecorderMod}";
     public string AlongsideNote => $"{s.RecorderMod}'s d3d12.dll is renamed while the recorder is in, and restored exactly as it was when it's removed.";
     public bool? AlongsidePending { get; set; }
@@ -1212,7 +1230,7 @@ public sealed class SettingsVm : Bindable
         get
         {
             var games = App.Core.Games;
-            var skipped = games.Where(g => g.RecorderSkip is ScsKiller.SkipAntiCheat or ScsKiller.SkipForeignDll or ScsKiller.SkipModNotChainable
+            var skipped = games.Where(g => g.RecorderSkip is ScsKiller.SkipAntiCheat or ScsKiller.SkipShaderMod or ScsKiller.SkipForeignDll or ScsKiller.SkipModNotChainable
                     or ScsKiller.SkipVulkanMod or ScsKiller.SkipNeedsAdmin)
                 .GroupBy(g => g.RecorderSkip).OrderByDescending(x => x.Count()).Select(x => $" · {x.Count()} skipped: {x.Key}");
             int n = games.Count(g => g.RecorderInstalled);

@@ -59,10 +59,20 @@ public sealed class SteamSource(string? steamRoot = null) : IGameSource
 
     readonly object _gate = new();
 
-    /// <summary>common/type of the given app ids from appinfo.vdf (binary KeyValues, v28 or v29; format: tools/steamdata.py),
-    /// streamed: other apps are skipped by their size. Null when the file is missing or not understood; an app that is
-    /// absent or whose entry doesn't parse is just missing from the result.</summary>
+    /// <summary>common/type of the given app ids from appinfo.vdf; see <see cref="Apps"/>.</summary>
     public static Dictionary<uint, string>? AppTypes(string path, IReadOnlySet<uint> ids)
+    {
+        if (Apps(path, ids) is not { } apps) return null;
+        var types = new Dictionary<uint, string>();
+        foreach (var (id, app) in apps)
+            if (app.GetValueOrDefault("common") is Dictionary<string, object> common && common.GetValueOrDefault("type") is string type) types[id] = type;
+        return types;
+    }
+
+    /// <summary>The appinfo object (common, config...) of the given app ids from appinfo.vdf (binary KeyValues, v28 or v29;
+    /// format: tools/steamdata.py), streamed: other apps are skipped by their size. Null when the file is missing or not
+    /// understood; an app that is absent or whose entry doesn't parse is just missing from the result.</summary>
+    public static Dictionary<uint, Dictionary<string, object>>? Apps(string path, IReadOnlySet<uint> ids)
     {
         try
         {
@@ -81,7 +91,7 @@ public sealed class SteamSource(string? steamRoot = null) : IGameSource
                 f.Position = start;
             }
             else if (magic != 0x07564428) return null;
-            var types = new Dictionary<uint, string>();
+            var apps = new Dictionary<uint, Dictionary<string, object>>();
             for (uint id; (id = r.ReadUInt32()) != 0;)
             {
                 var size = r.ReadUInt32();
@@ -91,12 +101,11 @@ public sealed class SteamSource(string? steamRoot = null) : IGameSource
                 try
                 {
                     var kv = Object(entry, keys);
-                    if ((kv.GetValueOrDefault("appinfo") as Dictionary<string, object> ?? kv).GetValueOrDefault("common") is Dictionary<string, object> common
-                        && common.GetValueOrDefault("type") is string type) types[id] = type;
+                    apps[id] = kv.GetValueOrDefault("appinfo") as Dictionary<string, object> ?? kv;
                 }
                 catch (Exception e) when (e is InvalidDataException or EndOfStreamException or IndexOutOfRangeException) { }
             }
-            return types;
+            return apps;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidDataException or ArgumentException or IndexOutOfRangeException)
         {

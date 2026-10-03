@@ -74,6 +74,15 @@ public sealed class StoreLaunchTests : IDisposable
     }
 
     [Fact]
+    public void A_game_the_user_added_runs_its_exe_from_its_folder()
+    {
+        var g = G("manual:0123456789abcdef", Store.Manual, @"X:\Games\Some Game");
+        Assert.True(StoreLaunch.Supported(g));
+        var c = StoreLaunch.Command(g)!;
+        Assert.Equal((@"X:\Games\Some Game\game.exe", @"X:\Games\Some Game", ""), (c.FileName, c.WorkingDirectory, c.Arguments));
+    }
+
+    [Fact]
     public void Ea_battlenet_and_unknown_stores_have_no_launch()
     {
         foreach (var g in new[] { G("ea:1234567", Store.EA), G("battlenet:prometheus", Store.Other), G("manual:x", Store.Other) })

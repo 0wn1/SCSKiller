@@ -13,7 +13,12 @@ public class RecordingsTests(ITestOutputHelper output) : IDisposable
 {
     readonly string _dir = Directory.CreateTempSubdirectory("scskiller-recordings-test-").FullName;
 
-    public void Dispose() => Directory.Delete(_dir, true);
+    bool _leak;   // a test's thread may still hold a file in it
+
+    public void Dispose()
+    {
+        if (!_leak) Directory.Delete(_dir, true);
+    }
 
     static PsoDb.Rec Blob(byte[] b) => new('B', [.. SHA1.HashData(b), .. b]);
     static string Sha(byte[] b) => PsoDb.Hex(SHA1.HashData(b));
@@ -95,33 +100,70 @@ public class RecordingsTests(ITestOutputHelper output) : IDisposable
     public async Task The_lock_is_an_exclusive_file_reentered_by_its_holder_and_waited_for_up_to_a_limit()
     {
         var path = Path.Combine(_dir, "recording.db");
-        using var held = new ManualResetEventSlim();
-        using var release = new ManualResetEventSlim();
-        var first = Task.Factory.StartNew(() =>
+        var deadline = TimeSpan.FromSeconds(60);   // each step's: a wait that ignores its limit would otherwise take the default 10 minutes
+        var held = new ManualResetEventSlim();
+        var release = new ManualResetEventSlim();
+        var cleanup = new CancellationTokenSource();   // every acquisition's: the cleanup ends whichever still waits
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(cleanup.Token);   // a community download's deadline, a stopped queue
+        var workers = new List<Task>();
+        Task<T> Worker<T>(Func<T> body)
         {
-            using (Recordings.Lock(path))
-            using (Recordings.Lock(path))   // re-entered (ImportRecording -> WriteKeys): no wait on itself
+            var t = Task.Factory.StartNew(body, TaskCreationOptions.LongRunning);
+            workers.Add(t);
+            return t;
+        }
+        // Timed on the waiting thread itself: under a loaded test run the thread pool starves, which delays an await's
+        // continuation and a CancellationTokenSource's timer by seconds, not the wait.
+        Task<(Exception? Error, TimeSpan Waited)> Waiter(Action wait) => Worker(() =>
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            return (Record.Exception(wait), clock.Elapsed);
+        });
+        try
+        {
+            var first = Worker(() =>
             {
-                held.Set();
-                release.Wait();
+                using (Recordings.Lock(path, ct: cleanup.Token))
+                using (Recordings.Lock(path, ct: cleanup.Token))   // re-entered (ImportRecording -> WriteKeys): no wait on itself
+                {
+                    held.Set();
+                    release.Wait();
+                }
+                return true;
+            });
+            Assert.True(held.Wait(TimeSpan.FromSeconds(10)));
+            var second = Worker(() => { using (Recordings.Lock(path, ct: cleanup.Token)) { } return true; });
+            Assert.False(second.Wait(300));   // a file, so a process in another session waits the same way
+            Assert.Throws<IOException>(() => new FileStream(path + ".lock", FileMode.Open, FileAccess.Read, FileShare.ReadWrite));
+
+            var (error, waited) = await Waiter(() => Recordings.Lock(path, TimeSpan.FromMilliseconds(200), cleanup.Token).Dispose()).WaitAsync(deadline);
+            Assert.IsType<IOException>(error);
+            Assert.True(waited.TotalSeconds >= 0.15, $"gave up after {waited.TotalSeconds:0.000} s, before its limit");
+
+            var cancelled = Waiter(() => Recordings.Lock(path, ct: cts.Token).Dispose());
+            Assert.False(cancelled.Wait(300));
+            cts.Cancel();
+            Assert.IsAssignableFrom<OperationCanceledException>((await cancelled.WaitAsync(deadline)).Error);
+
+            release.Set();
+            await first.WaitAsync(deadline);
+            await second.WaitAsync(deadline);
+        }
+        finally
+        {
+            // a failed step leaves no thread holding the lock file or using the events once they're disposed
+            release.Set();
+            cleanup.Cancel();
+            bool joined;
+            try { joined = Task.WaitAll([.. workers], deadline); }
+            catch (AggregateException) { joined = true; }   // they ended; the test's own failure is the one reported
+            if (!joined)
+            {
+                _leak = true;   // a thread still owns the lock file: the folder and the events are left, not raced
+                Assert.Fail($"a lock thread still runs {deadline.TotalSeconds:0} s after the cleanup cancelled it; {_dir} is left");
             }
-        }, TaskCreationOptions.LongRunning);
-        Assert.True(held.Wait(TimeSpan.FromSeconds(10)));
-        var second = Task.Factory.StartNew(() => { using (Recordings.Lock(path)) { } }, TaskCreationOptions.LongRunning);
-        Assert.False(second.Wait(300));   // a file, so a process in another session waits the same way
-        Assert.Throws<IOException>(() => new FileStream(path + ".lock", FileMode.Open, FileAccess.Read, FileShare.ReadWrite));
-        var clock = System.Diagnostics.Stopwatch.StartNew();
-        await Assert.ThrowsAsync<IOException>(() => Task.Factory.StartNew(() => Recordings.Lock(path, TimeSpan.FromMilliseconds(200)).Dispose(),
-            TaskCreationOptions.LongRunning));
-        Assert.InRange(clock.Elapsed.TotalSeconds, 0.15, 5);
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));   // a community download's deadline, a stopped queue
-        clock.Restart();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Task.Factory.StartNew(() => Recordings.Lock(path, ct: cts.Token).Dispose(),
-            TaskCreationOptions.LongRunning));
-        Assert.InRange(clock.Elapsed.TotalSeconds, 0.15, 5);
-        release.Set();
-        await first;
-        await second.WaitAsync(TimeSpan.FromSeconds(10));
+            foreach (var d in new IDisposable[] { held, release, cts, cleanup }) d.Dispose();
+        }
     }
 
     [Fact]

@@ -1,6 +1,7 @@
 using System.Globalization;
 using SCSKiller.Core;
 using SCSKiller.Core.App;
+using SCSKiller.Core.Vendors;
 
 namespace SCSKiller.Tests.Platform;
 
@@ -85,5 +86,34 @@ public class FormatTests
             (S(GameStatus.Warmed, "warmed for driver 610.88"), "Driver 610.88"),
         };
         Assert.All(cases, c => Assert.Equal(c.Note, Format.ShortNote(c.State)));
+    }
+
+    static GpuInfo Gpu(GpuVendor v, string name, ulong vram) => new(v, name, "1.0", 0, vram);
+
+    [Fact]
+    public void The_gpu_notice_shows_on_other_vendors_until_closed_for_that_gpu()
+    {
+        Assert.StartsWith("SCSKiller doesn't compile on Intel GPUs yet", Format.GpuNotice(Gpu(GpuVendor.Intel, "Intel Graphics", 0), null));
+        Assert.StartsWith("SCSKiller doesn't compile on Qualcomm GPUs yet", Format.GpuNotice(Gpu(GpuVendor.Qualcomm, "Adreno", 0), null));
+        Assert.StartsWith("SCSKiller doesn't compile on this GPU yet", Format.GpuNotice(Gpu(GpuVendor.Unknown, "no D3D adapter", 0), null));
+        Assert.Null(Format.GpuNotice(Gpu(GpuVendor.Nvidia, "NVIDIA GeForce", 8UL << 30), null));
+        Assert.Null(Format.GpuNotice(Gpu(GpuVendor.Amd, "AMD Radeon", 8UL << 30), null));
+        Assert.Null(Format.GpuNotice(Gpu(GpuVendor.Intel, "Intel Graphics", 0), "Intel Graphics"));
+        Assert.NotNull(Format.GpuNotice(Gpu(GpuVendor.Intel, "Intel Arc", 0), "Intel Graphics"));   // another GPU than the one it was closed for
+        Assert.Null(AppStore.DefaultSettings.GpuNoticeDismissed);
+    }
+
+    [Fact]
+    public void A_laptop_with_integrated_intel_and_a_discrete_gpu_uses_the_discrete_one_and_gets_no_notice()
+    {
+        var intel = new DxgiAdapter(Gpu(GpuVendor.Intel, "Intel Graphics", 128UL << 20), 0x46A6, 0);
+        foreach (var dgpu in new[] { Gpu(GpuVendor.Nvidia, "NVIDIA GeForce Laptop GPU", 8UL << 30), Gpu(GpuVendor.Amd, "AMD Radeon", 8UL << 30) })
+        {
+            var discrete = new DxgiAdapter(dgpu, 0x10, 0);
+            Assert.Equal(dgpu, GpuBackends.Primary([intel, discrete]));   // DXGI lists the iGPU first on most laptops
+            Assert.Equal(dgpu, GpuBackends.Primary([discrete, intel]));
+            Assert.Null(Format.GpuNotice(GpuBackends.Primary([intel, discrete])!, null));
+        }
+        Assert.Equal(intel.Gpu, GpuBackends.Primary([intel]));
     }
 }

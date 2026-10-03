@@ -202,6 +202,20 @@ public class MiddlewarePackTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void AGameTheUserAddedNeverFillsAPackButIsSeededFromOne()
+    {
+        var x = Make("mw-manual");
+        var dir = Install(x, "added", x.Dll);
+        var added = new Game("manual:0123456789abcdef", "added", Store.Manual, dir, Path.Combine(dir, "game.exe"));
+        var planner = new Planner(x.PacksDir);
+        planner.Build(added, Engine, Index(Sha(x.GameCs)), new Recording(x.RecordingDb), Caps, Path.Combine(x.Root, "plan-added"), null, default);
+        Assert.False(Directory.Exists(Path.Combine(x.PacksDir, "amd")));   // its recording's PSOs stay its own
+
+        planner.Build(GameIn(Install(x, "store", x.Dll), "test:store"), Engine, Index(Sha(x.GameCs)), new Recording(x.RecordingDb), Caps, Path.Combine(x.Root, "plan-store"), null, default);
+        Assert.Equal(3, planner.Build(added, Engine, Index(), null, Caps, Path.Combine(x.Root, "plan-added-2"), null, default).Stats.MiddlewareItems);
+    }
+
+    [Fact]
     public void SeedsAnotherInstallWithTheSameDllAndMaterializesFromItsCopy()
     {
         var x = Make("mw-seed");

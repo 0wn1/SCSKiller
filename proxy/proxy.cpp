@@ -27,6 +27,7 @@
 // (1 device, 2 thread, 3 PSO extension), u32 pipeline creation flags (NvExt); the warm creates that record with it.
 #define NOMINMAX
 #include <windows.h>
+#include <shlobj.h>
 #include <psapi.h>
 #include <share.h>
 #include <d3d12.h>
@@ -54,6 +55,8 @@
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "dxguid.lib")  // CLSID_D3D12DeviceFactory, CLSID_D3D12SDKConfiguration
+#pragma comment(lib, "shell32.lib")  // SHGetKnownFolderPath (delay-loaded: only at the first device)
+#pragma comment(lib, "ole32.lib")    // CoTaskMemFree (likewise)
 
 using Hash = std::array<uint8_t, 20>;
 struct HashH { size_t operator()(const Hash& h) const { size_t v; memcpy(&v, h.data(), sizeof v); return v; } };
@@ -127,15 +130,174 @@ static std::wstring exe_name() {
     std::wstring s = p;
     return s.substr(s.find_last_of(L"\\/") + 1);
 }
+// Until the first device decides admission, the log isn't opened (a pass-through writes nothing): lines wait here.
+// g_log and g_log_deferred change under g_early_mx (admitted), and logf reads them under it.
+static std::mutex g_early_mx;
+static std::string g_early;
+static bool g_log_deferred;
 void logf(const char* fmt, ...) {  // also used by warm11.cpp
-    if (!g_log) return;
     va_list a;
     va_start(a, fmt);
-    fprintf(g_log, "[%9.1fs] ", now_ms() / 1000);
-    vfprintf(g_log, fmt, a);
-    fputc('\n', g_log);
-    fflush(g_log);
+    int n = vsnprintf(nullptr, 0, fmt, a);
     va_end(a);
+    if (n < 0) return;
+    char t[24];
+    snprintf(t, sizeof t, "[%9.1fs] ", now_ms() / 1000);
+    std::string line(n + 1, '\0');
+    va_start(a, fmt);
+    vsnprintf(line.data(), line.size(), fmt, a);
+    va_end(a);
+    line.back() = '\n';
+    std::lock_guard l(g_early_mx);
+    if (g_log) fputs((t + line).c_str(), g_log), fflush(g_log);
+    else if (g_log_deferred) g_early += t + line;
+}
+
+// Admission, decided once at the first device (any path: D3D12CreateDevice, a device factory; D3D12GetInterface's hooks
+// only forward until then). The recorder records for the whole run only when all hold, else it is a pure pass-through
+// (no device hooked, nothing written):
+//  - scskiller.armed has [scskiller] armed=1 and this process's exe as it was then: the app wrote it after a clean full
+//    anti-cheat check of the install and deletes it on any change there (GameFiles.DetectAntiCheat walks the install;
+//    this dll doesn't);
+//  - no anti-cheat marker in this folder: the built-in list, plus scskiller.ini markers= (it only adds; malformed: no);
+//  - no anti-cheat client module loaded.
+// scskiller.armed is read again after the rest: changed or gone (the app disarmed it meanwhile) is a pass-through.
+// Accepted limits: a client that loads later in an admitted run isn't caught here (the app removes the recorder and the
+// next launch isn't armed); the app arms after its check and its install watcher's events arrive milliseconds after the
+// change, so a launch inside that window may be admitted (the exe fingerprint covers updates); an anti-cheat added while
+// SCSKiller isn't running, without any change to the game's exe (the armed file stays valid with the app closed, so the
+// recorder keeps working then); another program deliberately holding SCSKiller's own ledger entry open (read-shared)
+// together with the game-folder file (the app's <entry>.revoked mark beside it still refuses, when it can be made).
+static const wchar_t* const kAntiCheatMarkers[] = {  // GameFiles.Markers; "*x": a name ending in x
+    L"EasyAntiCheat", L"EasyAntiCheat_EOS", L"start_protected_game.exe", L"EasyAntiCheat_EOS_Setup.exe", L"EasyAntiCheat_Setup.exe",
+    L"BattlEye", L"BEService.exe", L"BEService_x64.exe", L"BELauncher.exe", L"EAAntiCheat.Installer.exe", L"GameGuard",
+    L"XIGNCODE", L"nProtect", L"randgrid.sys", L"*_BE.exe"};
+static std::atomic<int> g_admission;  // 0 undecided, 1 records, -1 pass-through
+static bool anti_cheat_loaded() {
+    for (auto m : {L"EasyAntiCheat_x64.dll", L"EasyAntiCheat_EOS.dll", L"BEClient_x64.dll", L"BEClient.dll"})
+        if (GetModuleHandleW(m)) return true;
+    return false;
+}
+static bool is_marker(const wchar_t* name, const std::vector<std::wstring>& markers) {
+    size_t n = wcslen(name);
+    for (auto& m : markers)
+        if (m[0] == L'*' ? n >= m.size() - 1 && !_wcsicmp(name + n - (m.size() - 1), m.c_str() + 1) : !_wcsicmp(name, m.c_str())) return true;
+    return false;
+}
+// False: an addition in markers= that isn't a plain name (empty, a path, a wildcard other than a leading '*').
+static bool anti_cheat_markers(std::vector<std::wstring>& out) {
+    out.assign(std::begin(kAntiCheatMarkers), std::end(kAntiCheatMarkers));
+    wchar_t v[4096];
+    DWORD n = GetPrivateProfileStringW(L"scskiller", L"markers", L"", v, 4096, (g_dir + L"scskiller.ini").c_str());
+    if (n >= 4094) return false;
+    if (!n) return true;
+    std::wstring s = v;
+    for (size_t at = 0;;) {
+        size_t bar = s.find(L'|', at);
+        std::wstring m = s.substr(at, bar == std::wstring::npos ? std::wstring::npos : bar - at);
+        if (m.empty() || m.find_first_of(L"\\/:?\"<>") != std::wstring::npos || m.find(L'*', 1) != std::wstring::npos || m == L"*") return false;
+        out.push_back(m);
+        if (bar == std::wstring::npos) return true;
+        at = bar + 1;
+    }
+}
+// Any marker among this folder's entries (at most 100,000 read; more, or a listing that fails, counts as one).
+static bool anti_cheat_beside(const std::vector<std::wstring>& markers) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW((g_dir + L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return true;
+    bool found = false;
+    size_t seen = 0;
+    do found = ++seen > 100000 || is_marker(fd.cFileName, markers);
+    while (!found && FindNextFileW(h, &fd));
+    bool listed = found || GetLastError() == ERROR_NO_MORE_FILES;
+    FindClose(h);
+    return found || !listed;
+}
+// scskiller.armed as it is now (at most 4 KB; "" when missing or unreadable).
+static std::string small_file(const std::wstring& path) {
+    HANDLE h = path.empty() ? INVALID_HANDLE_VALUE : CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return "";
+    std::string s(4096, '\0');
+    DWORD n = 0;
+    if (!ReadFile(h, s.data(), (DWORD)s.size(), &n, nullptr)) n = 0;
+    CloseHandle(h);
+    s.resize(n);
+    return s;
+}
+// The app's ledger entry for this process's exe: %LOCALAPPDATA%\SCSKiller\armed\<SHA-1 of the exe's full path, UTF-16LE,
+// A-Z lowered, in hex>. The app writes it with the nonce it puts in scskiller.armed and deletes it first when it disarms:
+// its own folder, which nothing in the game holds open. "" when the folder or the exe path can't be had.
+static std::wstring ledger_path() {
+    std::wstring exe(32768, L'\0');
+    DWORD n = GetModuleFileNameW(nullptr, exe.data(), (DWORD)exe.size());
+    if (!n || n >= exe.size()) return L"";
+    exe.resize(n);
+    for (auto& c : exe)
+        if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
+    PWSTR local = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) return CoTaskMemFree(local), L"";
+    std::wstring dir = local;
+    CoTaskMemFree(local);
+    Hash h = sha1(exe.data(), exe.size() * sizeof(wchar_t));
+    wchar_t hex[41] = {};
+    for (int i = 0; i < 20; ++i) swprintf(hex + 2 * i, 3, L"%02x", h[i]);
+    return dir + L"\\SCSKiller\\armed\\" + hex;
+}
+// Both attestations as they are now: scskiller.armed and the ledger entry.
+static std::string armed_text() {
+    const std::wstring ledger = ledger_path();
+    return small_file(g_dir + L"scskiller.armed") + '\0' + small_file(ledger) + (GetFileAttributesW((ledger + L".revoked").c_str()) != INVALID_FILE_ATTRIBUTES ? "|revoked" : "");
+}
+// armed=1, checked= present, and the install the app checked is the one running: exe_size= and exe_time= (FILETIME, UTC)
+// are this process's exe as it was then (the app closed while the game updated has no watcher to disarm; an update that
+// adds anti-cheat ships a changed exe).
+static bool armed() {
+    const std::wstring file = g_dir + L"scskiller.armed";
+    wchar_t v[32];
+    GetPrivateProfileStringW(L"scskiller", L"armed", L"", v, 32, file.c_str());
+    if (wcscmp(v, L"1")) return false;
+    auto number = [&](const wchar_t* key, uint64_t& out) {
+        DWORD n = GetPrivateProfileStringW(L"scskiller", key, L"", v, 32, file.c_str());
+        if (!n || n >= 30 || !iswdigit(v[0])) return false;
+        wchar_t* end;
+        errno = 0;
+        out = wcstoull(v, &end, 10);
+        return !*end && !errno;
+    };
+    if (!GetPrivateProfileStringW(L"scskiller", L"checked", L"", v, 32, file.c_str())) return false;
+    std::wstring exe(32768, L'\0');
+    DWORD n = GetModuleFileNameW(nullptr, exe.data(), (DWORD)exe.size());
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    uint64_t size, time;
+    if (!n || n >= exe.size() || !GetFileAttributesExW(exe.c_str(), GetFileExInfoStandard, &a) || !number(L"exe_size", size) || !number(L"exe_time", time))
+        return false;
+    if (size != ((uint64_t)a.nFileSizeHigh << 32 | a.nFileSizeLow) || time != ((uint64_t)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime))
+        return false;
+    // the same nonce in the app's ledger: a scskiller.armed the app couldn't revoke (held open) has none there
+    const std::wstring ledger = ledger_path();
+    if (GetFileAttributesW((ledger + L".revoked").c_str()) != INVALID_FILE_ATTRIBUTES) return false;  // the app's mark beside an entry it couldn't revoke
+    wchar_t nonce[64], kept[64];
+    DWORD a1 = GetPrivateProfileStringW(L"scskiller", L"nonce", L"", nonce, 64, file.c_str());
+    DWORD a2 = ledger.empty() ? 0 : GetPrivateProfileStringW(L"scskiller", L"nonce", L"", kept, 64, ledger.c_str());
+    return a1 == 32 && a2 == 32 && !wcscmp(nonce, kept);
+}
+static bool admitted() {
+    if (g_warm) return true;  // scskiller_warm's staged child replays; it is never a game
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::vector<std::wstring> markers;
+        const std::string attested = armed_text();
+        const char* why = !armed() ? "not armed" : !anti_cheat_markers(markers) ? "markers= malformed"
+                          : anti_cheat_beside(markers) ? "anti-cheat next to the exe" : anti_cheat_loaded() ? "anti-cheat client loaded" : nullptr;
+        if (wchar_t ms[16]; !why && GetEnvironmentVariableW(L"SCSKILLER_TEST_ADMIT_PAUSE_MS", ms, 16)) Sleep(_wtoi(ms));  // tests: a change in between
+        if (!why && armed_text() != attested) why = "disarmed while deciding";  // the app disarmed it meanwhile (an install change)
+        std::lock_guard l(g_early_mx);
+        if (!why && (g_log = _wfopen((g_dir + L"scskiller.log").c_str(), L"a"))) fputs(g_early.c_str(), g_log), fflush(g_log);
+        g_early.clear(), g_log_deferred = false;
+        g_admission = why ? -1 : 1;
+    });
+    return g_admission > 0;
 }
 
 // Original device methods; vtable slots are fixed by the COM ABI.
@@ -2329,7 +2491,7 @@ static void pin_self() {
 
 // Every device the game gets, however it asked for one: the hooks, once per vtable.
 static HRESULT device_created(HRESULT hr, IUnknown* adapter, D3D_FEATURE_LEVEL fl, void** pp) {
-    if (FAILED(hr) || !pp || !*pp) return hr;
+    if (FAILED(hr) || !pp || !*pp || !admitted()) return hr;
     pin_self();
     install_hooks((IUnknown*)*pp);
     if (g_next) hook_below(adapter, fl);
@@ -2371,7 +2533,7 @@ static HRESULT STDMETHODCALLTYPE hk_factory_createdevice(ID3D12DeviceFactory* f,
 }
 static void hook_factory(IUnknown* unk) {
     ID3D12DeviceFactory* f;
-    if (!unk || FAILED(unk->QueryInterface(IID_PPV_ARGS(&f)))) return;
+    if (!unk || g_admission < 0 || FAILED(unk->QueryInterface(IID_PPV_ARGS(&f)))) return;  // a pass-through installs nothing more
     pin_self();
     {
         std::lock_guard l(g_mx);
@@ -2400,7 +2562,7 @@ static HRESULT STDMETHODCALLTYPE hk_createdevicefactory(ID3D12SDKConfiguration1*
 extern "C" HRESULT WINAPI Proxy_D3D12GetInterface(REFCLSID clsid, REFIID riid, void** pp) {
     if (!real_D3D12GetInterface) return E_NOINTERFACE;  // a runtime from before it
     HRESULT hr = ((decltype(&D3D12GetInterface))real_D3D12GetInterface)(clsid, riid, pp);
-    if (FAILED(hr) || !pp || !*pp) return hr;
+    if (FAILED(hr) || !pp || !*pp || g_admission < 0) return hr;  // undecided: the factory hooks forward to device_created
     if (clsid == CLSID_D3D12DeviceFactory) hook_factory((IUnknown*)*pp);
     ID3D12SDKConfiguration1* c;
     if (clsid == CLSID_D3D12SDKConfiguration && SUCCEEDED(((IUnknown*)*pp)->QueryInterface(IID_PPV_ARGS(&c)))) {
@@ -2555,7 +2717,8 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
     g_threads = _wtoi(cfg(L"SCSKILLER_THREADS", L"threads", L"0").c_str());
     if (g_threads <= 0) g_threads = std::max(1, (int)std::thread::hardware_concurrency() - 2);
     if (!g_warm) SetEvent(g_warm_done);
-    g_log = _wfopen((g_dir + L"scskiller.log").c_str(), L"a");
+    if (g_warm) g_log = _wfopen((g_dir + L"scskiller.log").c_str(), L"a");
+    else g_log_deferred = true;  // opened by admitted(), at the first device
     GetModuleFileNameW(nullptr, p, MAX_PATH);
     logf("loaded into %ls", p);
     if (warm_asked && !g_warm) logf("mode warm ignored: this process isn't scskiller_warm, it records");

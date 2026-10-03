@@ -62,7 +62,9 @@ public static class RedRayTracing
     /// of the space-0 SRV registers the libraries bind (always, empty or not) and one of their space-0 CBVs (when they bind
     /// any), each a run of consecutive registers per range at OFFSET_APPEND, volatile descriptors and data; registers the
     /// global root signature already gives are left out. The Witcher 3's recording: 66 of 66 material hit groups rebuilt
-    /// byte for byte. Null when a binding is unbounded or partly in a global range: a local range would overlap it.</summary>
+    /// byte for byte. Null when a binding is unbounded or partly in a global range (a local range would overlap it), or when
+    /// nothing is bound in space 0: the SRV table is then empty and last, which NVIDIA fails to create (0x8000FFFF; the debug
+    /// layer only warns), while an empty SRV table before a CBV table works.</summary>
     public static RootSig.Desc? Local(IEnumerable<ShaderInfo> libs, RootSig.Ranges global)
     {
         var spans = new Dictionary<string, List<(ulong Lo, ulong Hi)>> { ["srv"] = [], ["cbv"] = [] };
@@ -84,7 +86,7 @@ public static class RedRayTracing
             var runs = Runs(spans[cls]);
             if (runs.Count > 0 || type == 0) rows.Add([0, 0, .. runs.SelectMany(r => new[] { type, (uint)(r.Hi - r.Lo), (uint)r.Lo, 0u, 3u })]);
         }
-        return new(0x80, rows, AppendRanges: true);
+        return rows[^1] is [0, 0] ? null : new(0x80, rows, AppendRanges: true);
     }
 
     // overlapping or adjacent ranges as one

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using SCSKiller.Core.Carved;
 
@@ -85,11 +86,20 @@ public static class GameFiles
     static readonly string[] GraphicsDlls = ["d3d12.dll", "d3d11.dll", "dxgi.dll", "sl.interposer.dll"];
 
     /// <summary>Null when the file isn't a readable PE.</summary>
-    static bool? ImportsGraphics(string exe)
+    internal static bool? ImportsGraphics(string exe)
     {
         try { return CarvedReader.PeImports(exe, out _).Any(d => GraphicsDlls.Contains(d, StringComparer.OrdinalIgnoreCase)); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or BadImageFormatException or InvalidOperationException) { return null; }
     }
+
+    /// <summary>The exes near the install root (as <see cref="FindExe"/> looks) that import a graphics API.</summary>
+    internal static IEnumerable<string> GraphicsExes(string installDir) => Directory.EnumerateFiles(installDir, "*.exe", Deep)
+        .Where(f => !NotTheGame.Any(s => Path.GetRelativePath(installDir, f).Contains(s, StringComparison.OrdinalIgnoreCase)) && !IsEngineFolder(installDir, f))
+        .Where(f => ImportsGraphics(f) == true);
+
+    /// <summary><paramref name="path"/> is inside the folder <paramref name="dir"/> (case-insensitive, full paths).</summary>
+    public static bool Inside(string dir, string path) =>
+        dir.Length > 0 && Path.GetFullPath(path).StartsWith(DirKey(dir) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>An install folder compared across sources: full path, no trailing separator (a drive root keeps its own).</summary>
     public static string DirKey(string dir) => dir.Length == 0 ? dir : Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir));
@@ -108,15 +118,18 @@ public static class GameFiles
         ("randgrid.sys", AntiCheat.Other),   // Ricochet (Call of Duty)
     ];
 
+    /// <summary>The marker names as the proxy's built-in list has them (its check beside the exe): "*x" matches a name ending in x.</summary>
+    public static IEnumerable<string> MarkerNames => Markers.Select(m => m.Name).Append("*_BE.exe");
+
     /// <summary>Looks for anti-cheat folders/files by name anywhere under the install, under the exe's folder when it is
     /// outside it, and in the names of the folders from the exe's up to the install root. A tree that can't be read whole
-    /// (a folder it may not list, the root included; more than <see cref="MaxEntries"/> entries) is <see cref="AntiCheat.Other"/>:
+    /// (a folder it may not list, the root included; more than <see cref="MaxEntries"/> entries; longer than <see cref="Budget"/>) is <see cref="AntiCheat.Other"/>:
     /// not known to be clean. A junction or symlink is a name, not followed: a folder it points into inside the tree is
     /// read where it is, and one outside is another folder's; one on the way from the install root to the exe is Other. <paramref name="quick"/>: the install root's and the exe
     /// folder's own entries only, for a recheck right after a full one. Battle.net titles are marked conservatively:
     /// Blizzard's Warden is server-side, not a file the install carries. The only anti-cheat detector: engine readers and
     /// middleware detection call it to skip their own work, exe discovery to read no other binary; the app's evaluation acts on its verdict.</summary>
-    public static AntiCheat DetectAntiCheat(Game game, bool quick = false)
+    public static AntiCheat DetectAntiCheat(Game game, bool quick = false, TimeSpan? budget = null)
     {
         if (game.Id.StartsWith("battlenet:", StringComparison.Ordinal)) return AntiCheat.Other;
         var install = Path.TrimEndingDirectorySeparator(Path.GetFullPath(game.InstallDir));
@@ -124,6 +137,7 @@ public static class GameFiles
         bool Inside(string d) => d.Equals(install, StringComparison.OrdinalIgnoreCase) || d.StartsWith(install + '\\', StringComparison.OrdinalIgnoreCase);
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var seen = 0;
+        var clock = Stopwatch.StartNew();
 
         AntiCheat Walk(string root)
         {
@@ -131,12 +145,15 @@ public static class GameFiles
             while (dirs.TryPop(out var dir))
             {
                 if (!visited.Add(dir)) continue;
-                List<FileSystemInfo> entries;
-                try { entries = new DirectoryInfo(dir).EnumerateFileSystemInfos("*", AllNames).ToList(); }
+                if (clock.Elapsed > (budget ?? Budget)) return AntiCheat.Other;   // also between folders: empty ones queued, a slow open
+                IEnumerator<FileSystemInfo> entries;   // streamed: the cap bounds memory too
+                try { entries = new DirectoryInfo(dir).EnumerateFileSystemInfos("*", AllNames).GetEnumerator(); }
                 catch (DirectoryNotFoundException) when (dir == root) { continue; }   // nothing installed there (access denied throws otherwise)
-                foreach (var e in entries)
+                using var _ = entries;
+                while (entries.MoveNext())
                 {
-                    if (++seen > MaxEntries) return AntiCheat.Other;
+                    var e = entries.Current;
+                    if (++seen > MaxEntries || clock.Elapsed > (budget ?? Budget)) return AntiCheat.Other;
                     if (Marker(e.Name) is var kind and not AntiCheat.None) return kind;
                     if (!quick && e is DirectoryInfo d && ((d.Attributes & FileAttributes.ReparsePoint) == 0 || d.LinkTarget == null)) dirs.Push(d.FullName);
                 }
@@ -165,6 +182,22 @@ public static class GameFiles
 
     /// <summary>Entries one detection reads at most (names only: an install of 170,000 entries reads in about 0.1 s warm).</summary>
     public const int MaxEntries = 2_000_000;
+
+    /// <summary>An anti-cheat marker among the folder's own entries (names only, not below); None when it can't be listed
+    /// (the install's own check, <see cref="DetectAntiCheat"/>, treats that as anti-cheat).</summary>
+    internal static AntiCheat MarkerIn(string dir)
+    {
+        try
+        {
+            foreach (var e in new DirectoryInfo(dir).EnumerateFileSystemInfos("*", AllNames))
+                if (Marker(e.Name) is var kind and not AntiCheat.None) return kind;
+            return AntiCheat.None;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException) { return AntiCheat.None; }
+    }
+
+    /// <summary>The time one detection takes at most (the slowest install measured: about 0.3 s cold).</summary>
+    public static readonly TimeSpan Budget = TimeSpan.FromSeconds(30);
 
     static AntiCheat Marker(string name)
     {

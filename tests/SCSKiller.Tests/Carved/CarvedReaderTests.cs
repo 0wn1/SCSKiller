@@ -183,6 +183,31 @@ public class CarvedReaderTests
         var rec = Assert.Single(PlanFile.Read(one.FilePath).Records);
         Assert.Equal([vs, ps], PsoDb.Parse(rec).Stages.Values);
 
+        // one whose last stage before the rasterizer writes no SV_Position streams its output out (The Witcher 3's VS-HS-DS-GS
+        // terrain pass): no stream output declaration to synthesize, so it's left out, a stage set counted once however many
+        // maps ship it; unless the recording has it, which replays it
+        var (vs1, ps1) = (Sha(d.Shaders[1].Vs), Sha(d.Shaders[1].Ps));
+        var streamed = index with
+        {
+            Shaders = new Dictionary<string, ShaderInfo>(index.Shaders) { [vs] = index.Shaders[vs] with { Outputs = [new SigElement("TEXCOORD", 0, 0, 0xF, 0, 3)] } },
+            Maps = [new ShaderMap("x", "records", CarvedReader.Platform, [vs], IsPipeline: true), new ShaderMap("y", "records", CarvedReader.Platform, [vs], IsPipeline: true),
+                new ShaderMap("z", "records", CarvedReader.Platform, [vs1, ps1], IsPipeline: true)],
+        };
+        var half = planner.Build(d.Game, engine, streamed, null, Ff7.Nvidia, Path.Combine(dir, "streamed"), null, CancellationToken.None);
+        Assert.Equal([vs1, ps1], PsoDb.Parse(Assert.Single(PlanFile.Read(half.FilePath).Records)).Stages.Values);
+        Assert.Equal((2, 1), (half.Stats.StageSets, half.Stats.LeftOut));
+        Assert.Equal(50, SCSKiller.Core.App.ScsKiller.CoveragePercent(half.Stats));
+        var recording = Path.Combine(dir, "streamed.db");
+        using (var f = File.Create(recording))
+        {
+            var g = SCSKiller.Tests.Planning.ExactLayoutsTests.Gfx(index.Shaders[vs].RootSignature!, streamed.Shaders[vs], null, [], []);
+            PsoDb.Write(f, g.Tag, g.Payload);
+        }
+        var recorded = planner.Build(d.Game, engine, streamed, new Recording(recording), Ff7.Nvidia, Path.Combine(dir, "streamed-recorded"), null, CancellationToken.None);
+        Assert.Equal((2, 0), (recorded.Stats.StageSets, recorded.Stats.LeftOut));
+        Assert.Equal(100, SCSKiller.Core.App.ScsKiller.CoveragePercent(recorded.Stats));
+        Assert.True(Planner.Positioned(new Dictionary<Stage, ShaderInfo> { [Stage.Vertex] = index.Shaders[vs] }));
+
         var work = Path.Combine(dir, "work");
         planner.Materialize(plan, d.Game, engine, reader, null, work, CancellationToken.None);
         Assert.Equal("605500aca5e115987aa01fcdb37aa13377bd700f18275629ed9535cdb3ffe18c", MaterializeOutputTests.Digest(work));

@@ -1,7 +1,7 @@
 ﻿// Shared contracts; numbering and semantics are documented in ARCHITECTURE.md.
 namespace SCSKiller.Core;
 
-public enum Store { Steam, Epic, Xbox, Other, EA }
+public enum Store { Steam, Epic, Xbox, Other, EA, Manual }   // Manual: added by the user (ManualSource)
 
 /// <summary>A game install. <see cref="Id"/> is stable across runs ("steam:2909400", "epic:&lt;AppName&gt;").
 /// <see cref="ExePath"/> is the process that creates the D3D12 device (for Unreal the *-Win64-Shipping.exe or the
@@ -62,6 +62,10 @@ public sealed record ShaderIndex(
 public interface IEngineReader
 {
     EngineInfo? Detect(Game game);   // null = not this engine
+    /// <summary>What Detect reads outside the game files (user settings, logs, the store's launch config), as a stamp: a
+    /// cached Detect result is redone when it changes. <paramref name="engine"/>: the engine detected before, null when
+    /// not known (every reader's stamp).</summary>
+    string DetectStamp(Game game, EngineInfo? engine) => "";
     ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, CancellationToken ct);
     /// <summary>Streams container bytes (hash convention above) for the requested shaders; the sink is called sequentially.</summary>
     void ReadShaders(Game game, EngineInfo engine, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct);
@@ -153,7 +157,7 @@ public sealed record PlanStats(long Recorded, long Generated, long SynthesizedTe
     long RtUncovered = 0,         // of those, the ones this plan can't compile: in no synthesized collection and no recorded ray
                                   // tracing state object (0 when the recording has RayQuery shaders and no state object: inline ray tracing)
     long StageSets = 0,           // distinct stage sets the planner found in the game files (0 = a plan from before this was counted)
-    long LeftOut = 0,             // of those, the ones not in the plan for any reason (no root signature, no template, Uncovered)
+    long LeftOut = 0,             // of those, the ones not in the plan for any reason (no root signature, no template, Uncovered, stream output)
     long MiddlewareSharedItems = 0, // of MiddlewareItems, the ones only a shared pack (downloaded from the community database) had
     long RtStateObjects = 0);     // ray tracing state objects of the recording the plan replays (0 = none recorded, or a plan from before this was counted)
 
@@ -246,7 +250,9 @@ public sealed record GameState(
     long RecordedSinceWarm = 0,     // pipelines its recordings and packs have that the last complete warm didn't compile, apart from NewPipelines (derived)
     int CommunityDbPsos = 0,        // the manifest entry's pipelines while InCommunityDb
     double? PsoPerSecond = null,   // the game's last complete warm onto a cold cache (ScsKiller.ColdWarm); null = none measured
-    FrameReport? LastFrames = null);   // the last launch's frame times (FrameLog); null = none measured
+    FrameReport? LastFrames = null,    // the last launch's frame times (FrameLog); null = none measured
+    string? ShaderMod = null,          // a ReShade add-on that replaces the game's shaders (Games.ReShade.Detect); null = none
+    bool ShaderModBlocks = false);     // ...and adds to every root signature the game creates: never compiled, recorded or shared
 
 /// <summary>A launch's frame times from the recorder (<see cref="App.FrameLog"/>): its length, the startup stretch before
 /// play (the game's own precompile and first load), the 1% low of play, every frame of 50 ms or more, and for a graph
@@ -304,12 +310,16 @@ public sealed record Settings(int Threads, WarmPriority Priority, DriverUpdateMo
     bool RecordAllGames = true,     // unless a game's RecorderOverride says otherwise
     int RecordingLimitMB = 256,     // per game: the recorder's db plus SCSKiller's copy of it; 0 = unlimited
     bool NotifyNewShaders = true,   // a notification when compiled games have new pipelines to compile (NewShaders)
-    bool ActiveCheck = true);       // the anonymous daily check that counts active installs (ScsKiller.ActiveCheck); off = nothing is sent
+    bool ActiveCheck = true,        // the anonymous daily check that counts active installs (ScsKiller.ActiveCheck); off = nothing is sent
+    string? GpuNoticeDismissed = null);   // the GPU name whose "doesn't compile on this GPU" notice was closed (Format.GpuNotice)
 
 public enum QueueStage { Waiting, Indexing, Planning, Materializing, Warming, Paused, Done, Failed, Stopped }
 public sealed record QueueItem(string GameId, QueueStage Stage, WarmProgress? Progress, string? Error,
     string? Note = null,   // why it waits or is paused ("paused while <game> is running"); Done/Stopped: ScsKiller.WarmCounts (failed, skipped)
     bool PlanCheck = false);   // a background plan rebuild the app queued itself (ScsKiller.CheckPlans), not a compile: lists leave it out
+
+/// <summary><see cref="IScsKiller.AddManualGame"/>'s result: the added game, or the listed one the exe belongs to.</summary>
+public sealed record ManualAdd(Game Game, bool Existed);
 
 public interface IScsKiller
 {
@@ -386,6 +396,13 @@ public interface IScsKiller
     void SetRecordAlongsideMod(string gameId, bool on);
     /// <summary>A running game's folder is left alone: call again when it exits. Null = every game.</summary>
     void ReconcileRecorders(string? gameId = null);
+    /// <summary>Adds the game whose exe the user picked (<see cref="Games.ManualSource"/>); the next scan lists it.
+    /// ArgumentException with the message to show when the pick can't be a game; an exe that belongs to a listed game
+    /// returns that game with <see cref="ManualAdd.Existed"/>.</summary>
+    ManualAdd AddManualGame(string exePath);
+    /// <summary>Forgets a game the user added, after taking its recorder and the recorder's files out of the game folder;
+    /// nothing else of the game is deleted. InvalidOperationException while it runs or compiles, or for a store's game.</summary>
+    void RemoveManualGame(string gameId);
     /// <summary>Deletes the recorder's data files (scskiller.db, its csv and log in the game folder, SCSKiller's copies of
     /// the recording), never the recorder itself; the next compile plans from the game files. False when there was nothing
     /// to delete. Throws InvalidOperationException while the game runs or a compile of it is in progress.</summary>

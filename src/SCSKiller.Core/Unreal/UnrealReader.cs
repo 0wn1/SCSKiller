@@ -53,6 +53,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
         notes = "";
         if (Locate(game) is not { } where) return null;
         var (paks, baseGame, fork, project) = where;
+        projects[game.InstallDir] = project;
         var eg = fork ?? baseGame;
         var s = Survey(paks, eg, project, null);
         var keyNote = "";
@@ -68,7 +69,8 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
             : !platforms.Any(p => p.StartsWith("PCD3D_")) ? $"no D3D shaders ({string.Join(", ", platforms)})"
             : null;
         var version = VersionOf(baseGame);
-        var (api, why) = UnrealRhi.Resolve(version.StartsWith('4') ? 4 : 5, platforms, s.Configs, project, UnrealRhi.UserDir(game, project), UnrealRhi.LaunchOptions(game));
+        var menu = UnrealRhi.LaunchMenu(game);
+        var (api, why) = UnrealRhi.Resolve(version.StartsWith('4') ? 4 : 5, platforms, s.Configs, project, UnrealRhi.UserDir(game, project), UnrealRhi.LaunchOptions(game), menu.Entries, menu.Default);
         notes = keyNote.Length > 0 ? $"{why}; AES key: {keyNote}" : why;
         return new EngineInfo("Unreal", version, fork?.ToString(), api, encrypted, unsupported);
     }
@@ -84,12 +86,23 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
     }
 
     /// <summary>Paks dir, engine version, fork, project folder; null = not a cooked Unreal game.</summary>
+    public string DetectStamp(Game game, EngineInfo? engine)
+    {
+        if (!projects.TryGetValue(game.InstallDir, out var project) && PaksDir(game.InstallDir) is { } paks)
+            projects[game.InstallDir] = project = ProjectOf(paks);   // a miss isn't kept: the install may be mid-update
+        return project == null ? "" : UnrealRhi.Stamp(game, project);
+    }
+
+    readonly ConcurrentDictionary<string, string> projects = new(StringComparer.OrdinalIgnoreCase);
+
+    static string ProjectOf(string paks) => Path.GetFileName(Path.GetDirectoryName(Path.GetDirectoryName(paks)))!; // <Project>\Content\Paks
+
     static (string Paks, EGame Base, EGame? Fork, string Project)? Locate(Game game)
     {
         if (PaksDir(game.InstallDir) is not { } paks) return null;
         var baseGame = DetectEngine(game, paks);
         var fork = DetectFork(baseGame, Path.GetFileName(game.InstallDir.TrimEnd('\\', '/')), Path.GetFileNameWithoutExtension(game.ExePath));
-        return (paks, baseGame, fork, Path.GetFileName(Path.GetDirectoryName(Path.GetDirectoryName(paks)))!); // <Project>\Content\Paks
+        return (paks, baseGame, fork, ProjectOf(paks));
     }
 
     /// <summary>Whether <paramref name="key"/> decrypts the index of the encrypted container at <paramref name="path"/>.</summary>
