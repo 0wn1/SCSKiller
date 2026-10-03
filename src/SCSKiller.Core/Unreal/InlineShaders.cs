@@ -135,7 +135,13 @@ public static class InlineShaders
     {
         using var z = new ZLibStream(new MemoryStream(d, at, n), CompressionMode.Decompress);
         using var o = new MemoryStream();
-        z.CopyTo(o);
+        var limit = Math.Min(MaxCode, (long)MaxRatio * n);
+        var buf = new byte[81920];
+        for (int got; (got = z.Read(buf)) > 0;)
+        {
+            if (o.Length + got > limit) throw new InvalidDataException("inflates past the code bound");
+            o.Write(buf, 0, got);
+        }
         return o.ToArray();
     }
 

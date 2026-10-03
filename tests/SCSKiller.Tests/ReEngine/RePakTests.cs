@@ -15,7 +15,8 @@ public class RePakTests
 {
     static readonly BigInteger Modulus = new(RSA.Create(1024).ExportParameters(false).Modulus, isUnsigned: true, isBigEndian: true);
 
-    public sealed record E(ulong Hash, byte[] Data, int Compression = 0, bool Chunked = false);
+    /// <param name="SizeInPacked">a chunked entry that gives its length as its packed size, its size 0</param>
+    public sealed record E(ulong Hash, byte[] Data, int Compression = 0, bool Chunked = false, bool SizeInPacked = false);
 
     /// <summary>A KPKA v4.2 package. Chunked entries go to a chunk table of <paramref name="block"/>-byte chunks (every
     /// other one stored, the rest zstd; the last padded to the block size, as the format requires).</summary>
@@ -45,7 +46,7 @@ public class RePakTests
                     chunks.Add((head + data.Length, z.Length));
                     data.Write(z);
                 }
-                packed = 0;
+                packed = e.SizeInPacked ? e.Data.Length : 0;
             }
             else
             {
@@ -58,7 +59,7 @@ public class RePakTests
             BinaryPrimitives.WriteUInt32LittleEndian(t[4..], (uint)(e.Hash >> 32));
             BinaryPrimitives.WriteInt64LittleEndian(t[8..], offset);
             BinaryPrimitives.WriteInt64LittleEndian(t[16..], packed);
-            BinaryPrimitives.WriteInt64LittleEndian(t[24..], e.Data.Length);
+            BinaryPrimitives.WriteInt64LittleEndian(t[24..], e.SizeInPacked ? 0 : e.Data.Length);
             BinaryPrimitives.WriteUInt64LittleEndian(t[32..], attr);
         }
         var o = new MemoryStream();
@@ -240,6 +241,45 @@ public class RePakTests
         Assert.DoesNotContain(RePak.NoModulus, engine.Unsupported ?? ""); // opened (no shader files in it: that's all it says)
         Assert.Equal(Modulus, new BigInteger(Convert.FromHexString(File.ReadAllText(file)), isUnsigned: true));
         Assert.Equal(engine, new ReEngineReader(data, _ => throw new InvalidOperationException("kept locally: no second download")).Detect(game));
+        Directory.Delete(dir, true);
+    }
+
+    /// <summary>A chunked material whose length is in its packed size is indexed (not taken for an empty entry); a patch
+    /// that can't be read makes the game unsupported, naming it, instead of indexing the shaders it replaces; a chunk
+    /// table claiming a block size no package uses is refused at open.</summary>
+    [Fact]
+    public void ChunkedEntriesSizedByPackedLengthAndUnreadablePatches()
+    {
+        var dir = Temp("reengine-chunked");
+        byte[] Sdf(params byte[][] cs) => [.. "SDF\0"u8, .. new byte[200], .. cs.SelectMany(c => c.Concat(new byte[12]))];
+        var (vs, ps) = (Hlsl.Vs(3, Hlsl.Rs1), Hlsl.Ps(3, Hlsl.Rs1));
+        File.WriteAllBytes(Path.Combine(dir, "re_chunk_000.pak"), Pak(RePak.ChunkTable, 256, new E(0xABCD, Sdf(vs, ps), Chunked: true, SizeInPacked: true)));
+        var game = new Game("test:re-chunked", "RE test", Store.Other, dir, Path.Combine(dir, "game.exe"));
+        var reader = new ReEngineReader(Path.Combine(dir, "data"), Offline);
+        var engine = reader.Detect(game)!;
+        Assert.Null(engine.Unsupported);
+        Assert.Equal(new[] { vs, ps }.Select(c => Convert.ToHexStringLower(SHA1.HashData(c))).Order(), reader.Index(game, engine, null, CancellationToken.None).Shaders.Keys.Order());
+
+        File.WriteAllBytes(Path.Combine(dir, "re_chunk_000.pak.patch_001.pak"), Pak(0, 64, new E(0xABCD, Sdf(ps)))[..20]);   // truncated
+        Assert.StartsWith("re_chunk_000.pak.patch_001.pak: ", new ReEngineReader(Path.Combine(dir, "data"), Offline).Detect(game)!.Unsupported);
+
+        var big = Path.Combine(dir, "big.pak");
+        File.WriteAllBytes(big, Pak(RePak.ChunkTable, 1 << 30, new E(1, Bytes(10, 3))));
+        Assert.Contains("chunk table", Assert.Throws<InvalidDataException>(() => RePak.Open(big)).Message);
+        Directory.Delete(dir, true);
+    }
+
+    /// <summary>A base package in the clear and an encrypted patch: the downloaded modulus kept is the one that opens the patch.</summary>
+    [Fact]
+    public void TheDownloadedModulusIsCheckedOnThePackageThatNeedsIt()
+    {
+        var dir = Temp("reengine-patch-key");
+        File.WriteAllBytes(Path.Combine(dir, "re_chunk_000.pak"), Pak(0, 64, new E(1, [.. "TEX\0"u8, .. Bytes(100, 3)])));
+        File.WriteAllBytes(Path.Combine(dir, "re_chunk_000.pak.patch_001.pak"), Pak(RePak.EncryptedTable, 64, new E(2, [.. "TEX\0"u8, .. Bytes(100, 5)])));
+        var game = new Game("test:re-patch-key", "RE test", Store.Other, dir, Path.Combine(dir, "game.exe"));
+        var wrong = new BigInteger(RSA.Create(1024).ExportParameters(false).Modulus, isUnsigned: true, isBigEndian: true);
+        var engine = new ReEngineReader(Path.Combine(dir, "data"), _ => RustSource(wrong, Modulus)).Detect(game)!;
+        Assert.DoesNotContain(RePak.NoModulus, engine.Unsupported ?? "");
         Directory.Delete(dir, true);
     }
 }

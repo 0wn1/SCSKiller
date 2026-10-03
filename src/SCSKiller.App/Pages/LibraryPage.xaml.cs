@@ -40,10 +40,11 @@ public sealed partial class LibraryPage : Page
     void OnSettings(object _, RoutedEventArgs __) => App.Main.Navigate(typeof(SettingsPage));
     void OnPlay(object sender, RoutedEventArgs _) => Vm.Play(RowOf(sender));
 
-    // Shift+click forces re-detection; otherwise it's redone only when an exe, build or SCSKiller changes.
+    // Either click fetches the server's data whatever its age; Shift+click also forces re-detection, which is otherwise
+    // redone only when an exe, build or SCSKiller changes.
     void OnRefresh(object _, RoutedEventArgs __) =>
         Vm.Rescan(force: Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(Windows.System.VirtualKey.Shift)
-            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down));
+            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down), userRequested: true);
 
     // Adding only queues the game: nothing compiles until Compile queue.
     void OnAdd(object sender, RoutedEventArgs _)

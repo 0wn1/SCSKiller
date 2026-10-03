@@ -117,6 +117,22 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
         Assert.Matches(@"^\d{3}\.\d{2}$", nv.Gpu.DriverVersion);
         Assert.True(nv.Gpu.DedicatedVideoMemory > 1UL << 30);
         Assert.Equal(new VendorCaps("nvidia-1", true, true, true, PerStageCache: true, RtCacheGranularity: RtCacheGranularity.Collection, PackageKeyed: true), nv.Caps);
+        var dxgi = GpuBackends.PrimaryAdapter()!;
+        Assert.Equal(NvidiaBackend.ReadDriverVersion(), nv.Gpu.DriverVersion);   // earlier builds stored NvAPI's: the same string
+        Assert.Equal(nv.Gpu.DriverVersion, NvidiaBackend.FromUserModeVersion(dxgi.DriverVersion));
+        var before = nv.Gpu;
+        Assert.True(nv.Refresh(dxgi));
+        Assert.Equal(before, nv.Gpu);
+        // this process's NvAPI keeps answering the running driver: two updates in a row follow DXGI's version
+        Assert.True(nv.Refresh(dxgi with { DriverVersion = "32.0.16.1800", AdapterLuid = 1 }));
+        Assert.Equal(("618.00", 1L), (nv.Gpu.DriverVersion, nv.Gpu.AdapterLuid));
+        Assert.True(nv.Refresh(dxgi with { DriverVersion = "32.0.16.1905" }));
+        Assert.Equal("619.05", nv.Gpu.DriverVersion);
+        Assert.False(nv.Refresh(dxgi with { DriverVersion = "" }));   // no DXGI version: the last one stays, not NvAPI's older one
+        Assert.Equal("619.05", nv.Gpu.DriverVersion);
+        Assert.True(nv.Refresh(dxgi));
+        Assert.Equal(before, nv.Gpu);
+        Assert.Equal(before.DriverVersion, nv.FallbackVersion(dxgi.DriverVersion));
 
         var usage = nv.GetCacheUsage();
         output.WriteLine($"usage: {usage.Path} {usage.BytesOnDisk / 1048576.0:0} MiB (upper bound {usage.UpperBound})");
@@ -154,6 +170,55 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void Amd_the_version_stays_the_registrys_whatever_DXGIs_format_and_waits_for_the_registry_after_an_update()
+    {
+        (string?, string?) registry = ("26.8.1", "32.0.31041.1004");
+        var dxgi = new GpuInfo(GpuVendor.Amd, "AMD Radeon RX 9070 XT", "31.0.24033.1003", 7, 16UL << 30);   // not the store's format
+        var amd = new AmdBackend(dxgi, _ => registry);
+        Assert.Equal(AmdBackend.FormatVersion("26.8.1", "32.0.31041.1004"), amd.Gpu.DriverVersion);   // what earlier builds stored
+        Assert.True(amd.Refresh(dxgi));
+        Assert.Equal("26.8.1 (32.0.31041.1004)", amd.Gpu.DriverVersion);
+
+        dxgi = dxgi with { DriverVersion = "31.0.24033.2001", AdapterLuid = 8 };   // installed; the registry not yet
+        Assert.False(amd.Refresh(dxgi));
+        Assert.False(amd.Refresh(dxgi));
+        Assert.Equal(("26.8.1 (32.0.31041.1004)", 8L), (amd.Gpu.DriverVersion, amd.Gpu.AdapterLuid));
+        registry = ("26.9.1", "32.0.31051.1001");
+        Assert.True(amd.Refresh(dxgi));
+        Assert.Equal("26.9.1 (32.0.31051.1001)", amd.Gpu.DriverVersion);
+        Assert.True(amd.Refresh(dxgi));
+
+        registry = ("26.9.1", null);   // a read during an install: the last complete one stays until the registry is back
+        Assert.False(amd.Refresh(dxgi));
+        Assert.Equal("26.9.1 (32.0.31051.1001)", amd.Gpu.DriverVersion);
+        registry = (null, null);
+        Assert.False(amd.Refresh(dxgi));
+        Assert.Equal("26.9.1 (32.0.31051.1001)", amd.Gpu.DriverVersion);
+        registry = ("26.9.1", "32.0.31051.1001");
+        Assert.True(amd.Refresh(dxgi));
+        Assert.Equal("26.9.1 (32.0.31051.1001)", amd.Gpu.DriverVersion);
+    }
+
+    [Fact]
+    public void Amd_without_a_store_version_in_the_registry_the_version_takes_DXGIs_as_before()
+    {
+        (string?, string?) registry = ("26.9.1", null);
+        var dxgi = new GpuInfo(GpuVendor.Amd, "AMD Radeon RX 9070 XT", "31.0.24033.2001", 7, 16UL << 30);
+        var amd = new AmdBackend(dxgi, _ => registry);
+        Assert.Equal("26.9.1 (31.0.24033.2001)", amd.Gpu.DriverVersion);
+        Assert.True(amd.Refresh(dxgi with { DriverVersion = "31.0.24033.3001" }));
+        Assert.Equal("26.9.1 (31.0.24033.3001)", amd.Gpu.DriverVersion);
+
+        registry = (null, null);   // nothing in the registry yet, from the start: DXGI's version, read again at every check
+        amd = new AmdBackend(dxgi, _ => registry);
+        Assert.Equal("31.0.24033.2001", amd.Gpu.DriverVersion);
+        Assert.False(amd.Refresh(dxgi));
+        registry = ("26.9.1", "32.0.31051.1001");
+        Assert.True(amd.Refresh(dxgi));
+        Assert.Equal("26.9.1 (32.0.31051.1001)", amd.Gpu.DriverVersion);
+    }
+
+    [Fact]
     public void Amd_driver_version_is_adrenalin_plus_driver_store()
     {
         Assert.Equal("26.8.1 (32.0.31041.1004)", AmdBackend.FormatVersion("26.8.1", "32.0.31041.1004"));
@@ -162,6 +227,17 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
         Assert.Equal("", AmdBackend.FormatVersion("", ""));
         // a hotfix keeps the Adrenalin number but not the store version: a different driver for staleness
         Assert.NotEqual(AmdBackend.FormatVersion("26.8.1", "32.0.31041.1004"), AmdBackend.FormatVersion("26.8.1", "32.0.31041.2001"));
+    }
+
+    [Fact]
+    public void Nvidia_driver_version_from_the_DXGI_user_mode_version()
+    {
+        Assert.Equal("617.14", NvidiaBackend.FromUserModeVersion("32.0.16.1714"));
+        Assert.Equal("552.22", NvidiaBackend.FromUserModeVersion("31.0.15.5222"));
+        Assert.Equal("610.08", NvidiaBackend.FromUserModeVersion("32.0.16.1008"));
+        Assert.Equal("560.09", NvidiaBackend.FromUserModeVersion("32.0.15.6009"));
+        Assert.Null(NvidiaBackend.FromUserModeVersion(""));
+        Assert.Null(NvidiaBackend.FromUserModeVersion("26.8.1"));
     }
 
     [Fact]
@@ -277,6 +353,117 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
             Assert.EndsWith(@"\Starfield.exe", starfield.ExePath, StringComparison.OrdinalIgnoreCase);
             Assert.Equal("1.14.74.0", starfield.Version);
         }
+    }
+
+    /// <summary>A PE that imports <paramref name="dll"/> (one import descriptor at RVA 0x1100, its name at 0x1180), padded by
+    /// <paramref name="size"/> bytes.</summary>
+    internal static byte[] Exe(string? dll, int size = 0)
+    {
+        var pe = Planning.MiddlewarePackTests.Pe(null, new byte[size]);
+        if (dll == null) return pe;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pe.AsSpan(0x58 + 120), 0x1100);   // import directory
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pe.AsSpan(0x58 + 124), 40);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pe.AsSpan(0x300 + 12), 0x1180);
+        System.Text.Encoding.ASCII.GetBytes(dll).CopyTo(pe, 0x380);
+        return pe;
+    }
+
+    /// <summary>launcher-configuration.json as CD PROJEKT RED's launcher ships it with The Witcher 3 (Steam).</summary>
+    internal static string RedConfig(string fallback = "DirectX 12", params (string Description, string Dir)[] entries) =>
+        $$"""
+        { "revision": 3, "executables": [{{string.Join(",", (entries.Length > 0 ? entries : [("DirectX 12", @"bin\\x64_dx12")]).Select(e =>
+            $$"""{ "description": "{{e.Description}}", "executable": { "directoryPath": "{{e.Dir}}", "fileName": "witcher3.exe" } }"""))}}],
+          "gameId": "witcher3", "platform": "steam", "fallback": "{{fallback}}", "editions": [{ "name": "remasteredEdition" }] }
+        """;
+
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void Steam_finds_the_witcher_3_with_the_real_exe_not_the_prelauncher()
+    {
+        if (new SteamSource().Discover().FirstOrDefault(g => g.Id == "steam:292030") is not { } w3) return;   // not installed here
+        Assert.EndsWith(@"\bin\x64_dx12\witcher3.exe", w3.ExePath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Exe_discovery_takes_the_game_cdpr_s_launcher_configuration_names()
+    {
+        var tmp = Directory.CreateTempSubdirectory("scskiller-launcher-test-").FullName;
+        var root = Path.Combine(tmp, "The Witcher 3");
+        try
+        {
+            void Put(string rel, byte[] bytes) { Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(root, rel))!); File.WriteAllBytes(Path.Combine(root, rel), bytes); }
+            Put(@"..\Other\witcher3.exe", Exe("d3d12.dll", 100));
+            Put("REDprelauncher.exe", Exe("Qt5Core.dll", 100));
+            Put(@"bin\x64_dx12\witcher3.exe", Exe("sl.interposer.dll", 5000));
+            Put(@"bin\x64_dx12\D3D12_0\d3dconfig.exe", Exe(null, 200));
+            Put(@"bin\x64_dx12\crashreporter\CrashReporter.exe", Exe("mscoree.dll", 300));
+            Put(@"bin\x64\witcher3.exe", Exe("d3d11.dll", 4000));
+            var config = Path.Combine(root, "launcher-configuration.json");
+            string Dx(string dir) => Path.Combine(root, dir, "witcher3.exe");
+
+            File.WriteAllText(config, RedConfig());
+            Assert.Equal(Dx(@"bin\x64_dx12"), GameFiles.FindExe(root));
+            Assert.Equal(Dx(@"bin\x64_dx12"), GameFiles.FindExe(root, "REDprelauncher.exe"));   // a store naming the launcher
+            File.WriteAllText(config, RedConfig("DirectX 12", ("DirectX 11", @"bin\\x64"), ("DirectX 12", @"bin\\x64_dx12")));
+            Assert.Equal(Dx(@"bin\x64_dx12"), GameFiles.FindExe(root));
+            File.WriteAllText(config, RedConfig("Vulkan", ("DirectX 11", @"bin\\x64"), ("DirectX 12", @"bin\\x64_dx12")));
+            Assert.Equal(Dx(@"bin\x64"), GameFiles.FindExe(root));   // no entry is the fallback: the first
+
+            // a target that's missing or outside the install, or a config that doesn't parse: the launcher stays (two exes import a graphics API)
+            // a junction inside the install that leads to another folder: as outside
+            using (var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe",
+                       $"/c mklink /J \"{Path.Combine(root, "linked")}\" \"{Path.Combine(tmp, "Other")}\"") { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!)
+            {
+                p.StandardOutput.ReadToEnd();
+                p.WaitForExit();
+                Assert.Equal(0, p.ExitCode);
+            }
+            foreach (var bad in new[] { RedConfig("DirectX 12", ("DirectX 12", @"bin\\gone")), RedConfig("DirectX 12", ("DirectX 12", @"..\\Other")),
+                         RedConfig("DirectX 12", ("DirectX 12", "linked")), "{ not json" })
+            {
+                File.WriteAllText(config, bad);
+                Assert.Equal(Path.Combine(root, "REDprelauncher.exe"), GameFiles.FindExe(root));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(Path.Combine(root, "linked"))) Directory.Delete(Path.Combine(root, "linked"));   // the junction, not its target
+            Directory.Delete(tmp, true);
+        }
+    }
+
+    [Fact]
+    public void Exe_discovery_takes_the_one_exe_that_imports_a_graphics_api_over_a_launcher_that_doesn_t()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-launcher-test-").FullName;
+        try
+        {
+            void Put(string rel, byte[] bytes) { Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(root, rel))!); File.WriteAllBytes(Path.Combine(root, rel), bytes); }
+            var launcher = Path.Combine(root, "Launcher.exe");
+            var game = Path.Combine(root, "Game", "Bin", "Game.exe");
+            Put("Launcher.exe", Exe("user32.dll", 1000));
+            Put(@"Game\Bin\Game.exe", Exe("d3d12.dll", 5000));
+            Put(@"Game\Bin\Small.exe", Exe("dxgi.dll", 10));             // smaller than the launcher: not the game
+            Put(@"Game\Bin\CrashHandler.exe", Exe("d3d11.dll", 9000));   // a crash handler is never the game
+            Assert.Equal(game, GameFiles.FindExe(root));
+
+            Put(@"Tools\Editor.exe", Exe("d3d11.dll", 6000));
+            Assert.Equal(launcher, GameFiles.FindExe(root));   // two candidates: the guess stays
+            File.Delete(Path.Combine(root, "Tools", "Editor.exe"));
+            Put(@"Tools\Locked.exe", new byte[3000]);
+            Assert.Equal(launcher, GameFiles.FindExe(root));   // a larger exe whose imports can't be read may be the game
+            File.Delete(Path.Combine(root, "Tools", "Locked.exe"));
+
+            Put(@"EasyAntiCheat\EasyAntiCheat_EOS_Setup.exe", Exe(null, 10));
+            Assert.Equal(launcher, GameFiles.FindExe(root));   // anti-cheat in the install: no other binary is read
+            Directory.Delete(Path.Combine(root, "EasyAntiCheat"), true);
+
+            Put("Launcher.exe", Exe("dxgi.dll", 1000));
+            Assert.Equal(launcher, GameFiles.FindExe(root));   // the guess imports one itself
+            Put("Launcher.exe", new byte[1000]);
+            Assert.Equal(launcher, GameFiles.FindExe(root));   // not a readable PE: unknown, kept
+        }
+        finally { Directory.Delete(root, true); }
     }
 
     [Fact]
@@ -700,5 +887,84 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
         Assert.True(NvidiaBackend.TaskEnabled(head + "<Settings><Priority>4</Priority></Settings></Task>"));   // Enabled absent = true
         Assert.True(NvidiaBackend.TaskEnabled(head + "<Settings><Enabled>true</Enabled></Settings></Task>"));
         Assert.False(NvidiaBackend.TaskEnabled(head + "<Settings><Enabled>false</Enabled></Settings></Task>"));   // the NVIDIA App's "off"
+    }
+
+    [Fact]
+    public void Epic_keeps_a_base_game_whose_manifest_names_itself_as_the_main_game()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-epic-test-").FullName;
+        try
+        {
+            var install = Directory.CreateDirectory(Path.Combine(root, "Game")).FullName;
+            File.WriteAllBytes(Path.Combine(install, "Game.exe"), new byte[100]);
+            var manifests = Directory.CreateDirectory(Path.Combine(root, "Manifests")).FullName;
+            void Item(string file, object m) => File.WriteAllText(Path.Combine(manifests, file), System.Text.Json.JsonSerializer.Serialize(m));
+            Item("a.item", new { AppName = "Game", MainGameAppName = "Game", InstallLocation = install });   // Legendary's export of a base game
+            Item("b.item", new { AppName = "Addon", MainGameAppName = "Game", InstallLocation = install });  // an add-on in the game's install
+            Item("c.item", new { AppName = "Other", MainGameAppName = "", InstallLocation = install });      // the launcher's own base game
+            Assert.Equal(["epic:Game", "epic:Other"], new EpicSource(manifests).Discover().Select(g => g.Id).Order());
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void FindExe_judges_helper_names_inside_the_install_only_and_skips_Source_2s_console()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-exe-test-").FullName;
+        try
+        {
+            foreach (var parent in new[] { "Setup", "Crash Tests", "DirectX Games", "Redist" })
+            {
+                var install = Directory.CreateDirectory(Path.Combine(root, parent, "Demo")).FullName;
+                File.WriteAllBytes(Path.Combine(install, "Game.exe"), new byte[100]);
+                Directory.CreateDirectory(Path.Combine(install, "_CommonRedist"));
+                File.WriteAllBytes(Path.Combine(install, "_CommonRedist", "vc_redist.x64.exe"), new byte[500]);
+                Assert.Equal(Path.Combine(install, "Game.exe"), GameFiles.FindExe(install));
+            }
+            var cs2 = Directory.CreateDirectory(Path.Combine(root, "Counter-Strike Global Offensive", "game", "bin", "win64")).FullName;
+            File.WriteAllBytes(Path.Combine(cs2, "cs2.exe"), new byte[300]);
+            File.WriteAllBytes(Path.Combine(cs2, "vconsole2.exe"), new byte[500]);
+            Assert.Equal(Path.Combine(cs2, "cs2.exe"), GameFiles.FindExe(Path.Combine(root, "Counter-Strike Global Offensive")));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    /// <summary>appinfo.vdf v28 with one app whose KeyValues nest far deeper than any real entry: that entry is left out,
+    /// discovery isn't taken down by a stack overflow.</summary>
+    [Fact]
+    public void Steam_app_types_survive_absurdly_nested_key_values()
+    {
+        var path = Path.Combine(Directory.CreateTempSubdirectory("scskiller-appinfo-test-").FullName, "appinfo.vdf");
+        try
+        {
+            var kv = new MemoryStream();
+            for (var i = 0; i < 200_000; i++) kv.Write([0, 0]);   // type 0 (an object), empty key
+            var entry = new byte[60 + kv.Length];
+            kv.ToArray().CopyTo(entry, 60);
+            using (var w = new BinaryWriter(File.Create(path)))
+            {
+                w.Write(0x07564428u); w.Write(1u);
+                w.Write(7u); w.Write((uint)entry.Length); w.Write(entry);
+                w.Write(0u);
+            }
+            Assert.Empty(SteamSource.AppTypes(path, new HashSet<uint> { 7 })!);
+        }
+        finally { Directory.Delete(Path.GetDirectoryName(path)!, true); }
+    }
+
+    /// <summary>All or nothing: a read-only cache file is deleted with the others, not left after them.</summary>
+    [Fact]
+    public void Deleting_cache_files_takes_read_only_ones_too()
+    {
+        var dir = Directory.CreateTempSubdirectory("scskiller-delete-test-").FullName;
+        try
+        {
+            var files = new[] { "a.parc", "b.parc" }.Select(n => Path.Combine(dir, n)).ToList();
+            foreach (var f in files) File.WriteAllBytes(f, new byte[10]);
+            File.SetAttributes(files[1], FileAttributes.ReadOnly);
+            Assert.Equal(2, AppCacheFiles.DeleteAll(files.Select(f => new FileInfo(f)).ToList()));
+            Assert.All(files, f => Assert.False(File.Exists(f)));
+        }
+        finally { Directory.Delete(dir, true); }
     }
 }

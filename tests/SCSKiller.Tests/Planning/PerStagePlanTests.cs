@@ -147,6 +147,66 @@ public class PerStagePlanTests(ITestOutputHelper output)
         }
     }
 
+    /// <summary>A recording mostly of [WaveSize] shaders still plans on its base platform: a wave partition counts for it, so
+    /// the base platform's unrecorded pairs plan, and NVIDIA still plans no wave64 shader.</summary>
+    [Fact]
+    public void AWavePartitionCountsForItsBasePlatform()
+    {
+        ShaderInfo[] waves = [Shader("cs-w1", Stage.Compute, []), Shader("cs-w2", Stage.Compute, []), Shader("cs-w3", Stage.Compute, [])];
+        var w4 = Shader("cs-w4", Stage.Compute, []);
+        ShaderInfo[] all = [Vs1, Ps1, Ps2, w4, .. waves];
+        var index = new ShaderIndex("synthetic", ["PCD3D_SM6", "PCD3D_SM6 wave64"], all.ToDictionary(s => s.Sha1),
+            [new ShaderMap("m", "Game", "PCD3D_SM6", [Vs1.Sha1, Ps1.Sha1, Ps2.Sha1]), new ShaderMap("w", "Game", "PCD3D_SM6 wave64", [w4.Sha1, .. waves.Select(w => w.Sha1)])]);
+        var dir = Ff7.TempDir("perstage-wave-base");
+        var path = Path.Combine(dir, "recording.db");
+        using (var f = File.Create(path))
+        {
+            var (rs, blob) = Rs(Vs1, Ps1);
+            var (cs, csBlob) = Rs(waves[0]);
+            WriteBlob(f, rs, blob);
+            WriteBlob(f, cs, csBlob);
+            Write(f, 'S', Gfx(rs, Vs1, Ps1, Layout1, [R16G16B16A16Float]).Payload);
+            foreach (var w in waves) Write(f, 'C', Compute(cs, w.Sha1)); // 3 wave64 shaders recorded, 2 of the base platform
+        }
+        foreach (var caps in new[] { Ff7.Nvidia, Ff7.Amd })
+        {
+            var log = new List<string>();
+            var plan = new Planner().Build(Ff7.Game, Ue426, index, new Recording(path), caps, Path.Combine(dir, caps.Profile), new SyncLog(log.Add), CancellationToken.None);
+            var body = PlanFile.Read(plan.FilePath).Records.ToList();
+            bool Planned(ShaderInfo s) => body.Any(r => r.Tag is 'S' or 'P' && r.Payload.AsSpan().IndexOf(Convert.FromHexString(s.Sha1)) >= 0);
+            Assert.Contains(log, l => l.Contains("platform PCD3D_SM6;"));
+            Assert.True(Planned(Ps2), string.Join(" | ", log));
+            Assert.Equal(caps == Ff7.Amd, Planned(w4));
+        }
+    }
+
+    /// <summary>A shared recording's PSO naming a shader neither the install nor the recording has (another build's, built at
+    /// run time) is skipped when materialized, so it doesn't cover its other shaders' units: VS A, recorded only before such a
+    /// PS, is still planned with the root signature it was recorded with.</summary>
+    [Fact]
+    public void ARecordedPsoThatCantReplayCoversNothing()
+    {
+        var gone = Ps("ps-gone", Target(0));
+        var vsA = Vs("vsA", In("POSITION", 0, 0, 7), In("TEXCOORD", 0, 1, 3));
+        var index = new ShaderIndex("synthetic", ["PCD3D_SM6"], new[] { vsA, Vs1, Ps1 }.ToDictionary(s => s.Sha1),
+            [new ShaderMap("m", "Game", "PCD3D_SM6", [vsA.Sha1, Vs1.Sha1, Ps1.Sha1])]);
+        var (rs, blob) = Rs(Vs1, Ps1);
+        foreach (var local in new[] { false, true })
+        {
+            var dir = Ff7.TempDir("perstage-unreplayable");
+            var path = Path.Combine(dir, "recording.db");
+            using (var f = File.Create(path))
+            {
+                WriteBlob(f, rs, blob);
+                if (local) WriteBlob(f, gone.Sha1, [.. "DXBC"u8, .. new byte[28]]); // this PC's recording has its bytes
+                Write(f, 'S', Gfx(rs, vsA, gone, Layout1, [R16G16B16A16Float]).Payload);
+                Write(f, 'S', Gfx(rs, Vs1, Ps1, Layout1, [R16G16B16A16Float]).Payload);
+            }
+            var plan = new Planner().Build(Ff7.Game, Ue426, index, new Recording(path), Ff7.Nvidia with { PerStageCache = true }, Path.Combine(dir, "plan"), null, CancellationToken.None);
+            Assert.Equal(!local, Psos(plan).Any(p => p.State.Stages.ContainsValue(vsA.Sha1) && p.State.Rs == rs));
+        }
+    }
+
     /// <summary>FF7 Rebirth planned for AMD from the AMD session: how the NVIDIA machine's recording (another player, another
     /// part of the game) is covered by the plan's units plus the session's own (it replays as it is), per stage.</summary>
     [Trait("Needs", "Game")]

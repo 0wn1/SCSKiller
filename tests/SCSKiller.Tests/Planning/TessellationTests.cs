@@ -59,6 +59,19 @@ public class TessellationTests
         }
     }
 
+    /// <summary>A DS writing SV_Position draws on its own and also feeds a GS taking its triangles (e.g. one routing them to
+    /// render-target slices): both chains plan, alone and with the PS.</summary>
+    [Fact]
+    public void ADomainShaderWritingPositionAlsoFeedsAGeometryShader()
+    {
+        var gsAfter = Shader("t-gs-after", Stage.Geometry, Ds.Outputs, [Pos, In("TEXCOORD", 0, 1)], gsInput: 3) with { ShaderModel = "gs_5_0" };
+        var plan = new Planner().Build(Ff7.Game, Ue427, Index("PCD3D_SM5", gsAfter), null, Ff7.Nvidia, Ff7.TempDir("tess-ds-gs"), null, CancellationToken.None);
+        var body = PlanFile.Read(plan.FilePath).Records.ToList();
+        var sets = body.Where(r => r.Tag == 'S').Select(PsoDb.Parse).Concat(body.Where(r => r.Tag == 'P').Select(r => PsoDb.ParseItem(r.Payload)).Select(i => new PsoDb.Pso(i.Rs, i.Stages, false, 0)))
+            .Where(p => p.Stages.ContainsValue(Ds.Sha1)).Select(Set).ToList();
+        Assert.Equal(new[] { Set(Vs, Hs, Ds), Set(Vs, Hs, Ds, Ps), Set(Vs, Hs, Ds, gsAfter), Set(Vs, Hs, Ds, gsAfter, Ps) }.Order(), sets.Order());
+    }
+
     /// <summary>UE 4's root signatures give the HS and DS their own tables (HULL / DOMAIN visibility), not denied; the pre-emit
     /// guard passes them, and still leaves out a DS declaring what UE 4 gives no domain shader (a UAV).</summary>
     [Fact]

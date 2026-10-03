@@ -216,4 +216,24 @@ public class UnityReaderTests
     static byte[] Le(int v) => BitConverter.GetBytes(v);
     static byte[] Be(int v) { var b = new byte[4]; BinaryPrimitives.WriteInt32BigEndian(b, v); return b; }
     static byte[] Be64(long v) { var b = new byte[8]; BinaryPrimitives.WriteInt64BigEndian(b, v); return b; }
+
+    /// <summary>A block whose data the file doesn't hold is refused at open, before a read allocates it; a closed bundle
+    /// keeps none of its decompressed blocks (the index keeps every bundle it opened until it ends).</summary>
+    [Fact]
+    public void BundleBlocksAreCheckedAtOpenAndFreedAtClose()
+    {
+        var dir = Temp();
+        var path = Path.Combine(dir, "x.bundle");
+        var content = Enumerable.Range(0, 5000).Select(i => (byte)(i * 7)).ToArray();
+        var bytes = Bundle(content, "CAB-0123");
+        File.WriteAllBytes(path, bytes[..^20]);
+        Assert.Throws<InvalidDataException>(() => UnityFiles.Bundle.Open(path));
+
+        File.WriteAllBytes(path, bytes);
+        var b = UnityFiles.Bundle.Open(path)!;
+        Assert.Equal(content, b.Read(0, content.Length));
+        b.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => b.Read(0, content.Length));
+        Directory.Delete(dir, true);
+    }
 }

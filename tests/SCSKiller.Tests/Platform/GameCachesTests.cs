@@ -84,6 +84,21 @@ public class GameCachesTests : IDisposable
     }
 
     [Fact]
+    public void A_path_only_in_the_WAL_is_found_with_non_ascii_characters()
+    {
+        var g = Steam(@"C:\Users\José\Games\Fake Game");
+        var walOnly = Path.Combine(_root, "D3DSCache", "01");
+        Directory.CreateDirectory(walOnly);
+        File.WriteAllBytes(Path.Combine(walOnly, "a.dxcache"), []);
+        File.WriteAllBytes(Path.Combine(walOnly, "a.dxcache-wal"), [.. "junk"u8, .. Encoding.UTF8.GetBytes(g.ExePath), 0, .. "more"u8]);   // SQLite's text: UTF-8
+        Assert.Equal([walOnly], D3DSCache.FoldersOf(Path.Combine(_root, "D3DSCache"), g));
+
+        // a fragment of a path before a byte that isn't UTF-8 text: not joined to the path after it
+        File.WriteAllBytes(Path.Combine(walOnly, "a.dxcache-wal"), [.. @"C:\partial"u8, 0xFF, .. Encoding.UTF8.GetBytes(g.ExePath), 0]);
+        Assert.Equal([g.ExePath], D3DSCache.ExePaths(walOnly)!);
+    }
+
+    [Fact]
     public void An_Xbox_game_matches_its_WindowsApps_package_path_by_family_and_path_in_Content()
     {
         var content = @"D:\XboxGames\Fake Game\Content";

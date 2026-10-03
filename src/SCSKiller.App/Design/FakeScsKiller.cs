@@ -118,7 +118,7 @@ public sealed class FakeScsKiller : IScsKiller
     public event Action<GameState>? GameChanged;
     public event Action<QueueItem>? QueueChanged;
 
-    public async Task<IReadOnlyList<GameState>> ScanAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<GameState>> ScanAsync(CancellationToken ct, bool userRequested = false)
     {
         if (HoldScan is { } hold) await hold.Task;
         await Task.Delay(600, ct);
@@ -133,7 +133,7 @@ public sealed class FakeScsKiller : IScsKiller
     public bool SetEncryptionKey(string gameId, string key) => false;
     public bool ShouldNotifyStale() => Settings.OnDriverUpdate == DriverUpdateMode.Ask && DriverStaleGames().Count > 0;
     public void ApplyDriverUpdateMode() { }
-    public Task<IReadOnlyList<GameState>> RescanAsync(CancellationToken ct) => ScanAsync(ct);
+    public Task<IReadOnlyList<GameState>> RescanAsync(CancellationToken ct, bool userRequested = false) => ScanAsync(ct);
     public void EnqueueWhenIdle(string gameId) => Enqueue(gameId);
 
     /// <summary>Adds at the end; runs only after StartQueue, like the real queue.</summary>

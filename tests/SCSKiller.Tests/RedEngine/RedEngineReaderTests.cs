@@ -1,0 +1,364 @@
+using System.Diagnostics;
+using System.IO.Compression;
+using System.Security.Cryptography;
+using System.Text;
+using SCSKiller.Core;
+using SCSKiller.Core.Carved;
+using SCSKiller.Core.Planning;
+using SCSKiller.Core.RedEngine;
+using SCSKiller.Tests.Carved;
+using SCSKiller.Tests.Planning;
+
+namespace SCSKiller.Tests.RedEngine;
+
+/// <summary>The REDengine 3 reader on a synthetic install: both caches written as the game lays them out, with shaders
+/// compiled here (<see cref="Hlsl"/>).</summary>
+public class RedEngineReaderTests
+{
+    const string Cs = "RWByteAddressBuffer u : register(u0); [numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID) { u.Store(i * 4, i); }";
+
+    /// <summary>A material cache: per shader key, zlib flag, sizes, the zlib stream of (container size, 0, container,
+    /// reflection); then the techniques; then the footer. A null shader is a placeholder entry (no container).
+    /// <paramref name="inflatedOff"/> is added to every declared inflated size.</summary>
+    internal static byte[] Materials((ulong Key, byte[]? Shader)[] shaders, ulong[][] techniques, uint version = 5, int inflatedOff = 0) =>
+        MaterialsRaw(shaders, [.. techniques.Select(t => Technique(t))], version, inflatedOff);
+
+    internal static byte[] MaterialsRaw((ulong Key, byte[]? Shader)[] shaders, byte[][] techniques, uint version = 5, int inflatedOff = 0)
+    {
+        var s = new MemoryStream();
+        var w = new BinaryWriter(s);
+        foreach (var (key, shader) in shaders)
+        {
+            var payload = shader == null ? new byte[24] : [.. BitConverter.GetBytes(shader.Length), 0, 0, 0, 0, .. shader, .. "RPMC"u8, .. new byte[60]];
+            var z = new MemoryStream();
+            using (var zs = new ZLibStream(z, CompressionLevel.Optimal, leaveOpen: true)) zs.Write(payload);
+            w.Write(key); w.Write((byte)1); w.Write(payload.Length + inflatedOff); w.Write((int)z.Length); w.Write(z.ToArray());
+        }
+        var at = s.Position;
+        foreach (var t in techniques) w.Write(t);
+        var size = s.Position - at;
+        w.Write(1u); w.Write(0u); w.Write(new byte[12]); // the two short lists before the footer
+        w.Write(shaders.Length); w.Write(techniques.Length); w.Write(0UL); w.Write(at); w.Write(size); w.Write(at);
+        w.Write("RDHS"u8); w.Write(version);
+        return s.ToArray();
+    }
+
+    /// <summary>One technique; <paramref name="pathLength"/> replaces the path's compact length bytes, <paramref name="names"/>
+    /// the second name list's count.</summary>
+    internal static byte[] Technique(ulong[] keys, byte[]? pathLength = null, uint names = 2)
+    {
+        var s = new MemoryStream();
+        var w = new BinaryWriter(s);
+        w.Write(1UL); w.Write(2UL); w.Write(3UL);
+        var path = Encoding.ASCII.GetBytes(@"fx\test.w2mg");
+        w.Write(pathLength ?? [(byte)(0x80 | path.Length)]); w.Write(path);
+        w.Write(7u);
+        foreach (var k in keys) w.Write(k);
+        w.Write(new byte[24]);
+        w.Write(1u); w.Write(new byte[32]); // one parameter record
+        w.Write(0u);
+        w.Write(0u);
+        w.Write(names); foreach (var n in new[] { "Sampler1", "Diffuse" }) { w.Write((byte)n.Length); w.Write(Encoding.ASCII.GetBytes(n)); w.Write((byte)0); }
+        return s.ToArray();
+    }
+
+    internal static byte[] Static(params byte[][] shaders)
+    {
+        var s = new MemoryStream();
+        var w = new BinaryWriter(s);
+        foreach (var c in shaders) { w.Write(5UL); w.Write(6UL); w.Write(8 + c.Length + 16); w.Write(c.Length); w.Write(0); w.Write(c); w.Write(new byte[16]); }
+        w.Write(shaders.Length); w.Write(new byte[16]); w.Write("RDHS"u8); w.Write(5u);
+        return s.ToArray();
+    }
+
+    sealed class Fixture
+    {
+        public readonly string Dir = Ff7.TempDir("redengine-synthetic");
+        public readonly byte[][] Vs = [.. Enumerable.Range(1, 3).Select(i => Hlsl.Vs(i, Hlsl.Rs1))], Ps = [.. Enumerable.Range(1, 3).Select(i => Hlsl.Ps(i, Hlsl.Rs1))];
+        public readonly byte[] Cs = Hlsl.Compile(RedEngineReaderTests.Cs, "main", "cs_5_1");
+        public Game Game => new("test:red", "red", Store.Other, Dir, Path.Combine(Dir, @"bin\x64_dx12\witcher3.exe"));
+
+        public Fixture()
+        {
+            var content = Path.Combine(Dir, "content", "content0");
+            Directory.CreateDirectory(content);
+            // VS1+PS1, VS2+PS2, VS1 alone, the compute shader, and one naming a key the cache doesn't have
+            File.WriteAllBytes(Path.Combine(content, "shaderdx12_0.cache"), Materials(
+                [(10, Vs[0]), (11, Ps[0]), (12, Vs[1]), (13, Ps[1]), (14, Cs), (15, null)],
+                [[10, 11, 0, 0, 0, 0], [12, 13, 0, 0, 0, 0], [10, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 14], [12, 99, 0, 0, 0, 0], [10, 11, 0, 0, 0, 0]]));
+            File.WriteAllBytes(Path.Combine(content, "staticshaderDx12_0.cache"), Static(Vs[2], Ps[2]));
+        }
+    }
+
+    static readonly Lazy<Fixture> Data = new(() => new Fixture());
+    static string Sha(byte[] b) => Convert.ToHexStringLower(SHA1.HashData(b));
+
+    /// <summary>The Witcher 3's three root signatures, as its recording has them.</summary>
+    const string Graphics = "f6c0d61f3ac22727d9ff6e93114588e5309b60be", Tessellation = "e4dd5cf68f8a5071fe1101be89f34b82ff1aab8c", Compute = "576ddc174436275ef40738aff737215322d2e5e1";
+
+    static string Rs(params Stage[] stages) => Convert.ToHexStringLower(SHA1.HashData(RootSig.Serialize(
+        RootSig.Build(RootSig.Rule.Red3, stages.ToDictionary(s => s, s => new ShaderInfo("", s, "", 0, new(0, 0, 0, 0), [], [], [])), false),
+        RootSig.StaticSamplers(RootSig.Rule.Red3))));
+
+    [Fact]
+    public void RootSignaturesAreTheGamesByteForByte()
+    {
+        Assert.Equal(Graphics, Rs(Stage.Vertex));
+        Assert.Equal(Graphics, Rs(Stage.Vertex, Stage.Pixel));
+        Assert.Equal(Tessellation, Rs(Stage.Vertex, Stage.Hull, Stage.Domain, Stage.Pixel));
+        Assert.Equal(Tessellation, Rs(Stage.Vertex, Stage.Geometry, Stage.Pixel));
+        Assert.Equal(Compute, Rs(Stage.Compute));
+        var engine = new EngineInfo(RedEngineReader.Family, RedEngineReader.Version, null, "D3D12", false, null);
+        Assert.Equal(RootSig.Rule.Red3, RootSig.RuleFor(engine));
+        Assert.True(RootSig.Verified(engine));
+    }
+
+    [Fact]
+    public void IndexesBothCachesAndTechniquesAsPipelines()
+    {
+        var d = Data.Value;
+        var reader = new RedEngineReader();
+        var engine = reader.Detect(d.Game)!;
+        Assert.Equal(new EngineInfo(RedEngineReader.Family, "DX12", null, "D3D12", false, null), engine);
+        Assert.Equal(new PlanCheck(Readiness.Ready, Planner.NoRecording), new Planner().Check(d.Game, engine, null, Ff7.Nvidia));
+        var index = reader.Index(d.Game, engine, null, CancellationToken.None);
+        Assert.Equal(7, index.Shaders.Count); // the placeholder is no shader
+        Assert.All(index.Shaders.Values, s => Assert.Null(s.RootSignature));
+        Assert.Equal(Stage.Compute, index.Shaders[Sha(d.Cs)].Stage);
+        Assert.Equal([[Sha(d.Vs[0]), Sha(d.Ps[0])], [Sha(d.Vs[1]), Sha(d.Ps[1])], [Sha(d.Vs[0])], [Sha(d.Cs)]],
+            index.Maps.Where(m => m.IsPipeline).Select(m => m.Shaders.ToArray())); // each distinct once; the unknown key's left out
+        var pool = Assert.Single(index.Maps, m => !m.IsPipeline);
+        Assert.Equal([Sha(d.Vs[2]), Sha(d.Ps[2])], pool.Shaders);
+
+        var got = new Dictionary<string, byte[]>();
+        reader.ReadShaders(d.Game, engine, new HashSet<string> { Sha(d.Ps[1]), Sha(d.Vs[2]), new('0', 40) }, (h, b) => got.Add(h, b), CancellationToken.None);
+        Assert.Equal(d.Ps[1], got[Sha(d.Ps[1])]);
+        Assert.Equal(d.Vs[2], got[Sha(d.Vs[2])]);
+        Assert.Equal(2, got.Count);
+        Assert.Null(new RedEngineReader().Detect(d.Game with { InstallDir = Path.Combine(d.Dir, "missing") }));
+    }
+
+    /// <summary>Techniques plan as they are, static shaders pair by linkage, every pipeline with the rule's root signature.</summary>
+    [Fact]
+    public void PlansEachTechniqueWithTheEnginesRootSignature()
+    {
+        var d = Data.Value;
+        var reader = new RedEngineReader();
+        var engine = reader.Detect(d.Game)!;
+        var index = reader.Index(d.Game, engine, null, CancellationToken.None);
+        var dir = Ff7.TempDir("redengine-plan");
+        var planner = new Planner();
+        var plan = planner.Build(d.Game, engine, index, null, Ff7.Nvidia, dir, null, CancellationToken.None);
+        var body = PlanFile.Read(plan.FilePath).Records.ToList();
+        Assert.Equal([Compute, Graphics], body.Where(r => r.Tag == 'B').Select(r => PsoDb.Hex(r.Payload.AsSpan(0, 20))).Order()); // the generated root signatures, no game bytes
+        var psos = body.Where(r => r.Tag == 'S').Select(r => PsoDb.Tuple(PsoDb.Parse(r).Rs, PsoDb.Parse(r).Stages))
+            .Concat(body.Where(r => r.Tag == 'P').Select(r => PsoDb.ParseItem(r.Payload)).Select(i => PsoDb.Tuple(i.Rs, i.Stages))).ToHashSet();
+        string T(string rs, params (Stage S, byte[] B)[] st) => PsoDb.Tuple(rs, st.Select(x => new KeyValuePair<int, string>((int)x.S, Sha(x.B))));
+        Assert.Equal(new HashSet<string>
+        {
+            T(Graphics, (Stage.Vertex, d.Vs[0]), (Stage.Pixel, d.Ps[0])), T(Graphics, (Stage.Vertex, d.Vs[1]), (Stage.Pixel, d.Ps[1])),
+            T(Graphics, (Stage.Vertex, d.Vs[0])), T(Compute, (Stage.Compute, d.Cs)),
+            T(Graphics, (Stage.Vertex, d.Vs[2])), T(Graphics, (Stage.Vertex, d.Vs[2]), (Stage.Pixel, d.Ps[2])),
+        }, psos);
+        Assert.True(plan.Stats.RootSigRuleVerified);
+        Assert.Equal(2, plan.Stats.RootSignatures);
+        var work = Path.Combine(dir, "work");
+        planner.Materialize(plan, d.Game, engine, reader, null, work, CancellationToken.None);
+        Ff7.CheckWarmReady(work);
+    }
+
+    [Fact]
+    public void RefusesOtherVersionsAndBrokenFiles()
+    {
+        var vs = Data.Value.Vs[0];
+        Assert.NotNull(RedShaderCache.ReadMaterials(new MemoryStream(Materials([(1, vs)], [[1, 0, 0, 0, 0, 0]]))));
+        Assert.Null(RedShaderCache.ReadMaterials(new MemoryStream(Materials([(1, vs)], [[1, 0, 0, 0, 0, 0]], version: 4))));
+        var f = Materials([(1, vs)], [[1, 0, 0, 0, 0, 0]]);
+        f[^48] = 2; // two shaders claimed, one stored
+        Assert.Null(RedShaderCache.ReadMaterials(new MemoryStream(f)));
+        Assert.Null(RedShaderCache.ReadMaterials(new MemoryStream(new byte[40])));
+        var st = Static(vs);
+        Assert.Single(RedShaderCache.ReadStatic(new MemoryStream(st))!);
+        st[^28] = 3;
+        Assert.Null(RedShaderCache.ReadStatic(new MemoryStream(st)));
+    }
+
+    /// <summary>No loop runs on a count or length the file can't hold, so a damaged file reads as null at once.</summary>
+    [Fact]
+    public void DamagedTechniquesReadAsNullFast()
+    {
+        var vs = Data.Value.Vs[0];
+        ulong[] k = [1, 0, 0, 0, 0, 0];
+        RedShaderCache.Materials? Read(byte[] f) => RedShaderCache.ReadMaterials(new MemoryStream(f));
+        var sw = Stopwatch.StartNew();
+        Assert.NotNull(Read(MaterialsRaw([(1, vs)], [Technique(k)])));
+        Assert.Null(Read(MaterialsRaw([(1, vs)], [Technique(k, pathLength: [0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F])]))); // would wrap past 63 bits
+        Assert.Null(Read(MaterialsRaw([(1, vs)], [Technique(k, pathLength: [0xFF, 0xFF, 0x7F])]))); // longer than the bytes left
+        Assert.Null(Read(MaterialsRaw([(1, vs)], [Technique(k, names: uint.MaxValue)])));
+        var whole = Materials([(1, vs)], [k, k]);
+        Assert.Null(Read([.. whole[..(whole.Length / 2)], .. whole[^48..]])); // truncated, footer kept
+        var huge = whole.ToArray();
+        BitConverter.GetBytes(uint.MaxValue).CopyTo(huge, huge.Length - 44); // techniques claimed
+        Assert.Null(Read(huge));
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public void AShaderInflatingToAnotherSizeIsLeftOut()
+    {
+        var vs = Data.Value.Vs[0];
+        var ok = new MemoryStream(Materials([(1, vs)], [[1, 0, 0, 0, 0, 0]]));
+        var e = RedShaderCache.ReadMaterials(ok)!.Shaders[1];
+        Assert.Equal(vs, RedShaderCache.Container(ok, e));
+        Assert.Null(RedShaderCache.Container(ok, e with { Inflated = RedShaderCache.MaxPayload + 1 }));
+        foreach (var off in new[] { -1, 1 })
+        {
+            var f = new MemoryStream(Materials([(1, vs)], [[1, 0, 0, 0, 0, 0]], inflatedOff: off));
+            Assert.Null(RedShaderCache.Container(f, RedShaderCache.ReadMaterials(f)!.Shaders[1]));
+        }
+    }
+
+    /// <summary>Slots VS, PS, GS, HS, DS, CS: a technique plans only as a stage set the root signatures are confirmed for,
+    /// with each key a shader of its slot's stage; its compute shader is a pipeline of its own.</summary>
+    [Fact]
+    public void TechniquesMustBeConfirmedStageSets()
+    {
+        Stage[] st = [Stage.Vertex, Stage.Pixel, Stage.Geometry, Stage.Hull, Stage.Domain, Stage.Compute];
+        var shaders = st.ToDictionary(s => s.ToString(), s => new ShaderInfo(s.ToString(), s, "", 0, new(0, 0, 0, 0), [], [], []));
+        var shaOf = st.Select((s, i) => (Key: (ulong)i + 1, Sha: s.ToString())).ToDictionary(x => x.Key, x => x.Sha);
+        List<string>? G(params ulong[] t) => RedEngineReader.Graphics(t, shaOf, shaders);
+        Assert.Equal(["Vertex", "Pixel"], G(1, 2, 0, 0, 0, 0));
+        Assert.Equal(["Vertex", "Pixel", "Hull", "Domain"], G(1, 2, 0, 4, 5, 0));
+        Assert.Equal(["Vertex"], G(1, 0, 0, 0, 0, 6)); // with its compute pass
+        Assert.Equal([], G(0, 0, 0, 0, 0, 6));
+        Assert.Null(G(0, 2, 0, 0, 0, 0));    // PS without a VS
+        Assert.Null(G(1, 2, 0, 4, 0, 0));    // HS without a DS
+        Assert.Null(G(1, 2, 0, 0, 5, 0));    // DS without a HS
+        Assert.Null(G(1, 0, 3, 0, 0, 0));    // VS+GS: not a set the recording confirmed
+        Assert.Null(G(1, 2, 3, 4, 5, 0));    // nor all five
+        Assert.Null(G(2, 1, 0, 0, 0, 0));    // a PS in the VS slot
+        Assert.Null(G(1, 0, 0, 0, 0, 2));    // a PS in the CS slot
+        Assert.Null(G(1, 9, 0, 0, 0, 0));    // a key the cache doesn't have
+        Assert.Null(G(0, 0, 0, 0, 0, 0));
+        Assert.False(RootSig.Red3Validated([Stage.Mesh, Stage.Pixel]));
+        Assert.Throws<RootSig.SerializeException>(() => Rs(Stage.Vertex, Stage.Geometry));
+    }
+
+    sealed class Stub : IEngineReader
+    {
+        public static readonly EngineInfo Info = new("Carved", "DXIL", null, "D3D12", false, null);
+        public EngineInfo? Detect(Game game) => Info;
+        public ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, CancellationToken ct) => new("carved", [], new Dictionary<string, ShaderInfo>(), []);
+        public void ReadShaders(Game game, EngineInfo engine, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct) { }
+    }
+
+    static (Game Game, string Cache) Install(string name)
+    {
+        var dir = Ff7.TempDir(name);
+        var cache = Path.Combine(dir, "content", "content0", "shaderdx12_0.cache");
+        Directory.CreateDirectory(Path.GetDirectoryName(cache)!);
+        return (new Game($"test:{name}", "red", Store.Other, dir, Path.Combine(dir, "witcher3.exe")), cache);
+    }
+
+    /// <summary>A material cache that doesn't read whole (counts past its tables, bytes inserted before the footer, a
+    /// technique table that doesn't parse) or whose techniques name no usable pipeline isn't REDengine 3: the next reader
+    /// detects the game under its own engine, and the plan gets none of the REDengine 3 root signatures.</summary>
+    [Fact]
+    public void ADamagedCacheIsTheGenericReadersGame()
+    {
+        var d = Data.Value;
+        var (game, cache) = Install("redengine-damaged");
+        var good = Materials([(10, d.Vs[0]), (11, d.Ps[0])], [[10, 11, 0, 0, 0, 0]]);
+        File.WriteAllBytes(cache, good);
+        Assert.Equal(RedEngineReader.Family, new RedEngineReader().Detect(game)?.Family);
+
+        var counts = good.ToArray();
+        BitConverter.GetBytes(200u).CopyTo(counts, counts.Length - 44); // more techniques than the table holds
+        var inserted = (byte[])[.. good[..^48], 0, 0, 0, 0, .. good[^48..]];
+        foreach (var damaged in new[] { counts, inserted, MaterialsRaw([(10, d.Vs[0])], [Technique([10, 0, 0, 0, 0, 0], names: 1 << 20)]),
+                     Materials([(11, d.Ps[0])], [[11, 0, 0, 0, 0, 0]]) }) // the last: a PS in the VS slot
+        {
+            File.WriteAllBytes(cache, damaged);
+            Assert.Null(new RedEngineReader().Detect(game));
+            Assert.Equal(Stub.Info, new EngineReaders((RedEngineReader.Family, new RedEngineReader()), ("Carved", new Stub())).Detect(game));
+        }
+
+        // the carver plans what it finds with the shaders' own root signatures, never REDengine 3's
+        File.WriteAllBytes(Path.Combine(game.InstallDir, "shaders.bin"), [.. d.Vs[2], .. d.Ps[2]]);
+        var carver = new CarvedReader();
+        var engine = new EngineReaders((RedEngineReader.Family, new RedEngineReader()), (CarvedReader.Family, carver)).Detect(game)!;
+        Assert.Equal(CarvedReader.Family, engine.Family);
+        Assert.Null(RootSig.RuleFor(engine));
+        var index = carver.Index(game, engine, null, CancellationToken.None);
+        var plan = new Planner().Build(game, engine with { Unsupported = null }, index, null, Ff7.Nvidia, Ff7.TempDir("redengine-fallback-plan"), null, CancellationToken.None);
+        var rs = PlanFile.Read(plan.FilePath).Records.Where(r => r.Tag is 'S' or 'P')
+            .Select(r => r.Tag == 'S' ? PsoDb.Parse(r).Rs : PsoDb.ParseItem(r.Payload).Rs).ToHashSet();
+        Assert.NotEmpty(rs);
+        Assert.Empty(rs.Intersect([Graphics, Tessellation, Compute]));
+    }
+
+    [Fact]
+    public void IndexRefusesACacheDamagedSinceDetection()
+    {
+        var d = Data.Value;
+        var (game, cache) = Install("redengine-changed");
+        File.WriteAllBytes(cache, Materials([(10, d.Vs[0]), (11, d.Ps[0])], [[10, 11, 0, 0, 0, 0]]));
+        var reader = new RedEngineReader();
+        var engine = reader.Detect(game)!;
+        File.WriteAllBytes(cache, Materials([(11, d.Ps[0])], [[11, 0, 0, 0, 0, 0]]));
+        Assert.Throws<InvalidDataException>(() => reader.Index(game, engine, null, CancellationToken.None));
+        File.WriteAllBytes(cache, [1, 2, 3]);
+        Assert.Throws<InvalidDataException>(() => reader.Index(game, engine, null, CancellationToken.None));
+    }
+
+    /// <summary>A recorded PSO whose shaders' only technique was left out (here a PS in the VS slot): those shaders are in the
+    /// index but in no map, and the PSO still plans, replayed as recorded.</summary>
+    [Fact]
+    public void ARecordedPsoOfALeftOutTechniquePlans()
+    {
+        var d = Data.Value;
+        var (game, cache) = Install("redengine-left-out");
+        File.WriteAllBytes(cache, Materials([(10, d.Vs[0]), (11, d.Ps[0]), (20, d.Vs[1]), (21, d.Ps[1])], [[10, 11, 0, 0, 0, 0], [21, 20, 0, 0, 0, 0]]));
+        var reader = new RedEngineReader();
+        var engine = reader.Detect(game)!;
+        var index = reader.Index(game, engine, null, CancellationToken.None);
+        var (vs, ps) = (Sha(d.Vs[1]), Sha(d.Ps[1]));
+        Assert.True(index.Shaders.ContainsKey(vs) && index.Shaders.ContainsKey(ps));
+        Assert.DoesNotContain(index.Maps, m => m.Shaders.Contains(vs) || m.Shaders.Contains(ps));
+
+        var rsBlob = RootSig.Serialize(RootSig.Build(RootSig.Rule.Red3, new Dictionary<Stage, ShaderInfo> { [Stage.Vertex] = index.Shaders[vs], [Stage.Pixel] = index.Shaders[ps] }, false), []);
+        var db = Path.Combine(game.InstallDir, "recording.db");
+        using (var s = File.Create(db))
+        {
+            PsoDb.WriteBlob(s, Graphics, rsBlob);
+            PsoDb.WriteBlob(s, vs, d.Vs[1]);
+            PsoDb.WriteBlob(s, ps, d.Ps[1]);
+            PsoDb.Write(s, 'S', PsoDb.Stream(Graphics, new SortedDictionary<int, string> { [(int)Stage.Vertex] = vs, [(int)Stage.Pixel] = ps }, null, 3, [PsoDb.R16G16B16A16Float], 0));
+        }
+        var plan = new Planner().Build(game, engine, index, new Recording(db), Ff7.Nvidia, Ff7.TempDir("redengine-left-out-plan"), null, CancellationToken.None);
+        Assert.Equal(1, plan.Stats.Recorded);
+        Assert.True(plan.Stats.RootSigRuleVerified);
+    }
+
+    /// <summary>A cache replaced by a shorter one after the index: its shaders are unavailable, never an exception.</summary>
+    [Fact]
+    public void ShadersGoneSinceTheIndexAreSkipped()
+    {
+        var d = Data.Value;
+        var (game, cache) = Install("redengine-shorter");
+        File.WriteAllBytes(cache, Materials([(10, d.Vs[0]), (11, d.Ps[0]), (12, d.Vs[1]), (13, d.Ps[1])], [[10, 11, 0, 0, 0, 0], [12, 13, 0, 0, 0, 0]]));
+        var reader = new RedEngineReader();
+        var engine = reader.Detect(game)!;
+        reader.Index(game, engine, null, CancellationToken.None);
+        var all = new[] { d.Vs[0], d.Ps[0], d.Vs[1], d.Ps[1] }.Select(Sha).ToHashSet();
+        var got = new List<string>();
+        reader.ReadShaders(game, engine, all, (h, _) => got.Add(h), CancellationToken.None);
+        Assert.Equal(4, got.Count);
+        File.WriteAllBytes(cache, Materials([(10, d.Vs[0])], [[10, 0, 0, 0, 0, 0]]));
+        got.Clear();
+        reader.ReadShaders(game, engine, all, (h, _) => got.Add(h), CancellationToken.None);
+        Assert.Equal([Sha(d.Vs[0])], got); // the one still where the index found it
+        File.Delete(cache);
+        reader.ReadShaders(game, engine, all, (h, _) => got.Add(h), CancellationToken.None);
+    }
+}

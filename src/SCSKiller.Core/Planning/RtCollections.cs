@@ -156,7 +156,10 @@ public static class RtCollections
             .OrderBy(f => Array.FindIndex(Kinds, k => k.Kind == f.Kind)).ToList();
         if (fns.Count == 0) return null;
         nameHash ??= Convert.ToHexStringLower([.. Convert.FromHexString(sha1).AsSpan(0, 8).ToArray().Reverse()]);
-        string Export(ShaderContainer.LibraryFunction f) => $"{Kinds.First(k => k.Kind == f.Kind).Prefix}_{nameHash}";
+        // export names must differ within a state object (DXR spec)
+        var names = fns.Select((f, i) => $"{Kinds.First(k => k.Kind == f.Kind).Prefix}_{nameHash}" + (fns.Take(i).Count(g => g.Kind == f.Kind) is var n and > 0 ? $"_{n}" : ""))
+            .ToList();
+        string Export(ShaderContainer.LibraryFunction f) => names[fns.IndexOf(f)];
         var hit = fns.Where(f => f.Kind is 8 or 9 or 10).ToList();
         var rayGen = fns.Any(f => f.Kind == 7);
         var w = new W();
@@ -167,10 +170,11 @@ public static class RtCollections
         foreach (var f in fns) w.Str(Export(f)).Str(f.Name).U32(0);
         Sub(9).U32(Math.Max(payload, (uint)fns.Max(f => f.Payload))).U32(Math.Max(attributes, (uint)fns.Max(f => f.Attributes)));
         Sub(7).U32(1).Names(fns.Select(Export));
-        if (hit.Count > 0)
+        // ponytail: hit group k takes the k-th hit shader of each kind; the library doesn't say how the game pairs them
+        for (var g = 0; g < hit.GroupBy(f => f.Kind).Select(k => k.Count()).DefaultIfEmpty(0).Max(); g++)
         {
-            string? Of(int kind) => hit.FirstOrDefault(f => f.Kind == kind) is { } f ? Export(f) : null;
-            Sub(11).Str($"HitGroup_{nameHash}").U32(Of(8) != null ? 1u : 0).Str(Of(9)).Str(Of(10)).Str(Of(8));
+            string? Of(int kind) => hit.Where(f => f.Kind == kind).ElementAtOrDefault(g) is { } f ? Export(f) : null;
+            Sub(11).Str($"HitGroup_{nameHash}" + (g > 0 ? $"_{g}" : "")).U32(Of(8) != null ? 1u : 0).Str(Of(9)).Str(Of(10)).Str(Of(8));
         }
         Sub(10).U32(depth);
         Sub(0).U32(flags);

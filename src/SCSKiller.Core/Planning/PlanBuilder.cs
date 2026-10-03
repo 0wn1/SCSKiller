@@ -34,7 +34,7 @@ sealed class PlanBuilder
     readonly Dictionary<string, List<(string Key, string Rs, bool Layout)>> templates = [];
     readonly Dictionary<string, Rec> recByKey = [];
     readonly Dictionary<(uint Topology, string Shape), (string Key, string Rs, bool Layout)> gsTopo = []; // GS templates by input topology and stages (a stream template has only its own shaders' subobjects)
-    readonly Dictionary<string, string> rsByCounts = [];
+    readonly Dictionary<string, List<string>> rsByCounts = []; // recorded root signatures by resource counts, in recording order
     readonly HashSet<string> have = [];
     readonly Dictionary<string, int> plats = [];
     byte[]? samplers;
@@ -205,8 +205,11 @@ sealed class PlanBuilder
                 catch (RootSig.SerializeException) { unbuilt++; }
             }
             have.Add(pso.Tuple);
-            foreach (var h in pso.Stages.Values) plats[platOfSha[h]] = plats.GetValueOrDefault(platOfSha[h]) + 1;
-            rsByCounts[Planner.CountsKey(st)] = pso.Rs;
+            // a [WaveSize] partition counts for its base platform: OnPlatform takes it in relative to that one
+            // an indexed shader in no map (a REDengine 3 technique left out) has no platform
+            foreach (var p in pso.Stages.Values.Where(platOfSha.ContainsKey).Select(h => platOfSha[h].Split(" wave")[0])) plats[p] = plats.GetValueOrDefault(p) + 1;
+            if (!rsByCounts.TryGetValue(Planner.CountsKey(st), out var byCounts)) rsByCounts[Planner.CountsKey(st)] = byCounts = [];
+            if (!byCounts.Contains(pso.Rs)) byCounts.Add(pso.Rs);
             var t = (r.Key, pso.Rs, pso.HasLayout);
             recByKey[r.Key] = r;
             var shape = Planner.Shape(pso.Stages);
@@ -253,7 +256,8 @@ sealed class PlanBuilder
     {
         // carved shaders carrying their root signature (RTS0): exact, served by the reader at materialize time
         if (stages.Values.Select(h => bc[h].RootSignature).FirstOrDefault(r => r != null) is { } embedded) return embedded;
-        if (!build) return rsByCounts.GetValueOrDefault(Planner.CountsKey(Infos(stages)));
+        if (rule == RootSig.Rule.Red3 && !RootSig.Red3Validated(stages.Keys.Select(k => (Stage)k))) return null; // not a stage set the rule was confirmed on
+        if (!build) return rsByCounts.TryGetValue(Planner.CountsKey(Infos(stages)), out var learned) ? learned.FirstOrDefault(r => Covers(r, stages), learned[0]) : null;
         var desc = RootSig.Build(rule, Infos(stages), MeshTier(stages), maxSrvs);
         if (!rsCache.TryGetValue(desc.Key, out var h))
         {
@@ -361,7 +365,7 @@ sealed class PlanBuilder
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var facts = ExactLayouts.Build(recs, recBlobs, policy, bc);
-        var cover = UnitCover.Seeded(facts);
+        var cover = UnitCover.Seeded(facts, h => bc.ContainsKey(h) || recBlobs.ContainsKey(h)); // a shared recording's PSO with a shader neither has doesn't replay
         var recorded = cover.Covered.ToHashSet();
 
         var layouts = new Dictionary<string, Resolved<List<List<LayoutElem>>>>();
@@ -554,7 +558,7 @@ sealed class PlanBuilder
             foreach (var (h, d) in Planner.TessPairs(ds))
             {
                 var tails = new List<(ShaderInfo? Gs, ShaderInfo? Ps)>(); // after the DS: nothing or a GS (depth passes), then a PS
-                foreach (var g in Planner.Rasterizable(d) ? [null] : gsIn[Planner.Sig(d.Outputs)].Where(g => Planner.Links(d, g) && Planner.Rasterizable(g)))
+                foreach (var g in (Planner.Rasterizable(d) ? [null] : Array.Empty<ShaderInfo?>()).Concat(gsIn[Planner.Sig(d.Outputs)].Where(g => Planner.Links(d, g) && Planner.Rasterizable(g))))
                 {
                     var last = g ?? d;
                     tails.Add((g, null));

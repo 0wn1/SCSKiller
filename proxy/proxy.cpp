@@ -53,6 +53,7 @@
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "dxguid.lib")  // CLSID_D3D12DeviceFactory, CLSID_D3D12SDKConfiguration
 
 using Hash = std::array<uint8_t, 20>;
 struct HashH { size_t operator()(const Hash& h) const { size_t v; memcpy(&v, h.data(), sizeof v); return v; } };
@@ -910,7 +911,10 @@ static void store(const Writer& w, const Hash& k) {
         for (auto& [h, b] : w.blobs)
             if (fresh(g_blobs_on_disk, h)) put('B', h.data(), 20, b.data(), b.size());
         for (auto& h : w.rsigs)
-            if (fresh(g_blobs_on_disk, h)) put('B', h.data(), 20, g_rs_bytes[h].data(), g_rs_bytes[h].size());
+            if (auto it = g_rs_bytes.find(h); it != g_rs_bytes.end()) {
+                if (fresh(g_blobs_on_disk, h)) put('B', h.data(), 20, it->second.data(), it->second.size());
+                g_rs_bytes.erase(it);  // written now or already kept: only what may still be written stays in memory
+            }
         put(w.tag, w.s.data(), w.s.size());
         db_flush();
     }
@@ -927,6 +931,7 @@ static void store(const Writer& w, const Hash& k) {
 // pre_ms: the hook's time before the create call (serializing and hashing the desc); the csv's proxy_ms adds this call's.
 static void note(Writer& w, double ms, bool lib, double pre_ms) {
     auto n0 = std::chrono::steady_clock::now();
+    double t_ret = now_ms();  // the csv's t_ms: when the create returned, not when the lock and the db write let the row out
     std::lock_guard l(g_mx);
     ++g_creates, g_lib_loads += lib;
     if (g_creates == 1) logf("first PSO seen (%s)", lib ? "pipeline library load" : "create");
@@ -948,7 +953,7 @@ static void note(Writer& w, double ms, bool lib, double pre_ms) {
     (known ? g_slow_known : tknown ? g_slow_tuple : g_slow_unknown) += ms > slow;
     if (g_csv) {  // key: the PSO key (sha1 of tag + payload, as the db's record); proxy_ms: the hook's own time, outside ms
         double own = pre_ms + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - n0).count();
-        fprintf(g_csv, "%.1f,%c,%d,%d,%.3f,%s,%.3f,%lu,%d\n", now_ms(), lib ? w.tag | 0x20 : w.tag, (int)known, (int)tknown, ms, hex(k).data(), own,
+        fprintf(g_csv, "%.1f,%c,%d,%d,%.3f,%s,%.3f,%lu,%d\n", t_ret, lib ? w.tag | 0x20 : w.tag, (int)known, (int)tknown, ms, hex(k).data(), own,
                 GetCurrentThreadId(), (int)t_presenting);
     }
     if (g_csv) fflush(g_csv);  // a crash or hard exit must not lose the timings
@@ -1596,8 +1601,10 @@ static void warm_main() {
                 std::lock_guard l(g_parkmx);
                 parked = !g_parked.empty();
             }
-            if (g_mem_mb && mb > g_mem_mb && parked && now - mem_released > 1000)
-                release_parked("over the memory budget"), mem_released = now, mb = private_mb();
+            // on its own thread: the gate waits for every create, and a hung one must not stop this loop's timeouts
+            static std::atomic<bool> releasing;
+            if (g_mem_mb && mb > g_mem_mb && parked && now - mem_released > 1000 && !releasing.exchange(true))
+                mem_released = now, std::thread([] { release_parked("over the memory budget"), releasing = false; }).detach();
             if (g_mem_mb && mb > g_mem_mb && g_allowed > 1 && now - mem_changed > 5000)
                 --g_allowed, mem_changed = now, logf("warm: private memory %.0f MB over the %u MB budget: %d workers", mb, g_mem_mb, g_allowed.load());
             else if (g_mem_mb && mb < 0.8 * g_mem_mb && g_allowed < g_threads && now - mem_changed > 30000)
@@ -1679,13 +1686,14 @@ static void on_first_pso(ID3D12Device* dev) {
 }
 
 static thread_local bool t_in;  // guards against the runtime routing one create through another
+static thread_local double t_below_ms;  // the below-wrapper hook's own time inside the current create (a chained mod's)
 
 static HRESULT remember_rs(HRESULT hr, const void* blob, SIZE_T n, void** pp) {
     if (SUCCEEDED(hr) && pp && *pp) {
         Hash h = sha1(blob, n);
         std::lock_guard l(g_mx);
         g_rs_of[*pp] = h;
-        g_rs_bytes.try_emplace(h, (const char*)blob, n);
+        if (g_db && !(g_db_capped && g_db_bytes >= g_db_cap) && !g_blobs_on_disk.count(h) && !imported(h)) g_rs_bytes.try_emplace(h, (const char*)blob, n);
     }
     return hr;
 }
@@ -1697,10 +1705,12 @@ template <class F> static HRESULT timed_create(ID3D12Device* dev, void** pp, Wri
     if (t_in || !pp) return call();
     t_in = true;
     on_first_pso(dev);
+    t_below_ms = 0;
     auto t0 = std::chrono::steady_clock::now();
     HRESULT hr = call();
-    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    if (SUCCEEDED(hr)) note(w, ms, lib, std::chrono::duration<double, std::milli>(t0 - w.t0).count());  // a failed library load is a miss: the game creates it next
+    // a chained mod's create reaches hk_*_below, whose recording is ours, not the driver's: proxy_ms, not ms
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - t_below_ms;
+    if (SUCCEEDED(hr)) note(w, ms, lib, std::chrono::duration<double, std::milli>(t0 - w.t0).count() + t_below_ms);  // a failed library load is a miss: the game creates it next
     t_in = false;
     return hr;
 }
@@ -1983,12 +1993,15 @@ template <class F> static HRESULT below(Writer& w, void** pp, F&& call) {
             if (!g_blobs_on_disk.count(h)) b = own.emplace_back(b);
     }
     t_below = true;
+    auto a = std::chrono::steady_clock::now();
     HRESULT hr = call();
+    auto b = std::chrono::steady_clock::now();
     t_below = false;
     if (SUCCEEDED(hr) && w.ok && !w.s.empty()) {
         std::lock_guard l(g_mx);
         store(w, key_of(w.tag, w.s));
     }
+    t_below_ms += std::chrono::duration<double, std::milli>(a - w.t0 + (std::chrono::steady_clock::now() - b)).count();
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hk_gfx_below(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** pp) {
@@ -2079,7 +2092,7 @@ static std::atomic<uint64_t> g_presents;
 static thread_local int t_present;  // nesting depth: only the outermost present of a thread is a frame
 
 template <class F> static HRESULT timed_present(void* sc, UINT flags, F&& call) {
-    LARGE_INTEGER a, b, c;
+    LARGE_INTEGER a, b, c, t;
     QueryPerformanceCounter(&a);
     if (t_present++ || (flags & DXGI_PRESENT_TEST)) {
         HRESULT hr = call();
@@ -2092,8 +2105,11 @@ template <class F> static HRESULT timed_present(void* sc, UINT flags, F&& call) 
     --t_present;
     t_presenting = true;
     {
+        // a failed present (DXGI_ERROR_WAS_STILL_DRAWING from a DO_NOT_WAIT retry) shows no frame; the frame's time is
+        // taken under the lock so two threads' frames queue in the order they returned
         std::lock_guard l(g_fmx);
-        g_fq.push_back({c.QuadPart, sc});
+        QueryPerformanceCounter(&t);
+        if (SUCCEEDED(hr)) g_fq.push_back({t.QuadPart, sc});
     }
     LARGE_INTEGER d;
     QueryPerformanceCounter(&d);
@@ -2183,22 +2199,27 @@ static FrameEnc g_fenc;  // the writer thread's
 static uint64_t g_fhead[4];  // the launch record, written when the first frame is
 static bool g_frames_full;
 
+// Frames are encoded only once the file is open, and a failed write ends the file: each frame's time is the sum of the
+// deltas before it, so a batch encoded but not written would shift every later frame.
 static void frames_flush(std::vector<FrameAt>& q) {
-    for (auto& f : q) g_fenc.put(f);
-    q.clear();
-    auto& o = g_fenc.out;
-    if (o.empty()) return;
+    if (q.empty() || g_frames_full) return q.clear();
     if (g_frames == INVALID_HANDLE_VALUE) {  // the last launch that presented replaces the file: a probe that never presents keeps it
         g_frames = CreateFileW((g_dir + L"scskiller_frames.bin").c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (g_frames == INVALID_HANDLE_VALUE) return o.clear(), logf("frames: scskiller_frames.bin can't be written (%lu)", GetLastError());
+        if (g_frames == INVALID_HANDLE_VALUE) return q.clear(), logf("frames: scskiller_frames.bin can't be written (%lu)", GetLastError());
         uint32_t mark = 0xFFFFFFFF;
-        DWORD done;
-        WriteFile(g_frames, &mark, 4, &done, nullptr), WriteFile(g_frames, g_fhead, sizeof g_fhead, &done, nullptr);
+        DWORD a = 0, b = 0;
+        if (!WriteFile(g_frames, &mark, 4, &a, nullptr) || !WriteFile(g_frames, g_fhead, sizeof g_fhead, &b, nullptr) || a + b != 4 + sizeof g_fhead)
+            return q.clear(), g_frames_full = true, logf("frames: writing scskiller_frames.bin failed (%lu), no frames written", GetLastError());
     }
-    DWORD n = (DWORD)(o.size() * 4), done;
-    if (g_fenc.bytes + n <= kFramesCap) WriteFile(g_frames, o.data(), n, &done, nullptr), g_fenc.bytes += n;
-    else if (!g_frames_full) g_frames_full = true, logf("frames: %llu bytes this launch, no more frames written", g_fenc.bytes);
+    for (auto& f : q) g_fenc.put(f);
+    q.clear();
+    auto& o = g_fenc.out;
+    DWORD n = (DWORD)(o.size() * 4), done = 0;
+    if (g_fenc.bytes + n > kFramesCap) g_frames_full = true, logf("frames: %llu bytes this launch, no more frames written", g_fenc.bytes);
+    else if (!WriteFile(g_frames, o.data(), n, &done, nullptr) || done != n)
+        g_frames_full = true, logf("frames: writing scskiller_frames.bin failed (%lu), no more frames written", GetLastError());
+    else g_fenc.bytes += n;
     o.clear();
 }
 
@@ -2274,6 +2295,24 @@ void* real_Ordinal99;
 using PFN_CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
 static PFN_CreateDevice real_CreateDevice;
 
+// Before any hook: they stay in the runtime's and nvapi64.dll's code for the life of the process, so what they point at
+// is never unloaded.
+static void pin_self() {
+    HMODULE self;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)&pin_self, &self);
+}
+
+// Every device the game gets, however it asked for one: the hooks, once per vtable.
+static HRESULT device_created(HRESULT hr, IUnknown* adapter, D3D_FEATURE_LEVEL fl, void** pp) {
+    if (FAILED(hr) || !pp || !*pp) return hr;
+    pin_self();
+    install_hooks((IUnknown*)*pp);
+    if (g_next) hook_below(adapter, fl);
+    static std::once_flag nv, frames;
+    std::call_once(nv, nv_hooks), std::call_once(frames, frame_hooks);
+    return hr;
+}
+
 extern "C" HRESULT WINAPI Proxy_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** pp) {
     static std::once_flag once;
     std::call_once(once, [] {
@@ -2283,14 +2322,70 @@ extern "C" HRESULT WINAPI Proxy_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE
         if (SUCCEEDED(dhr)) dbg->EnableDebugLayer(), dbg->Release();
         logf("d3d12 debug: %s (hr=0x%08x)", SUCCEEDED(dhr) ? "debug layer enabled" : "debug layer unavailable: install the Graphics Tools optional feature", (unsigned)dhr);
     });
-    HRESULT hr = real_CreateDevice(adapter, fl, riid, pp);
-    // the hooks stay in the runtime's and nvapi64.dll's code for the life of the process: never unload what they point at
-    HMODULE self;
-    if (SUCCEEDED(hr) && pp && *pp) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)&Proxy_D3D12CreateDevice, &self);
-    if (SUCCEEDED(hr) && pp && *pp) install_hooks((IUnknown*)*pp);
-    if (SUCCEEDED(hr) && pp && *pp && g_next) hook_below(adapter, fl);
-    static std::once_flag nv, frames;
-    if (SUCCEEDED(hr) && pp && *pp) std::call_once(nv, nv_hooks), std::call_once(frames, frame_hooks);
+    return device_created(real_CreateDevice(adapter, fl, riid, pp), adapter, fl, pp);
+}
+
+// A device from ID3D12DeviceFactory::CreateDevice (D3D12GetInterface: CLSID_D3D12DeviceFactory, or
+// ID3D12SDKConfiguration1::CreateDeviceFactory) never passes D3D12CreateDevice: its factory's vtable is hooked instead.
+// Each SDK's D3D12Core.dll has its own factory vtable and original: one entry per vtable. A device of a second D3D12Core
+// in the same process isn't recorded: the device hooks keep one original per method (patch logs the skip).
+using PFN_FactoryCreateDevice = HRESULT(STDMETHODCALLTYPE*)(ID3D12DeviceFactory*, IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+using PFN_CreateDeviceFactory = HRESULT(STDMETHODCALLTYPE*)(ID3D12SDKConfiguration1*, UINT, LPCSTR, REFIID, void**);
+enum { SLOT_FACTORY_CREATEDEVICE = 9, SLOT_CREATEDEVICEFACTORY = 4 };  // vtslots.cpp checks these
+struct FacVt { std::atomic<void**> vt; std::atomic<PFN_FactoryCreateDevice> orig; };
+static FacVt g_facvt[8];
+static std::atomic<int> g_nfacvt;
+static PFN_CreateDeviceFactory o_createdevicefactory;
+static HRESULT STDMETHODCALLTYPE hk_factory_createdevice(ID3D12DeviceFactory* f, IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** pp) {
+    void** vt = *(void***)f;
+    PFN_FactoryCreateDevice o = nullptr;
+    for (int i = 0, n = g_nfacvt.load(std::memory_order_acquire); i < n && !o; ++i)
+        if (g_facvt[i].vt == vt) o = g_facvt[i].orig;
+    if (!o) return E_FAIL;  // unreachable: only a vtable in the table points here
+    return device_created(o(f, adapter, fl, riid, pp), adapter, fl, pp);
+}
+static void hook_factory(IUnknown* unk) {
+    ID3D12DeviceFactory* f;
+    if (!unk || FAILED(unk->QueryInterface(IID_PPV_ARGS(&f)))) return;
+    pin_self();
+    {
+        std::lock_guard l(g_mx);
+        void** vt = *(void***)f;
+        int n = g_nfacvt;
+        if (vt[SLOT_FACTORY_CREATEDEVICE] != (void*)hk_factory_createdevice) {
+            if (n == (int)std::size(g_facvt)) logf("hook: a %zuth device factory vtable, not hooked", std::size(g_facvt) + 1);
+            else {
+                g_facvt[n].orig = (PFN_FactoryCreateDevice)vt[SLOT_FACTORY_CREATEDEVICE], g_facvt[n].vt = vt;  // before the slot
+                g_nfacvt.store(n + 1, std::memory_order_release);
+                DWORD old;
+                VirtualProtect(&vt[SLOT_FACTORY_CREATEDEVICE], sizeof(void*), PAGE_READWRITE, &old);
+                vt[SLOT_FACTORY_CREATEDEVICE] = (void*)hk_factory_createdevice;
+                VirtualProtect(&vt[SLOT_FACTORY_CREATEDEVICE], sizeof(void*), old, &old);
+                logf("hook: device factory vtable %p", (void*)vt);
+            }
+        }
+    }
+    f->Release();
+}
+static HRESULT STDMETHODCALLTYPE hk_createdevicefactory(ID3D12SDKConfiguration1* c, UINT sdk, LPCSTR path, REFIID riid, void** pp) {
+    HRESULT hr = o_createdevicefactory(c, sdk, path, riid, pp);
+    if (SUCCEEDED(hr) && pp) hook_factory((IUnknown*)*pp);
+    return hr;
+}
+extern "C" HRESULT WINAPI Proxy_D3D12GetInterface(REFCLSID clsid, REFIID riid, void** pp) {
+    if (!real_D3D12GetInterface) return E_NOINTERFACE;  // a runtime from before it
+    HRESULT hr = ((decltype(&D3D12GetInterface))real_D3D12GetInterface)(clsid, riid, pp);
+    if (FAILED(hr) || !pp || !*pp) return hr;
+    if (clsid == CLSID_D3D12DeviceFactory) hook_factory((IUnknown*)*pp);
+    ID3D12SDKConfiguration1* c;
+    if (clsid == CLSID_D3D12SDKConfiguration && SUCCEEDED(((IUnknown*)*pp)->QueryInterface(IID_PPV_ARGS(&c)))) {
+        pin_self();
+        {
+            std::lock_guard l(g_mx);
+            patch(*(void***)c, SLOT_CREATEDEVICEFACTORY, (void*)hk_createdevicefactory, o_createdevicefactory);
+        }
+        c->Release();
+    }
     return hr;
 }
 

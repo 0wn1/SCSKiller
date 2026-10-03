@@ -315,8 +315,9 @@ public interface IScsKiller
     IGpuVendorBackend Vendor { get; }
     Settings Settings { get; set; }
 
-    Task<IReadOnlyList<GameState>> ScanAsync(CancellationToken ct);     // cheap: reuses saved per-game results
-    Task<IReadOnlyList<GameState>> RescanAsync(CancellationToken ct);   // re-checks every game
+    // userRequested: the user's refresh, which also fetches the server's data whatever its age (ScsKiller.UserFetchEvery)
+    Task<IReadOnlyList<GameState>> ScanAsync(CancellationToken ct, bool userRequested = false);     // cheap: reuses saved per-game results
+    Task<IReadOnlyList<GameState>> RescanAsync(CancellationToken ct, bool userRequested = false);   // re-checks every game
     IReadOnlyList<GameState> Games { get; }
     event Action<GameState>? GameChanged;
 

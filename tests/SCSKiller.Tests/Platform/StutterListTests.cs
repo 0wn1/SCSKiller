@@ -87,7 +87,7 @@ public class StutterListTests : IDisposable
                      e => e.Remove("reason"), e => e.Remove("ids"), e => e["extra"] = 1, e => e["name"] = 5,
                  })
             Assert.Null(StutterList.TryParse(One(bad)));
-        foreach (var bad in new[] { "", "{}", "[]", "null", """{"games":[]}""", """{"games":null}""", "{\"games\":[", """{"games":[],"other":1}""" })
+        foreach (var bad in new[] { "", "{}", "[]", "null", """{"games":[]}""", """{"games":null}""", """{"games":[null]}""", "{\"games\":[", """{"games":[],"other":1}""" })
             Assert.Null(StutterList.TryParse(bad));
     }
 

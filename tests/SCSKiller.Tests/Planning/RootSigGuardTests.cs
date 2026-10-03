@@ -40,6 +40,36 @@ public class RootSigGuardTests(ITestOutputHelper output)
         }
     }
 
+    /// <summary>Learned root signatures (the rule doesn't rebuild the recording's): compute shaders A (t0 space 0) and B (t0
+    /// space 1) have the same counts and their own root signatures; C, unrecorded with A's bindings, gets the one that covers
+    /// it, A's, whichever was recorded last.</summary>
+    [Fact]
+    public void TheLearnedLookupTakesARootSignatureThatCovers()
+    {
+        ShaderInfo Cs(string name, int space) => Shader(name, Stage.Compute, []) with { ShaderModel = "cs_6_0", Counts = new(0, 1, 0, 0), Bindings = [new("srv", space, 0, 1)] };
+        var (a, b, c) = (Cs("lk-a", 0), Cs("lk-b", 1), Cs("lk-c", 0));
+        (string Sha, byte[] Blob) Rs(uint space) { var x = RootSig.Serialize(new RootSig.Desc(0, [[0, 0, 0, 1, 0, space, 0]]), []); return (PsoDb.Hex(System.Security.Cryptography.SHA1.HashData(x)), x); }
+        var (ra, rb) = (Rs(0), Rs(1));
+        var index = new ShaderIndex("synthetic", ["PCD3D_SM6"], new[] { a, b, c }.ToDictionary(s => s.Sha1), [new ShaderMap("m", "Game", "PCD3D_SM6", [a.Sha1, b.Sha1, c.Sha1])]);
+        foreach (var order in new[] { new[] { (a, ra), (b, rb) }, [(b, rb), (a, ra)] })
+        {
+            var dir = Ff7.TempDir("rs-learned");
+            var path = Path.Combine(dir, "recording.db");
+            using (var f = File.Create(path))
+                foreach (var (cs, rs) in order)
+                {
+                    PsoDb.WriteBlob(f, rs.Sha, rs.Blob);
+                    PsoDb.Write(f, 'C', PsoDb.Compute(rs.Sha, cs.Sha1));
+                }
+            var log = new List<string>();
+            var plan = new Planner().Build(Ff7.Game, Ue427, index, new Recording(path), Ff7.Nvidia, Path.Combine(dir, "plan"), new SyncLog(log.Add), CancellationToken.None);
+            Assert.Contains(log, l => l.Contains("learned lookup"));
+            var items = PlanFile.Read(plan.FilePath).Records.Where(r => r.Tag == 'P').Select(r => PsoDb.ParseItem(r.Payload)).ToList();
+            Assert.Equal(ra.Sha, Assert.Single(items, i => i.Stages.ContainsValue(c.Sha1)).Rs);
+            Assert.Equal(0, plan.Stats.Uncovered);
+        }
+    }
+
     /// <summary>DXBC links by register: a VS writing SV_RenderTargetArrayIndex in r0 and SV_POSITION in r1 can't feed a PS reading
     /// SV_Position from r0 (the runtime's linkage error; Hogwarts: 9 PSOs), so the pair isn't planned; the same pair in DXIL
     /// (linked by semantic) and a VS with SV_POSITION in r0 are.</summary>

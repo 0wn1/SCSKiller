@@ -11,7 +11,7 @@ EXPORTS
     D3D12CreateVersionedRootSignatureDeserializer = stub_D3D12CreateVersionedRootSignatureDeserializer @107
     D3D12DeviceRemovedExtendedData = stub_D3D12DeviceRemovedExtendedData @108
     D3D12EnableExperimentalFeatures = stub_D3D12EnableExperimentalFeatures @109
-    D3D12GetInterface = stub_D3D12GetInterface       @110
+    D3D12GetInterface = Proxy_D3D12GetInterface      @110
     D3D12PIXEventsReplaceBlock = stub_D3D12PIXEventsReplaceBlock @111
     D3D12PIXGetThreadInfo = stub_D3D12PIXGetThreadInfo @112
     D3D12PIXNotifyWakeFromFenceSignal = stub_D3D12PIXNotifyWakeFromFenceSignal @113

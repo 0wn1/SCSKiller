@@ -88,6 +88,9 @@ public sealed class Community
     readonly SemaphoreSlim manifestGate = new(1, 1);
     CommunityManifest? manifest;
     DateTimeOffset backoffUntil, packBackoffUntil;
+    volatile bool expired;
+    long manifestFailedAt;   // clock.GetTimestamp(): a clock change doesn't move the wait
+    TimeSpan manifestWait;
 
     /// <param name="dbToken">(fresh, ct): an access token that carries "db", else null (signed out, or not a supporter);
     /// fresh: a new one, after a 401 (<see cref="Account.GetDbTokenAsync"/>)</param>
@@ -103,8 +106,12 @@ public sealed class Community
     /// <summary>The last failure, in plain words; null after a success.</summary>
     public string? Problem { get; private set; }
 
+    /// <summary>The next <see cref="ManifestAsync"/> checks the server whatever the copy's age (a user's refresh).</summary>
+    public void Expire() => expired = true;
+
     /// <summary>The manifest: the local copy while it was checked less than <see cref="ManifestMaxAge"/> ago (its file's write
-    /// time), else brought up to date first (3 s per route). A failed check keeps the copy (null when there's none).</summary>
+    /// time) and not <see cref="Expire"/>d, else brought up to date first (3 s per route). A failed check keeps the copy (null when there's none);
+    /// after a 429 or 503 none is made until its Retry-After (1 h without one, a day at most), offline for 5 minutes.</summary>
     public async Task<CommunityManifest?> ManifestAsync(CancellationToken ct = default)
     {
         await manifestGate.WaitAsync(ct);
@@ -114,7 +121,9 @@ public sealed class Community
             if (manifest == null && File.Exists(file))
                 try { manifest = CommunityManifest.Parse(File.ReadAllBytes(file)); }
                 catch (InvalidDataException) { }   // damaged: fetched whole
-            if (manifest != null && clock.GetUtcNow() - File.GetLastWriteTimeUtc(file) < ManifestMaxAge) return manifest;
+            if (manifest != null && !expired && clock.GetUtcNow() - File.GetLastWriteTimeUtc(file) < ManifestMaxAge) return manifest;
+            if (clock.GetElapsedTime(manifestFailedAt) < manifestWait) return manifest;
+            expired = false;
             var have = manifest != null && File.Exists(file) ? File.ReadAllBytes(file) : null;
             try
             {
@@ -130,7 +139,11 @@ public sealed class Community
                     HttpStatusCode.OK => await r.Content.ReadAsByteArrayAsync(ct),   // the whole file: a first fetch or a compaction
                     _ => null,
                 };
-                if (next == null) Problem = Refused(r);
+                if (next == null)
+                {
+                    Problem = Refused(r);
+                    if (r.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.ServiceUnavailable) ManifestBackoff(RetryAt(r) - clock.GetUtcNow());
+                }
                 else
                 {
                     var parsed = CommunityManifest.Parse(next);   // before saving: a body this version can't read never replaces a good copy
@@ -139,11 +152,19 @@ public sealed class Community
                     (manifest, Problem) = (parsed, null);
                 }
             }
-            catch (Exception e) when (!ct.IsCancellationRequested) { Problem = Plain(e); }
+            catch (Exception e) when (!ct.IsCancellationRequested)
+            {
+                Problem = Plain(e);
+                if (e is HttpRequestException or OperationCanceledException) ManifestBackoff(TimeSpan.FromMinutes(5));   // offline: not at every scan
+            }
             return manifest;
         }
         finally { manifestGate.Release(); }
     }
+
+    // the edge's longest window is a day: a larger or negative value is not believed
+    void ManifestBackoff(TimeSpan wait) =>
+        (manifestFailedAt, manifestWait) = (clock.GetTimestamp(), wait < TimeSpan.Zero ? TimeSpan.Zero : wait > TimeSpan.FromDays(1) ? TimeSpan.FromDays(1) : wait);
 
     /// <summary>Downloads <paramref name="e"/> into <paramref name="gameDir"/>\community.db (+ community.json) when an access
     /// token with "db" is at hand. Null when not entitled, while backing off after a 429/503, or on any failure
@@ -165,7 +186,7 @@ public sealed class Community
                 if (!r.IsSuccessStatusCode)
                 {
                     if (r.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.ServiceUnavailable)   // quota; the fallback route's budget
-                        backoffUntil = clock.GetUtcNow() + (r.Headers.RetryAfter?.Delta ?? TimeSpan.FromHours(1));
+                        backoffUntil = RetryAt(r);
                     Problem = Refused(r);
                     return null;
                 }
@@ -212,7 +233,7 @@ public sealed class Community
             if (!r.IsSuccessStatusCode)
             {
                 if (r.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.ServiceUnavailable)
-                    packBackoffUntil = clock.GetUtcNow() + (r.Headers.RetryAfter?.Delta ?? TimeSpan.FromHours(1));
+                    packBackoffUntil = RetryAt(r);
                 Problem = Refused(r);
                 return null;
             }
@@ -304,6 +325,14 @@ public sealed class Community
             return buf.ToArray();
         }
     }
+
+    // Retry-After as seconds or as a date; an hour without one
+    DateTimeOffset RetryAt(HttpResponseMessage r) => r.Headers.RetryAfter switch
+    {
+        { Delta: { } d } => clock.GetUtcNow() + d,
+        { Date: { } at } => at,
+        _ => clock.GetUtcNow() + TimeSpan.FromHours(1),
+    };
 
     static string Refused(HttpResponseMessage r) => r.StatusCode switch
     {

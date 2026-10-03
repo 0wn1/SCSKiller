@@ -23,6 +23,8 @@ public class CommunityTests : IDisposable
     {
         public DateTimeOffset Now = new(2026, 9, 28, 12, 0, 0, TimeSpan.Zero);
         public override DateTimeOffset GetUtcNow() => Now;
+        public override long GetTimestamp() => Now.UtcTicks;   // the monotonic clock moves with Now
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
     }
 
     internal sealed class Fake(Func<HttpRequestMessage, HttpResponseMessage> answer) : HttpMessageHandler
@@ -163,6 +165,44 @@ public class CommunityTests : IDisposable
     }
 
     [Fact]
+    public async Task A_refused_or_failed_manifest_check_waits_before_the_next()
+    {
+        var answer = HttpStatusCode.TooManyRequests;
+        var fake = new Fake(r =>
+        {
+            if (answer == 0) throw new HttpRequestException(HttpRequestError.ConnectionError, "unreachable");
+            var a = Ours(answer, answer == HttpStatusCode.OK ? Manifest() : null);
+            if (answer == HttpStatusCode.TooManyRequests) a.Headers.RetryAfter = new(TimeSpan.FromMinutes(20));
+            if (answer == HttpStatusCode.ServiceUnavailable) a.Headers.RetryAfter = new(TimeSpan.FromDays(30));
+            return a;
+        });
+        var community = Make(fake);
+        int Checks() => fake.Log.Count(l => l.Contains("/v1/manifest/"));
+
+        Assert.Null(await community.ManifestAsync());
+        community.Expire();   // a user's refresh doesn't skip the wait either
+        Assert.Null(await community.ManifestAsync());
+        Assert.Equal(1, Checks());
+        _clock.Now += TimeSpan.FromMinutes(21);
+        answer = HttpStatusCode.ServiceUnavailable;
+        await community.ManifestAsync();
+        Assert.Equal(2, Checks());
+        _clock.Now += TimeSpan.FromHours(23);
+        await community.ManifestAsync();
+        Assert.Equal(2, Checks());   // 30 days asked: a day at most
+        _clock.Now += TimeSpan.FromHours(1);
+        answer = 0;
+        await community.ManifestAsync();
+        _clock.Now += TimeSpan.FromMinutes(4);
+        await community.ManifestAsync();
+        Assert.Equal(4, Checks());   // offline (each route once): 5 minutes
+        _clock.Now += TimeSpan.FromMinutes(1);
+        answer = HttpStatusCode.OK;
+        Assert.NotNull(await community.ManifestAsync());
+        Assert.Equal(5, Checks());
+    }
+
+    [Fact]
     public async Task Offline_or_down_keeps_the_copy_and_says_so_quietly()
     {
         var up = true;
@@ -182,6 +222,51 @@ public class CommunityTests : IDisposable
         Assert.Null(await community.DownloadAsync(entry, _dir));
         Assert.Null(await community.DownloadAsync(entry, _dir));   // offline: the next game doesn't wait for the timeouts again
         Assert.Equal(2, fake.Log.Count(l => l.Contains("/v1/o/")));   // each route once
+    }
+
+    [Fact]
+    public async Task A_refused_manifest_check_waits_for_its_retry_after_instead_of_asking_once_per_game()
+    {
+        var refuse = true;
+        var fake = new Fake(_ =>
+        {
+            if (!refuse) return Ours(HttpStatusCode.OK, Manifest(Alias("steam:480@1", Content)));
+            var r = Ours(HttpStatusCode.TooManyRequests);
+            r.Headers.RetryAfter = new(TimeSpan.FromMinutes(30));
+            return r;
+        });
+        var community = Make(fake);
+        for (var game = 0; game < 3; game++) Assert.Null(await community.ManifestAsync());
+        Assert.Single(fake.Log);
+        Assert.NotNull(community.Problem);
+
+        refuse = false;
+        _clock.Now += TimeSpan.FromMinutes(31);
+        Assert.NotNull(await community.ManifestAsync());
+        Assert.Equal(2, fake.Log.Count);
+
+        // Retry-After as a date
+        var dated = new Fake(_ =>
+        {
+            var r = Ours(HttpStatusCode.ServiceUnavailable);
+            r.Headers.RetryAfter = new(_clock.Now + TimeSpan.FromMinutes(10));
+            return r;
+        });
+        var other = new Community(Path.Combine(_dir, "dated"), (_, _) => Task.FromResult<string?>("t"), new RouteFailover(dated, [Com, Io], _clock), _clock);
+        await other.ManifestAsync();
+        _clock.Now += TimeSpan.FromMinutes(9);
+        await other.ManifestAsync();
+        Assert.Single(dated.Log);
+        _clock.Now += TimeSpan.FromMinutes(2);
+        await other.ManifestAsync();
+        Assert.Equal(2, dated.Log.Count);
+
+        // unreachable: each route once, then not again for a while
+        var down = new Fake(_ => throw new HttpRequestException(HttpRequestError.ConnectionError, "unreachable"));
+        var offline = new Community(Path.Combine(_dir, "other"), (_, _) => Task.FromResult<string?>("t"), new RouteFailover(down, [Com, Io], _clock), _clock);
+        for (var game = 0; game < 3; game++) Assert.Null(await offline.ManifestAsync());
+        Assert.Equal(2, down.Log.Count);
+        Assert.Contains("Can't reach", offline.Problem);
     }
 
     /// <summary>A body that sends nothing after the headers, until cancelled.</summary>
@@ -262,14 +347,14 @@ public class CommunityTests : IDisposable
         var entry = new CommunityEntry(Content, PsoDb.Hex(SHA256.HashData(obj)), obj.Length, 1, 2);
         var fake = new Fake(_ =>
         {
-            var r = new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new Dribble(obj, 8, TimeSpan.FromMilliseconds(100))) };
+            var r = new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new Dribble(obj, 12, TimeSpan.FromMilliseconds(250))) };
             r.Headers.Add("X-SCSK", "1");
             return r;
         });
         var community = new Community(_dir, (_, _) => Task.FromResult<string?>("t"), new RouteFailover(fake, [Com, Io], _clock), _clock)
-            { BodyIdle = TimeSpan.FromMilliseconds(400) };
+            { BodyIdle = TimeSpan.FromSeconds(2) };
         var took = System.Diagnostics.Stopwatch.StartNew();
-        Assert.NotNull(await community.DownloadAsync(entry, Path.Combine(_dir, "games", "steam_480")));   // 8 x 100 ms: twice the idle limit in all
+        Assert.NotNull(await community.DownloadAsync(entry, Path.Combine(_dir, "games", "steam_480")));   // 12 x 250 ms: 1.5 times the idle limit in all, each gap an eighth of it
         Assert.True(took.Elapsed > community.BodyIdle);
         Assert.Null(community.Problem);
     }

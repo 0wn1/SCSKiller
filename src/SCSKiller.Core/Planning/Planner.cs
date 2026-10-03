@@ -49,7 +49,7 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
     /// <summary>Bump when the plan for the same game and inputs changes (new pipeline kinds, root-signature rules, D3D11):
     /// the app then rebuilds plans (warmed games' when idle, ScsKiller.CheckPlans) and offers a re-warm only where the new
     /// plan has records the warm didn't replay.</summary>
-    public const int Version = 21;
+    public const int Version = 22;
 
     /// <summary>The vendor's D3D11 driver cache persists across processes, is keyed on the exe file name and caches per
     /// shader, whatever the state or the other stages (measured on NVIDIA, proxy/probe11.cpp): a staged warm
@@ -216,9 +216,11 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
         foreach (var r in keptItems) Write(gen, r.Tag, r.Payload);
         // a ray tracing collection per library ('Y'), its exports read from the library: an 'R' record the warm creates like a
         // recorded one; a library not in this install, or without a ray tracing entry point, is skipped. With rule payload 0 a
-        // ray generation library gets one per payload the other libraries have (RtCollections.Payloads)
+        // ray generation library gets one per payload the other libraries have (RtCollections.Payloads), the recorded ones'
+        // (no 'Y': their collections replay from the recording) included
         var own = rt.Select(y => y.Library).Distinct().Where(rtBytes.ContainsKey).ToDictionary(h => h, h => RtCollections.OwnPayload(rtBytes[h]));
-        var pipelinePayloads = rt.Where(y => y.Payload == 0).Select(y => own.GetValueOrDefault(y.Library)).Where(p => p > 0).Distinct().Order().ToList();
+        var pipelinePayloads = rt.Where(y => y.Payload == 0).Select(y => own.GetValueOrDefault(y.Library))
+            .Concat(main.Select(RtCollections.Read).OfType<RtCollections.Recorded>().Select(c => c.Payload)).Where(p => p > 0).Distinct().Order().ToList();
         foreach (var y in rt)
         {
             var n = 0;

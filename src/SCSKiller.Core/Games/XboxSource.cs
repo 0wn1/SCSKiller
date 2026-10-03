@@ -15,9 +15,9 @@ public sealed class XboxSource : IGameSource
     public IReadOnlyList<Game> Discover()
     {
         var games = new List<Game>();
-        foreach (var drive in "CDEFGH")
+        foreach (var drive in DriveInfo.GetDrives().Where(d => d.DriveType is DriveType.Fixed or DriveType.Removable))
         {
-            var root = $"{drive}:\\XboxGames";
+            var root = Path.Combine(drive.RootDirectory.FullName, "XboxGames");
             if (!Directory.Exists(root)) continue;
             foreach (var titleDir in Directory.EnumerateDirectories(root))
             {

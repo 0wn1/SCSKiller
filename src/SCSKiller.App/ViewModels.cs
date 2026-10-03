@@ -346,6 +346,10 @@ public sealed class LibraryVm : Bindable
     public bool NoMatch => Filtering && Games.Count > 0 && shown == 0;
     public string NoMatchText => $"No games match “{filter}”";
     public bool Scanning { get; private set; }
+    int refreshing;   // Rescan calls not finished: the scan, then a user refresh's server fetches
+    public bool Refreshing => refreshing > 0;
+    public string? RefreshNote { get; private set; }
+    public bool HasRefreshNote => RefreshNote != null;
     public string? Error { get; private set; }
     public bool HasError => Error != null;
 
@@ -398,15 +402,24 @@ public sealed class LibraryVm : Bindable
     public string ScanBusyNote => forced ? "Re-reading every game's engine and anti-cheat; the list updates when it's done."
         : "The list updates when it's done.";
 
-    public async void Rescan(bool force = true)
+    public async void Rescan(bool force = true, bool userRequested = false)
     {
-        Scanning = true; forced = force; Error = null; Refresh();   // the summary says "Looking for games…" while nothing is listed
-        var scan = force ? App.Core.RescanAsync(CancellationToken.None) : App.Core.ScanAsync(CancellationToken.None);
+        Scanning = true; refreshing++; forced = force; Error = RefreshNote = null; Refresh();   // the summary says "Looking for games…" while nothing is listed
+        var scan = force ? App.Core.RescanAsync(CancellationToken.None, userRequested) : App.Core.ScanAsync(CancellationToken.None, userRequested);
         if (await Task.WhenAny(scan, Task.Delay(300)) != scan) { slowScan = true; Changed(); }
         try { await scan; scanned = true; }
         catch (Exception e) { Error = "Scan failed: " + e.Message; }
         Scanning = slowScan = false;
         Refresh();
+        if (userRequested && Error == null && App.Core is ScsKiller k)
+            RefreshNote = await k.ServerRefresh switch
+            {
+                ScsKiller.ServerCheck.TooSoon => "Checked the server a few minutes ago.",
+                ScsKiller.ServerCheck.Unreachable => "Couldn't reach the SCSKiller server. The lists stay as they were.",
+                _ => null,
+            };
+        refreshing--;
+        Changed();
     }
 
     public void Refresh()

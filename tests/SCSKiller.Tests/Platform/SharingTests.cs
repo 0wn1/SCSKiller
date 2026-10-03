@@ -312,6 +312,41 @@ public class SharingTests : IDisposable
     }
 
     [Fact]
+    public async Task Sharing_turned_off_during_a_pass_sends_nothing_more()
+    {
+        Record(BigRecording(25_000));   // two uploads' worth
+        _upload = _ =>
+        {
+            _enabled = false;   // the user turns it off while the first upload is on its way
+            return null!;
+        };
+        var sharing = Make();
+        Assert.Null(await sharing.ShareAsync(GameDir, Content, Meta));
+        Assert.Single(Uploads);
+        Assert.Single(Sharing.Shared(GameDir)!.Sent!);   // the one sent is kept; the recording isn't stamped done
+
+        _enabled = true;
+        _upload = null;
+        Assert.NotNull(await sharing.ShareAsync(GameDir, Content, Meta));
+        Assert.Equal(2, Uploads.Count);   // the rest, once it is on again
+    }
+
+    [Fact]
+    public async Task Sharing_turned_off_before_the_retry_of_a_401_sends_it_no_more()
+    {
+        Record(LocalRecording());
+        _upload = _ =>
+        {
+            _enabled = false;
+            return Ours(HttpStatusCode.Unauthorized, """{"error":"invalid_token"}"""u8.ToArray());
+        };
+        Assert.Null(await Make().ShareAsync(GameDir, Content, Meta));
+        Assert.Single(Uploads);
+        Assert.Single(_sent, s => s.Line.Contains("/v1/devices"));   // no new device either
+        Assert.Null(Sharing.Shared(GameDir));
+    }
+
+    [Fact]
     public async Task Sharing_off_sends_nothing_and_registers_nothing()
     {
         _enabled = false;
@@ -368,5 +403,19 @@ public class SharingTests : IDisposable
         File.Delete(Path.Combine(_dir, "packs-shared.json"));
         Assert.Empty(await sharing.SharePacksAsync(packs, "nvidia", "1.4.0"));
         Assert.Equal(2, Uploads.Count);
+
+        // turned off while the first of two changed packs is on its way: not the second
+        var fsr2 = new MiddlewarePack("amd", "amd_fidelityfx_dx12.dll", new string('e', 40), 1000, gpu: "nvidia");
+        fsr2.Add(new PsoDb.Rec('C', PsoDb.Compute(PsoDb.Zero, Sha1(Shader))), "steam:480");
+        fsr2.Write(Path.Combine(packs, "amd", MiddlewarePack.FileName(fsr2.Header.Dll, fsr2.Header.ContentHash)));
+        File.Delete(Path.Combine(_dir, "packs-shared.json"));
+        _upload = _ =>
+        {
+            _enabled = false;
+            return null!;
+        };
+        _enabled = true;
+        await sharing.SharePacksAsync(packs, "nvidia", "1.4.0");
+        Assert.Equal(3, Uploads.Count);
     }
 }

@@ -99,7 +99,7 @@ public sealed class CarvedReader : IEngineReader
                 if (LanePlatform(Dxbc.WaveLanes(c)) is { } lanes) platformOf[sha] = lanes;
             }
             catch (Exception e) when (e is ArgumentException or IndexOutOfRangeException) { bad++; } // valid container, odd program: not usable
-        }, () => graphics >= MinGraphics);
+        }, () => graphics >= MinGraphics, ct);
 
         rootSigs.Apply(shaders);
 
@@ -201,7 +201,7 @@ public sealed class CarvedReader : IEngineReader
     /// 16+ containers. Detect stops once <paramref name="enough"/>. Unreadable files are skipped.
     /// ponytail: budget-bounded sampling of unnamed files (512 MB Detect, 4 GB Index); an engine that hides a small shader
     /// pack among many big unnamed files can be missed. Add a speed-hint glob for it if one ever is.</summary>
-    static long Walk(string dir, bool detect, Found found, Func<bool> enough)
+    static long Walk(string dir, bool detect, Found found, Func<bool> enough, CancellationToken ct = default)
     {
         var (named, other) = Files(dir);
         var buf = new byte[Block];
@@ -209,17 +209,17 @@ public sealed class CarvedReader : IEngineReader
         foreach (var f in named)
         {
             if (detect && (enough() || read >= DetectBudget)) return read;
-            read += Scan(f, buf, detect ? Windows(f.Length, NamedWindow) : [(0, f.Length)], (o, c) => found(f, o, c));
+            read += Scan(f, buf, detect ? Windows(f.Length, NamedWindow) : [(0, f.Length)], (o, c) => found(f, o, c), ct);
         }
         if (enough()) return read;
         foreach (var f in other)
         {
             if (read >= (detect ? DetectBudget : IndexSampleBudget) || detect && enough()) break;
             var w = Windows(f.Length, OtherWindow);
-            if (detect || w.Length == 1) { read += Scan(f, buf, w, (o, c) => found(f, o, c)); continue; }
+            if (detect || w.Length == 1) { read += Scan(f, buf, w, (o, c) => found(f, o, c), ct); continue; }
             var hits = 0;
-            read += Scan(f, buf, w, (_, _) => hits++);
-            if (hits >= 16) read += Scan(f, buf, [(0, f.Length)], (o, c) => found(f, o, c));
+            read += Scan(f, buf, w, (_, _) => hits++, ct);
+            if (hits >= 16) read += Scan(f, buf, [(0, f.Length)], (o, c) => found(f, o, c), ct);
         }
         return read;
     }
@@ -227,24 +227,25 @@ public sealed class CarvedReader : IEngineReader
     static (long Lo, long Hi)[] Windows(long len, long w) =>
         len <= 3 * w ? [(0, len)] : [(0, w), (len / 2 - w / 2, len / 2 + w / 2), (len - w, len)];
 
-    static long Scan(FileInfo f, byte[] buf, (long Lo, long Hi)[] windows, Hit hit)
+    static long Scan(FileInfo f, byte[] buf, (long Lo, long Hi)[] windows, Hit hit, CancellationToken ct)
     {
         try
         {
             using var h = File.OpenHandle(f.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, FileOptions.SequentialScan);
             var len = RandomAccess.GetLength(h);
-            return windows.Sum(w => Carve(h, len, w.Lo, Math.Min(w.Hi, len), buf, hit));
+            return windows.Sum(w => Carve(h, len, w.Lo, Math.Min(w.Hi, len), buf, hit, ct));
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return 0; }
     }
 
     /// <summary>Every valid container starting in [lo, hi) of the file (it may end past hi), in file order.</summary>
-    static long Carve(SafeFileHandle h, long len, long lo, long hi, byte[] buf, Hit hit)
+    static long Carve(SafeFileHandle h, long len, long lo, long hi, byte[] buf, Hit hit, CancellationToken ct)
     {
         long read = 0;
         Span<byte> head = stackalloc byte[32];
         for (var pos = lo; pos < hi;)
         {
+            ct.ThrowIfCancellationRequested();
             var n = RandomAccess.Read(h, buf.AsSpan(0, (int)Math.Min(buf.Length, hi - pos)), pos);
             if (n <= 0) break;
             read += n;

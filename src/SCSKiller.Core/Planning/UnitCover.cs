@@ -21,17 +21,20 @@ public sealed class UnitCover(ExactLayouts facts)
     public UnitPolicy Policy => Facts.Policy;
     public HashSet<Unit> Covered { get; } = [];
 
-    /// <summary>A cover that already has every unit the recording itself creates (the game's own PSOs replay as they are).</summary>
-    public static UnitCover Seeded(ExactLayouts facts)
+    /// <summary>A cover that already has every unit the recording itself creates (the game's own PSOs replay as they are).
+    /// <paramref name="replays"/>: whether a shader's bytes reach the warm; a PSO with one that doesn't is skipped there, so
+    /// its units stay uncovered.</summary>
+    public static UnitCover Seeded(ExactLayouts facts, Func<string, bool>? replays = null)
     {
         var c = new UnitCover(facts);
-        c.Covered.UnionWith(RecordedUnits(facts));
+        c.Covered.UnionWith(RecordedUnits(facts, replays));
         return c;
     }
 
-    /// <summary>Every unit of the recording's PSOs.</summary>
-    public static IEnumerable<Unit> RecordedUnits(ExactLayouts x) =>
-        x.Graphics.SelectMany(s => UnitsOf(x, s)).Concat(x.Compute.Select(c => new Unit(Stage.Compute, c.Stages[(int)Stage.Compute], x.RsKey(c.Rs))));
+    /// <summary>Every unit of the recording's PSOs (of those whose shaders all <paramref name="replays"/>).</summary>
+    public static IEnumerable<Unit> RecordedUnits(ExactLayouts x, Func<string, bool>? replays = null) =>
+        x.Graphics.Where(s => replays == null || s.Stages.Values.All(replays)).SelectMany(s => UnitsOf(x, s))
+            .Concat(x.Compute.Where(c => replays == null || c.Stages.Values.All(replays)).Select(c => new Unit(Stage.Compute, c.Stages[(int)Stage.Compute], x.RsKey(c.Rs))));
 
     /// <summary>The units a recorded graphics PSO compiles.</summary>
     public static IEnumerable<Unit> UnitsOf(ExactLayouts x, PsoState s)

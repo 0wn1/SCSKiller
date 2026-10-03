@@ -97,7 +97,7 @@ jobs:
         run: |
           $d = Join-Path $env:RUNNER_TEMP "nuget-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
-          [IO.File]::AppendAllText($env:GITHUB_ENV, "NUGET_PACKAGES=$d\packages`nNUGET_HTTP_CACHE_PATH=$d\http`n")   # UTF-8, no BOM
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "NUGET_PACKAGES=$d\packages\`nNUGET_HTTP_CACHE_PATH=$d\http`n")   # UTF-8, no BOM; the trailing \ because csproj paths append to $(NuGetPackageRoot)
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
         if: github.ref_type != 'tag'

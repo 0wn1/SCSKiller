@@ -11,18 +11,51 @@ namespace SCSKiller.Core.Vendors;
 /// driver can keep the Adrenalin number while its compiler (and so the cache) changes; the store/UMD version changes with
 /// every driver. Read from the registry only: the display adapter's class key (RadeonSoftwareVersion + DriverVersion), else
 /// HKLM\SOFTWARE\AMD\CN, else the release in ReleaseVersion ("26.10.41.01-260811a-..."); the DXGI user-mode driver version
-/// when the class key has no DriverVersion. Only compared for equality (staleness) and shown, never parsed.
+/// when the class key has no DriverVersion. Shown only, never parsed: staleness follows DXGI's (ScsKiller.DriverId).
 ///
 /// Cache size: the driver caps DxcCache at a fixed <see cref="AmdAppCache.DxcCacheCap"/>; Adrenalin, the registry and
 /// ADLX offer no size setting (only the shader cache mode and a reset).</summary>
-public sealed class AmdBackend : IGpuVendorBackend
+public sealed class AmdBackend : IGpuVendorBackend, IRefreshableGpu
 {
     const string DisplayClass = @"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
 
-    public AmdBackend(GpuInfo dxgi)
+    readonly Func<string, (string? Adrenalin, string? DriverStore)> _registry;
+    string? _umd, _read;   // DXGI's version and the version read at the last complete read
+    bool _hadAdrenalin, _hadStore;   // the registry values that read found
+    string? _adrenalin;              // the last release the registry gave
+
+    /// <summary>The form without the registry's store version: the release, if known, and DXGI's version.</summary>
+    public string FallbackVersion(string umd) => FormatVersion(_adrenalin, umd);
+
+    public AmdBackend(GpuInfo dxgi) : this(dxgi, DriverVersions) { }
+
+    internal AmdBackend(GpuInfo dxgi, Func<string, (string? Adrenalin, string? DriverStore)> registry)
     {
-        var (adrenalin, store) = DriverVersions(dxgi.Name);
-        Gpu = dxgi with { DriverVersion = FormatVersion(adrenalin, store ?? dxgi.DriverVersion) };
+        (_registry, Gpu) = (registry, dxgi);
+        Refresh(dxgi);
+    }
+
+    /// <summary>The version is read as at start (the registry's; DXGI's only without a store version there), never compared
+    /// with DXGI's, whose format can differ. False (read again at the next check) for a read that can't be trusted yet:
+    /// <list type="bullet">
+    /// <item>a registry value the last complete read found is missing (a read during an install): that read's version stays;</item>
+    /// <item>no registry value at all: DXGI's version, as at start, until the registry has one;</item>
+    /// <item>DXGI's version changed but the registry still gives the same version: it is behind an install.</item>
+    /// </list></summary>
+    public bool Refresh(GpuInfo adapter)
+    {
+        var (adrenalin, store) = _registry(adapter.Name);
+        _adrenalin = adrenalin ?? _adrenalin;
+        if (_read != null && ((_hadAdrenalin && adrenalin == null) || (_hadStore && store == null)))
+        {
+            Gpu = adapter with { DriverVersion = _read };
+            return false;
+        }
+        var version = FormatVersion(adrenalin, store ?? adapter.DriverVersion);
+        Gpu = adapter with { DriverVersion = version };
+        if ((adrenalin == null && store == null) || (_umd != null && adapter.DriverVersion != _umd && version == _read)) return false;
+        (_umd, _read, _hadAdrenalin, _hadStore) = (adapter.DriverVersion, version, adrenalin != null, store != null);
+        return true;
     }
 
     /// <summary>"26.8.1 (32.0.31041.1004)"; either part alone when the other is unknown.</summary>
@@ -36,7 +69,7 @@ public sealed class AmdBackend : IGpuVendorBackend
         };
 
     public GpuVendor Vendor => GpuVendor.Amd;
-    public GpuInfo Gpu { get; }
+    public GpuInfo Gpu { get; private set; }
     public VendorCaps Caps { get; } = new("amd-1", CacheKeyedByExeName: true, StateIndependentCache: false, CacheSizeConfigurable: false,
         PerStageCache: true, RtCacheGranularity: RtCacheGranularity.WholeObject);   // selftest dxr 3: only an exact repeat of the whole object hits
 

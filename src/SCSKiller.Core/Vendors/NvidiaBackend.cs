@@ -13,7 +13,7 @@ namespace SCSKiller.Core.Vendors;
 ///   setting absent from the base profile = driver default (the driver reports its default value: 0x4000 = 16 GB on 610.88)
 ///   N (1..0xFFFFFFFE) = N MiB;  0 = cache disabled;  0xFFFFFFFF = unlimited.
 /// Setting "default" deletes the override from the base profile. Saving needs admin.</summary>
-public sealed unsafe class NvidiaBackend : IGpuVendorBackend
+public sealed unsafe class NvidiaBackend : IGpuVendorBackend, IRefreshableGpu
 {
     public const string CacheSizeSettingName = "Shader disk cache maximum size";
     const uint KnownCacheSizeId = 0x00AC8497;
@@ -24,14 +24,48 @@ public sealed unsafe class NvidiaBackend : IGpuVendorBackend
     public NvidiaBackend(GpuInfo dxgi)
     {
         Check(((delegate* unmanaged<int>)Fn(0x0150E828))(), "NvAPI_Initialize");
+        var fromDxgi = FromUserModeVersion(dxgi.DriverVersion);
+        (Gpu, _confirmed) = (dxgi with { DriverVersion = fromDxgi ?? ReadDriverVersion() }, fromDxgi != null);
+    }
+
+    bool _confirmed;   // the version came from DXGI once: NvAPI's may be older
+
+    internal static string ReadDriverVersion()
+    {
         uint ver;
         byte* branch = stackalloc byte[64];
         Check(((delegate* unmanaged<uint*, byte*, int>)Fn(0x2926AAAD))(&ver, branch), "NvAPI_SYS_GetDriverAndBranchVersion");
-        Gpu = dxgi with { DriverVersion = $"{ver / 100}.{ver % 100:00}" };
+        return $"{ver / 100}.{ver % 100:00}";
     }
 
+    /// <summary>DXGI's version first: the process keeps the nvapi64.dll it loaded at start, which after a driver update may
+    /// fail or still answer the old version. Without one from DXGI (incomplete): the last DXGI one stays, NvAPI's only
+    /// when there never was one.</summary>
+    public bool Refresh(GpuInfo adapter)
+    {
+        if (FromUserModeVersion(adapter.DriverVersion) is { } dxgi)
+        {
+            (Gpu, _confirmed) = (adapter with { DriverVersion = dxgi }, true);
+            return true;
+        }
+        string? nv = null;
+        if (!_confirmed)
+            try { nv = ReadDriverVersion(); }
+            catch (InvalidOperationException) { }
+        Gpu = adapter with { DriverVersion = nv ?? Gpu.DriverVersion };
+        return false;
+    }
+
+    public string FallbackVersion(string umd) => FromUserModeVersion(umd) ?? umd;
+
+    /// <summary>NVIDIA's version in a DXGI user-mode driver version: its last five digits ("32.0.16.1714" = "617.14");
+    /// null when it isn't one.</summary>
+    public static string? FromUserModeVersion(string umd) =>
+        umd.Split('.') is [_, _, var a, var b] && int.TryParse(a, out var hi) && int.TryParse(b, out var lo) && lo < 10000
+        && $"{hi}{lo:0000}" is { Length: >= 5 } d ? $"{d[^5..^2]}.{d[^2..]}" : null;
+
     public GpuVendor Vendor => GpuVendor.Nvidia;
-    public GpuInfo Gpu { get; }
+    public GpuInfo Gpu { get; private set; }
     public VendorCaps Caps { get; } = new("nvidia-1", CacheKeyedByExeName: true, StateIndependentCache: true, CacheSizeConfigurable: true,
         PerStageCache: true,    // measured: a pipeline of stages cached in other pairings costs 0.40 ms, as an exact hit (gen/ab_perstage.py)
         RtCacheGranularity: RtCacheGranularity.Collection,   // selftest dxr: collections cached on their own; Jedi's recorded ones 42.7 -> 3.35 ms after synthesized ones
@@ -333,8 +367,12 @@ public sealed unsafe class NvidiaBackend : IGpuVendorBackend
             nint s, p;
             Check(((delegate* unmanaged<nint*, int>)Fn(0x0694D52E))(&s), "NvAPI_DRS_CreateSession");
             Session = s;
-            Check(((delegate* unmanaged<nint, int>)Fn(0x375DBD6B))(s), "NvAPI_DRS_LoadSettings");
-            Check(((delegate* unmanaged<nint, nint*, int>)Fn(0xDA8466A0))(s, &p), "NvAPI_DRS_GetBaseProfile");
+            try
+            {
+                Check(((delegate* unmanaged<nint, int>)Fn(0x375DBD6B))(s), "NvAPI_DRS_LoadSettings");
+                Check(((delegate* unmanaged<nint, nint*, int>)Fn(0xDA8466A0))(s, &p), "NvAPI_DRS_GetBaseProfile");
+            }
+            catch { Dispose(); throw; }   // the caller's using never gets the object
             Profile = p;
         }
         public void Dispose() => ((delegate* unmanaged<nint, int>)Fn(0xDAD9CFF8))(Session);   // NvAPI_DRS_DestroySession

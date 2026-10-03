@@ -10,7 +10,8 @@ namespace SCSKiller.Core.Planning;
 /// (tables, CBVs, static samplers, flags) by Star Wars Jedi: Survivor's (Respawn's 4.26 fork: 23626/23626 with its bindless
 /// tables, <see cref="BindlessTables"/>). The stock rules
 /// are read from Epic's source (D3D12RootSignature.cpp: FD3D12RootSignatureDesc; D3D12Util.cpp: InitShaderRegisterCounts and
-/// the bound-shader-state quantizer; D3D12RHI.h: MAX_*), for resource binding tier 3 (every NVIDIA GPU SCSKiller supports).</summary>
+/// the bound-shader-state quantizer; D3D12RHI.h: MAX_*), for resource binding tier 3 (every NVIDIA GPU SCSKiller supports).
+/// REDengine 3's are one per kind of pipeline (<see cref="BuildRed3"/>).</summary>
 public static unsafe class RootSig
 {
     /// <summary>One construction rule per range of engine versions (each rule holds until the next one's version). 4.20/4.21
@@ -28,12 +29,14 @@ public static unsafe class RootSig
         Ue51,   // 5.1-5.3: a stage's table only when it uses that resource type
         Ue54,   // 5.4: MAX_SAMPLERS 32, root constants
         Ue55,   // 5.5-5.7: vertex shaders get UAVs
+        Red3,   // REDengine 3 (The Witcher 3, DX12): three fixed root signatures, see BuildRed3
     }
 
-    /// <summary>The rule an Unreal game's engine version builds with; null = none known. A fork other than FF7's gets its base
+    /// <summary>The rule a game's engine (an Unreal version, REDengine 3) builds with; null = none known. A fork other than FF7's gets its base
     /// version's stock rule, which the fork may have changed (FF7's did).</summary>
     public static Rule? RuleFor(EngineInfo e)
     {
+        if (e.Family == RedEngine.RedEngineReader.Family) return Rule.Red3;
         if (e.Family != "Unreal" || !System.Version.TryParse(e.Version, out var v)) return null;
         if (e.Fork == "GAME_FinalFantasy7Rebirth" && e.Version == "4.26") return Rule.Ff7;
         return (v.Major, v.Minor) switch
@@ -53,13 +56,13 @@ public static unsafe class RootSig
 
     /// <summary>The engine's rule is confirmed by a real game (<see cref="ConfirmedEngines"/>, per version and fork). Another
     /// fork (e.g. Stellar Blade's) may add slots no shader shows, so it stays unconfirmed.</summary>
-    public static bool Verified(EngineInfo e) => RuleFor(e) != null && ConfirmedEngines.Current.Contains(e);
+    public static bool Verified(EngineInfo e) => RuleFor(e) is { } r && (r == Rule.Red3 || ConfirmedEngines.Current.Contains(e)); // one REDengine 3 build: its recording confirmed it
 
     /// <summary>UE's six static samplers (space 1000, s0-s5): point/bilinear/trilinear x wrap/clamp, 52 bytes each.</summary>
     public static readonly byte[] Ue426Samplers = UeSamplers(0, 1000);
 
     /// <summary>The static samplers a rule's root signatures carry (4.25: the same six at s1000-s1005 in space 0; before: none).</summary>
-    public static byte[] StaticSamplers(Rule r) => r switch { Rule.Ue420 or Rule.Ue421 or Rule.Ue422 => [], Rule.Ue425 => Ue425Samplers, _ => Ue426Samplers };
+    public static byte[] StaticSamplers(Rule r) => r switch { Rule.Ue420 or Rule.Ue421 or Rule.Ue422 or Rule.Red3 => [], Rule.Ue425 => Ue425Samplers, _ => Ue426Samplers };
 
     static readonly byte[] Ue425Samplers = UeSamplers(1000, 0);
 
@@ -92,7 +95,40 @@ public static unsafe class RootSig
     /// GRHISupportsMeshShadersTier0 on mesh-shader GPUs and so denies the mesh/amplification stages it doesn't use</param>
     /// <param name="maxSrvs">the game's MAX_SRVS when it isn't the rule's (<see cref="MaxSrvsFor"/>); 0 = the rule's</param>
     public static Desc Build(Rule r, IReadOnlyDictionary<Stage, ShaderInfo> stages, bool meshTier, uint maxSrvs = 0) =>
-        r == Rule.Ff7 ? BuildUe(stages) : BuildStock(r, stages, meshTier, maxSrvs);
+        r switch { Rule.Ff7 => BuildUe(stages), Rule.Red3 => BuildRed3(stages), _ => BuildStock(r, stages, meshTier, maxSrvs) };
+
+    /// <summary>The stage sets the recording confirmed <see cref="BuildRed3"/> on: VS, VS+PS, VS+HS+DS, VS+HS+DS+PS,
+    /// VS+GS+PS, VS+GS+HS+DS, CS.</summary>
+    public static bool Red3Validated(IEnumerable<Stage> stages) => Red3Sets.Contains(Mask(stages));
+
+    static int Mask(IEnumerable<Stage> stages) => stages.Aggregate(0, (m, s) => m | 1 << (int)s);
+
+    static readonly HashSet<int> Red3Sets = new[]
+    {
+        new[] { Stage.Vertex }, [Stage.Vertex, Stage.Pixel], [Stage.Vertex, Stage.Hull, Stage.Domain], [Stage.Vertex, Stage.Hull, Stage.Domain, Stage.Pixel],
+        [Stage.Vertex, Stage.Geometry, Stage.Pixel], [Stage.Vertex, Stage.Geometry, Stage.Hull, Stage.Domain], [Stage.Compute],
+    }.Select(Mask).ToHashSet();
+
+    /// <summary>REDengine 3's root signatures depend on the pipeline's stages only: compute; VS (+ PS); and with a GS, HS or DS
+    /// the same plus a CBV, SRV and two sampler tables for each of those three (and stream output allowed). All tables are
+    /// volatile, root CBVs static while set. The Witcher 3's recording: 586 of 586 PSOs of its own shaders (VS and VS+PS
+    /// 487, tessellation and GS 6, compute 93) use exactly these.</summary>
+    static Desc BuildRed3(IReadOnlyDictionary<Stage, ShaderInfo> stages)
+    {
+        if (!Red3Validated(stages.Keys)) throw new SerializeException($"no REDengine 3 root signature confirmed for {string.Join('+', stages.Keys)}");
+        if (stages.ContainsKey(Stage.Compute))
+            return new(0, [[2, 0, 0, 0, 2], [0, 0, 2, 15, 1, 0, 1], [0, 0, 0, 8, 0, 0, 1], [0, 0, 0, 11, 8, 0, 1], [0, 0, 0, 13, 19, 0, 1],
+                [0, 0, 0, 31, 32, 0, 1], [0, 0, 1, 16, 0, 0, 1], [0, 0, 3, 8, 0, 0, 0], [0, 0, 3, 8, 8, 0, 0]]);
+        var rows = new List<uint[]>();
+        foreach (var vis in new uint[] { 5, 1 }) for (var b = 0u; b < 5; b++) rows.Add([2, vis, b, 0, 2]);
+        rows.AddRange([[0, 5, 2, 11, 5, 0, 1], [0, 5, 0, 8, 0, 0, 1], [0, 5, 0, 11, 8, 0, 1], [0, 5, 0, 13, 19, 0, 1], [0, 5, 0, 31, 32, 0, 1],
+            [0, 5, 3, 8, 0, 0, 0], [0, 5, 3, 8, 8, 0, 0], [0, 1, 2, 11, 5, 0, 1], [0, 1, 0, 8, 0, 0, 1], [0, 1, 0, 56, 8, 0, 1],
+            [0, 1, 3, 8, 0, 0, 0], [0, 1, 3, 8, 8, 0, 0], [0, 0, 1, 4, 0, 0, 1]]);
+        if (!stages.Keys.Any(s => s is Stage.Geometry or Stage.Hull or Stage.Domain)) return new(0x1D, rows); // input layout; HS, DS, GS denied
+        foreach (var vis in new[] { Vis(Stage.Geometry), Vis(Stage.Hull), Vis(Stage.Domain) })
+            rows.AddRange([[0, vis, 2, 32, 0, 0, 1], [0, vis, 0, 64, 0, 0, 1], [0, vis, 3, 8, 0, 0, 0], [0, vis, 3, 8, 8, 0, 0]]);
+        return new(0x41, rows); // input layout, stream output
+    }
 
     static readonly Stage[] Ue4Stages = [Stage.Pixel, Stage.Vertex, Stage.Geometry, Stage.Hull, Stage.Domain];
     static readonly Stage[] Ue5Stages = [Stage.Pixel, Stage.Vertex, Stage.Geometry, Stage.Mesh, Stage.Amplification];

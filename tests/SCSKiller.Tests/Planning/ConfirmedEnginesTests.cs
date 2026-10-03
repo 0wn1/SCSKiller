@@ -78,7 +78,7 @@ public class ConfirmedEnginesTests : IDisposable
                      e => e["extra"] = 1,
                  })
             Assert.Null(ConfirmedEngines.TryParse(One(bad)));
-        foreach (var bad in new[] { "", "null", "[]", "{}", """{"engines":[]}""", """{"engines":null}""", "<html>",
+        foreach (var bad in new[] { "", "null", "[]", "{}", """{"engines":[]}""", """{"engines":null}""", """{"engines":[null]}""", "<html>",
                      One(_ => { })[..^1] + ""","extra":1}""", One(_ => { })[..^1] + ""","about":""}""" })
             Assert.Null(ConfirmedEngines.TryParse(bad));
         Assert.Null(ConfirmedEngines.TryParse(One(_ => { })[..^1] + new string(' ', ContentFile.MaxBytes) + "}"));   // valid JSON, over 64 KB

@@ -97,7 +97,7 @@ public sealed class Sharing
         var sent = new List<string>();
         var (uploadId, psos, fresh) = ((string?)null, 0, 0);
         var chunks = HashOnly.Chunks(records, ChunkRecords, ChunkRaw, out var tooLarge);
-        if (tooLarge > 0) Problem = $"{tooLarge} ray tracing records name more than an upload may carry ({HashOnly.MaxStateObjectRefs} references with what they build on): shared without them.";
+        if (tooLarge > 0) Problem = $"{tooLarge} ray tracing records are more than an upload may carry with what they build on ({ChunkRecords} records, {ChunkRaw >> 20} MB, {HashOnly.MaxStateObjectRefs} references): shared without them.";
         foreach (var chunk in chunks)
         {
             var id = Id(chunk, contentHash);   // the same records for another build are new there
@@ -273,10 +273,10 @@ public sealed class Sharing
         return $"{Convert.ToHexStringLower(h.GetHashAndReset())}|{contentHash}";
     }
 
-    /// <summary>POST /v1/upload with the upload device's token (registered first if there is none); null when no device could be had.</summary>
+    /// <summary>POST /v1/upload with the upload device's token (registered first if there is none); null when sharing is off or no device could be had.</summary>
     async Task<HttpResponseMessage?> PostAsync(byte[] body, UploadMeta meta, CancellationToken ct)
     {
-        if (await DeviceTokenAsync(ct) is not { } token) return null;
+        if (!enabled() || await DeviceTokenAsync(ct) is not { } token || !enabled()) return null;   // again: turned off while registering
         var request = new HttpRequestMessage(HttpMethod.Post, new Uri(routes.Primary, "v1/upload")) { Content = new ByteArrayContent(body) };
         request.Content.Headers.ContentType = new("application/octet-stream");
         request.Headers.Authorization = new("Bearer", token);

@@ -23,8 +23,8 @@ public sealed class EpicSource(string? manifestsDir = null) : IGameSource
                 var r = doc.RootElement;
                 string? S(string k) => r.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
                 if (r.TryGetProperty("bIsIncompleteInstall", out var inc) && inc.ValueKind == JsonValueKind.True) continue;
-                if (!string.IsNullOrEmpty(S("MainGameAppName"))) continue;   // add-on sharing the main game's install
                 if (S("AppName") is not { } app || S("InstallLocation") is not { } install) continue;
+                if (S("MainGameAppName") is { Length: > 0 } main && main != app) continue;   // add-on sharing the main game's install (Legendary names a base game's own)
                 if (GameFiles.FindExe(install, string.IsNullOrEmpty(S("LaunchExecutable")) ? null : S("LaunchExecutable")) is not { } exe) continue;
                 games.Add(new Game($"epic:{app}", S("DisplayName") ?? app, Store.Epic, install, exe, S("AppVersionString")));
             }

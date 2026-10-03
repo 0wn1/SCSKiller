@@ -59,7 +59,7 @@
                     <StackPanel Spacing="2">
                         <TextBlock Text="GPU" Style="{StaticResource Caption}" />
                         <TextBlock x:Name="GpuName" FontSize="13" FontWeight="SemiBold" TextWrapping="Wrap" />
-                        <TextBlock x:Name="GpuDriver" Style="{StaticResource Caption}" />
+                        <TextBlock x:Name="GpuDriver" Style="{StaticResource Caption}" TextWrapping="Wrap" />
                     </StackPanel>
                 </Border>
             </NavigationView.PaneFooter>

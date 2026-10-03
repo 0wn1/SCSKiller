@@ -1,3 +1,6 @@
+using System.Text.Json;
+using SCSKiller.Core.Carved;
+
 namespace SCSKiller.Core.Games;
 
 /// <summary>Install-folder heuristics shared by the game sources.</summary>
@@ -7,7 +10,8 @@ public static class GameFiles
     static readonly EnumerationOptions Flat = new() { IgnoreInaccessible = true };
 
     /// <summary>The process that creates the D3D12 device: the largest exe under a Binaries\Win64 folder (Unreal; not
-    /// Engine\Binaries, which only holds helpers like CrashReportClient), else <paramref name="launcherExe"/>, else the largest exe near the install root.</summary>
+    /// Engine\Binaries, which only holds helpers like CrashReportClient), else <paramref name="launcherExe"/>, else the largest
+    /// exe near the install root. A launcher among the last two is replaced by the game it starts (<see cref="LaunchedExe"/>).</summary>
     public static string? FindExe(string installDir, string? launcherExe = null)
     {
         if (!Directory.Exists(installDir)) return null;
@@ -21,22 +25,76 @@ public static class GameFiles
         if (launcherExe != null)
         {
             var p = Path.GetFullPath(Path.Combine(installDir, launcherExe));
-            if (File.Exists(p)) return p;
+            if (File.Exists(p)) return RedLauncherTarget(installDir, p) ?? p;
         }
         // ponytail: non-Unreal games get a guess; Steam's real launch target lives in the binary appinfo.vdf, parse it if this misfires
         var exes = Directory.EnumerateFiles(installDir, "*.exe", Deep)
-            .Where(f => !NotTheGame.Any(s => f.Contains(s, StringComparison.OrdinalIgnoreCase)))
+            .Where(f => !NotTheGame.Any(s => Path.GetRelativePath(installDir, f).Contains(s, StringComparison.OrdinalIgnoreCase)))
             .Select(f => new FileInfo(f))
             .ToList();
-        return (exes.FirstOrDefault(f => Directory.Exists(Path.ChangeExtension(f.FullName, null) + "_Data"))   // Unity: Game.exe + Game_Data
-                ?? exes.OrderBy(f => f.DirectoryName!.Length > installDir.TrimEnd('\\').Length ? 1 : 0)       // root folder first
-                    .ThenByDescending(f => f.Length).FirstOrDefault())?.FullName;
+        if (exes.FirstOrDefault(f => Directory.Exists(Path.ChangeExtension(f.FullName, null) + "_Data")) is { } unity) return unity.FullName;   // Unity: Game.exe + Game_Data
+        var guess = exes.OrderBy(f => f.DirectoryName!.Length > installDir.TrimEnd('\\').Length ? 1 : 0)   // root folder first
+            .ThenByDescending(f => f.Length).FirstOrDefault();
+        return guess == null ? null : LaunchedExe(installDir, guess, exes);
+    }
+
+    /// <summary>The game a launcher (<paramref name="guess"/>) starts: the target of CD PROJEKT RED's launcher-configuration.json
+    /// next to it, else, when the guess imports no graphics API, the one larger exe of <paramref name="exes"/> that does (no
+    /// binary read in an install with anti-cheat). Anything else (one unreadable, several, none) keeps the guess.</summary>
+    static string LaunchedExe(string installDir, FileInfo guess, IReadOnlyList<FileInfo> exes)
+    {
+        if (RedLauncherTarget(installDir, guess.FullName) is { } red) return red;
+        var larger = exes.Where(f => f.Length > guess.Length).ToList();
+        if (larger.Count == 0 || ImportsGraphics(guess.FullName) != false
+            || DetectAntiCheat(new Game("", "", Store.Other, installDir, guess.FullName)) != AntiCheat.None) return guess.FullName;
+        var imports = larger.Select(f => (f.FullName, Imports: ImportsGraphics(f.FullName))).ToList();
+        return imports.All(x => x.Imports != null) && imports.Where(x => x.Imports == true).ToList() is [var game] ? game.FullName : guess.FullName;
+    }
+
+    /// <summary>launcher-configuration.json's executables[]: the entry whose description is its "fallback", else the first;
+    /// null unless that exe exists inside the install.</summary>
+    static string? RedLauncherTarget(string installDir, string exe)
+    {
+        var config = Path.Combine(Path.GetDirectoryName(exe)!, "launcher-configuration.json");
+        if (!File.Exists(config)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(config));
+            var r = doc.RootElement;
+            if (r.ValueKind != JsonValueKind.Object || !r.TryGetProperty("executables", out var list) || list.ValueKind != JsonValueKind.Array) return null;
+            var fallback = r.TryGetProperty("fallback", out var f) && f.ValueKind == JsonValueKind.String ? f.GetString() : null;
+            var entries = list.EnumerateArray().Where(e => e.ValueKind == JsonValueKind.Object).ToList();
+            if (entries.Count == 0) return null;
+            var pick = entries.FirstOrDefault(e => e.TryGetProperty("description", out var d) && d.ValueKind == JsonValueKind.String && d.GetString() == fallback,
+                entries[0]);
+            if (!pick.TryGetProperty("executable", out var x) || x.ValueKind != JsonValueKind.Object) return null;
+            string? S(string k) => x.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+            if (S("fileName") is not { Length: > 0 } name) return null;
+            var target = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(config)!, S("directoryPath") ?? "", name));
+            var root = DirKey(installDir);
+            if (!target.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || !File.Exists(target)) return null;
+            // a junction or symlink below the install root leads out of it, as the anti-cheat scan takes it (the root itself may be one)
+            for (var p = target; p.Length > root.Length; p = Path.GetDirectoryName(p)!)
+                if ((p == target ? new FileInfo(p) : (FileSystemInfo)new DirectoryInfo(p)) is { LinkTarget: not null }) return null;
+            return target;
+        }
+        catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException or ArgumentException) { return null; }
+    }
+
+    // Streamline's interposer stands in for dxgi and d3d12 in games that ship it: witcher3.exe imports neither
+    static readonly string[] GraphicsDlls = ["d3d12.dll", "d3d11.dll", "dxgi.dll", "sl.interposer.dll"];
+
+    /// <summary>Null when the file isn't a readable PE.</summary>
+    static bool? ImportsGraphics(string exe)
+    {
+        try { return CarvedReader.PeImports(exe, out _).Any(d => GraphicsDlls.Contains(d, StringComparer.OrdinalIgnoreCase)); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or BadImageFormatException or InvalidOperationException) { return null; }
     }
 
     /// <summary>An install folder compared across sources: full path, no trailing separator (a drive root keeps its own).</summary>
     public static string DirKey(string dir) => dir.Length == 0 ? dir : Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir));
 
-    static readonly string[] NotTheGame = ["redist", "directx", "crash", "unins", "setup"];
+    static readonly string[] NotTheGame = ["redist", "directx", "crash", "unins", "setup", "vconsole"];   // vconsole2.exe: Source 2's developer console
 
     static bool IsEngineFolder(string installDir, string path) =>
         Path.GetRelativePath(installDir, path).StartsWith("Engine" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
@@ -57,7 +115,7 @@ public static class GameFiles
     /// read where it is, and one outside is another folder's; one on the way from the install root to the exe is Other. <paramref name="quick"/>: the install root's and the exe
     /// folder's own entries only, for a recheck right after a full one. Battle.net titles are marked conservatively:
     /// Blizzard's Warden is server-side, not a file the install carries. The only anti-cheat detector: engine readers and
-    /// middleware detection call it to skip their own work; the app's evaluation acts on its verdict.</summary>
+    /// middleware detection call it to skip their own work, exe discovery to read no other binary; the app's evaluation acts on its verdict.</summary>
     public static AntiCheat DetectAntiCheat(Game game, bool quick = false)
     {
         if (game.Id.StartsWith("battlenet:", StringComparison.Ordinal)) return AntiCheat.Other;

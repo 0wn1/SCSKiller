@@ -28,7 +28,8 @@ public partial class App : Application
     static readonly TimeSpan SessionEndWait = TimeSpan.FromSeconds(10);
 
     static Tray? tray;
-    static bool notifications, toldAboutTray, quitting;
+    static bool notifications, toldAboutTray, quitting, checkingDriver, checkAgain;
+    static string? toldDriver;   // the driver and games the last driver-update notification was about
     static Dictionary<string, string>? told;   // NewShaders' notified store
     static TaskCompletionSource? quitNow;   // set while quitting waits for the compile to finish: the tray's Quit again ends it
     static readonly CancellationTokenSource stopWatching = new();
@@ -56,6 +57,9 @@ public partial class App : Application
             real.Community = new Community(AppStore.DefaultDir, Account.GetDbTokenAsync);
             real.Sharing = new Sharing(AppStore.DefaultDir, () => real.Settings.ShareRecordings);   // anonymous: never the Patreon sign-in
             real.ContentRoutes = RouteFailover.Default;
+            // the entitlements first: the update check picks the channel they allow. Only the feed: a package download
+            // (the edge allows 3 full packages a day per device) waits for the 6 h check.
+            real.UserFetch = async () => { await Account.RefreshAsync(); await Updater.CheckAsync(download: false); };
             // not before the welcome, which says it is sent and where to turn it off
             real.ActiveCheck = new ActiveCheck(AppStore.DefaultDir, () => real.Settings is { ActiveCheck: true, WelcomeSeen: true }, real.Vendor.Vendor);
             // not in the unattended --driver-updated launch: nobody at the PC, no game folder is written
@@ -115,6 +119,7 @@ public partial class App : Application
                 lastSizes = DateTime.UtcNow;
                 Task.Run(Core.RefreshCacheSizes);
             };
+            if (Core is ScsKiller gpu) gpu.GpuChanged += () => Main.DispatcherQueue.TryEnqueue(OnGpuChanged);
             ApplyStartWithWindows();
             Updater.Start();
             if (Core is ScsKiller k && !driverUpdated)
@@ -145,15 +150,45 @@ public partial class App : Application
         }
 
         if (!args.Contains(WindowsStartup.TrayArg)) Main.Activate();
-        if (notifications && Core.ShouldNotifyStale()) AppNotificationManager.Default.Show(DriverToast(Core.DriverStaleGames()));
+        ShowDriverToast();
     }
 
-    static void NotifyDriverUpdate(bool exitIfNothing) =>
+    /// <summary>One scan at a time (UI thread): a request while one runs scans again after it, since only a scan started
+    /// after the request sees what it was about.</summary>
+    static void NotifyDriverUpdate(bool exitIfNothing)
+    {
+        if (checkingDriver) { checkAgain = true; return; }
+        checkingDriver = true;
         Core.ScanAsync(CancellationToken.None).ContinueWith(_ => Main.DispatcherQueue.TryEnqueue(() =>
         {
-            if (notifications && Core.ShouldNotifyStale()) AppNotificationManager.Default.Show(DriverToast(Core.DriverStaleGames()));
-            else if (exitIfNothing) _ = QuitAsync();
+            checkingDriver = false;
+            if (checkAgain)
+            {
+                checkAgain = false;
+                NotifyDriverUpdate(exitIfNothing);
+            }
+            else if (!ShowDriverToast() && exitIfNothing) _ = QuitAsync();
         }));
+    }
+
+    /// <summary>The driver-update notification, once per driver and set of stale games; false when there is nothing to notify.</summary>
+    static bool ShowDriverToast()
+    {
+        if (!notifications || !Core.ShouldNotifyStale()) return false;
+        var stale = Core.DriverStaleGames();
+        var about = $"{(Core as ScsKiller)?.DriverId}|{string.Join('|', stale.Select(g => g.Game.Id).Order())}";
+        if (about != toldDriver) AppNotificationManager.Default.Show(DriverToast(stale));
+        toldDriver = about;
+        return true;
+    }
+
+    /// <summary>A driver update found by a scan, a compile or the watcher's check: the scan that follows lists the games it
+    /// made stale.</summary>
+    static void OnGpuChanged()
+    {
+        Main.ShowGpu();
+        if (Core is ScsKiller { GpuRestartNote: null }) NotifyDriverUpdate(exitIfNothing: false);
+    }
 
     /// <summary>Another launch handed its activation to this instance (Program): the shortcut or the app again (show the
     /// window), the sign-in entry (already here), the driver-update task (check and notify), a toast.</summary>
@@ -349,7 +384,7 @@ public partial class App : Application
     {
         if (!notifications || !Core.Settings.NotifyNewShaders) return;
         told ??= store.LoadNotified();
-        var (due, notified) = NewShaders.Due(Core.Games, Core.Queue, told, Core.Vendor.Gpu.DriverVersion);
+        var (due, notified) = NewShaders.Due(Core.Games, Core.Queue, told, Core.DriverStaleGames().Select(s => s.Game.Id).ToHashSet());
         if (due.Count == 0 && notified.Count == told.Count) return;   // entries only drop without a notification
         store.SaveNotified(told = notified);   // before showing: never twice
         if (due.Count > 0) AppNotificationManager.Default.Show(NewShadersToast(due));

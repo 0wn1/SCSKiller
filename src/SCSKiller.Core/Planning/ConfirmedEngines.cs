@@ -25,7 +25,7 @@ public sealed class ConfirmedEngines
         ContentFile.Read<ListFile>(json) is { Engines.Length: >= 1 and <= MaxEngines } f && (f.About == null || ContentFile.Text(f.About, 1000))
         && f.Engines.All(Valid) ? new(f) : null;
 
-    static bool Valid(Entry e) =>
+    static bool Valid(Entry? e) => e is not null &&
         e.Version is { Length: >= 3 and <= 5 } v && v.Count(c => c == '.') == 1 && v.All(c => char.IsAsciiDigit(c) || c == '.') && char.IsAsciiDigit(v[0]) && char.IsAsciiDigit(v[^1])
         && (e.Fork == null || e.Fork is { Length: > 5 and <= 64 } && e.Fork.StartsWith("GAME_", StringComparison.Ordinal) && e.Fork.All(c => char.IsAsciiLetterOrDigit(c) || c == '_'))
         && ContentFile.Text(e.Game, 100) && ContentFile.Text(e.Evidence, 300);

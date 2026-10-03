@@ -152,6 +152,14 @@
       "reason": "Heavy shader compilation at startup and on level loads (Digital Foundry Direct)",
       "source": "https://youtu.be/19qyGXz5FUU?t=1843",
       "date": "2026-09-29"
+    },
+    {
+      "name": "SILENT HILL f",
+      "ids": ["steam:2947440"],
+      "severity": "moderate",
+      "reason": "Major PSO stutters during play; SCSKiller measured 92 shader stutters on a cold run and 0 after one compile",
+      "source": "https://www.dsogaming.com/pc-performance-analyses/silent-hill-f-benchmarks-pc-performance-analysis/",
+      "date": "2026-10-02"
     }
   ]
 }

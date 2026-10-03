@@ -39,10 +39,16 @@ public class AppTests : IDisposable
     public void Dispose() => Directory.Delete(_root, true);
 
     ScsKiller Killer(IEngineReader? reader = null, IPlanner? planner = null, IWarmer? warmer = null, string driver = "100.01", Game? game = null,
-        Game[]? games = null, IGpuVendorBackend? vendor = null) =>
-        new([new FakeSource(games ?? [game ?? _game])], vendor ?? new FakeVendor(Gpu with { DriverVersion = driver }), reader ?? new FakeReader(null),
+        Game[]? games = null, IGpuVendorBackend? vendor = null, IGameSource? source = null)
+    {
+        var v = vendor ?? new FakeVendor(Gpu with { DriverVersion = driver });
+        return new([source ?? new FakeSource(games ?? [game ?? _game])], v, reader ?? new FakeReader(null),
             planner ?? new FakePlanner(), warmer ?? new FakeWarmer(), Path.Combine(_root, "data"), _proxy)
-        { LocalAppData = _root, MyGames = Path.Combine(_root, "My Games"), ProgramData = Path.Combine(_root, "ProgramData") };   // never the real D3DSCache or Saved folders
+        {
+            LocalAppData = _root, MyGames = Path.Combine(_root, "My Games"), ProgramData = Path.Combine(_root, "ProgramData"),   // never the real D3DSCache or Saved folders
+            Adapters = () => [Listed(v.Gpu)],   // DXGI lists the vendor's adapter, its version as the user-mode one
+        };
+    }
 
     async Task<ScsKiller> Warmed(Game? game = null)
     {
@@ -454,6 +460,17 @@ public class AppTests : IDisposable
         k.ReconcileRecorders(_game.Id);
         Assert.Equal(mod, File.ReadAllBytes(dll));   // the mod is back
         Assert.False(File.Exists(Path.Combine(_exeDir, ScsKiller.ChainName)));
+    }
+
+    [Fact]
+    public async Task A_blob_record_too_short_for_its_hash_fails_only_the_import_not_the_scan()
+    {
+        var k = Killer(new FakeReader(Unreal));
+        k.ProcessNames = () => new HashSet<string>();
+        await k.ScanAsync(default);
+        File.WriteAllBytes(Path.Combine(_exeDir, "scskiller.db"), [(byte)'B', 1, 0, 0, 0, 0]);   // a framed 'B' of one byte
+        Assert.Contains(await k.ScanAsync(default), s => s.Game.Id == _game.Id);
+        Assert.True(File.Exists(Path.Combine(_exeDir, "scskiller.db")));   // left as it is
     }
 
     [Fact]
@@ -1496,7 +1513,7 @@ public class AppTests : IDisposable
     /// <summary>The proxy's frame times on WARP (`selftest frames`): each present of a swap chain made by the hooked DXGI factory
     /// is one frame, with an overlay that hooked Present / Present1 before the proxy did, a present nested in another, and a
     /// second overlay that hooked them after the proxy did before another swap chain of that vtable was made; a
-    /// DXGI_PRESENT_TEST isn't one. A create's csv row names its thread and whether that thread presents, and the launch
+    /// DXGI_PRESENT_TEST isn't one, nor a present that failed (DXGI_ERROR_WAS_STILL_DRAWING). A create's csv row names its thread and whether that thread presents, and the launch
     /// ends with #end. frames=0 in scskiller.ini: no frame log.</summary>
     [Fact]
     public void The_proxy_counts_each_present_once()
@@ -1517,7 +1534,7 @@ public class AppTests : IDisposable
             return o;
         }
         var on = Run("");
-        Assert.Contains("overlay 45", on);
+        Assert.Contains("overlay 48", on);
         Assert.Contains("late 2", on);
         Assert.Contains("frames 43", on);
         // tid,presents at the end of each create row: the presenting thread's PSO, then another thread's
@@ -1536,6 +1553,48 @@ public class AppTests : IDisposable
                     >= double.Parse(lines[session + 1].Split(',')[1], System.Globalization.CultureInfo.InvariantCulture));
         File.Delete(Path.Combine(dir, "scskiller_frames.bin"));
         Assert.Contains("frames -1", Run("frames=0\r\n"));
+    }
+
+    /// <summary>The proxy's frame file held open by another handle at first (`selftest framesheld`): the frames presented
+    /// meanwhile are lost, and the first one written after keeps its own time.</summary>
+    [Fact]
+    public void The_proxy_loses_frames_not_time_when_its_frame_file_is_held()
+    {
+        if (OwnWarmExe() is not { } warmExe) return;
+        var bin = Path.GetDirectoryName(warmExe)!;
+        var dir = Path.Combine(_root, "framesheld");
+        Directory.CreateDirectory(dir);
+        File.Copy(Path.Combine(bin, "selftest.exe"), Path.Combine(dir, "selftest.exe"));
+        File.Copy(Path.Combine(bin, "d3d12.dll"), Path.Combine(dir, "d3d12.dll"));
+        File.WriteAllText(Path.Combine(dir, "scskiller.ini"), "[scskiller]\r\nmode=record\r\n");
+        using var p = Process.Start(new ProcessStartInfo(Path.Combine(dir, "selftest.exe"), "framesheld") { RedirectStandardOutput = true })!;
+        var o = p.StandardOutput.ReadToEnd();
+        p.WaitForExit();
+        Assert.Equal(0, p.ExitCode);
+        var drift = long.Parse(o.Split("drift_us ")[1].Trim());
+        Assert.InRange(drift, -2000, 2000);
+    }
+
+    /// <summary>A device made through ID3D12DeviceFactory (`selftest factory`, the proxy's D3D12GetInterface on WARP), not
+    /// D3D12CreateDevice: its compute PSO is recorded, and the factory's hook keeps the proxy loaded from the start.</summary>
+    [Fact]
+    public void The_proxy_records_a_device_from_a_device_factory()
+    {
+        if (OwnWarmExe() is not { } warmExe) return;
+        var bin = Path.GetDirectoryName(warmExe)!;
+        var dir = Path.Combine(_root, "factory");
+        Directory.CreateDirectory(dir);
+        File.Copy(Path.Combine(bin, "selftest.exe"), Path.Combine(dir, "selftest.exe"));
+        File.Copy(Path.Combine(bin, "d3d12.dll"), Path.Combine(dir, "d3d12.dll"));
+        File.WriteAllText(Path.Combine(dir, "scskiller.ini"), "[scskiller]\r\nmode=record\r\nframes=0\r\n");
+        using var p = Process.Start(new ProcessStartInfo(Path.Combine(dir, "selftest.exe"), "factory") { RedirectStandardOutput = true })!;
+        var o = p.StandardOutput.ReadToEnd();
+        p.WaitForExit();
+        Assert.Equal(0, p.ExitCode);
+        if (o.Contains("no factory")) return;   // a runtime without independent devices
+        Assert.Contains("loaded 1", o);
+        Assert.Contains("created 0x00000000", o);
+        Assert.Single(PsoDb.Read(Path.Combine(dir, "scskiller.db")), r => r.Tag == 'C');
     }
 
     /// <summary>The proxy on WARP with frames=0 (`selftest unload`): once a device made through it hooked the runtime, a
@@ -2240,6 +2299,289 @@ public class AppTests : IDisposable
         running.Clear();
         k.ReconcileRecorders(g.Id);
         Assert.False(File.Exists(Dll(g)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]   // a copy of our proxy put next to the game by hand, not in the manifest: ours, never a mod to chain
+    public async Task A_recorder_installed_next_to_a_launcher_moves_next_to_the_game_it_starts(bool handCopy)
+    {
+        // The Witcher 3's layout: CD PROJEKT RED's launcher at the root, the game (with its own Agility SDK) in bin\x64_dx12
+        var install = Path.Combine(_root, "The Witcher 3");
+        var bin = Directory.CreateDirectory(Path.Combine(install, "bin", "x64_dx12", "D3D12_0")).Parent!.FullName;
+        var launcher = Path.Combine(install, "REDprelauncher.exe");
+        File.WriteAllBytes(launcher, DiscoveryAndVendorTests.Exe("Qt5Core.dll", 100));
+        File.WriteAllBytes(Path.Combine(bin, "witcher3.exe"), DiscoveryAndVendorTests.Exe("sl.interposer.dll", 5000));
+        File.WriteAllBytes(Path.Combine(bin, "D3D12_0", "D3D12Core.dll"), new byte[64]);
+        var was = new Game("steam:292030", "The Witcher 3", Store.Steam, install, launcher);
+        var before = RecordKiller([was]);
+        await before.ScanAsync(default);
+        before.InstallRecorder(was.Id);
+        Assert.True(ScsKiller.IsOurProxy(Path.Combine(install, "d3d12.dll")));
+        static PsoDb.Rec Pso(char c) => new('C', PsoDb.Compute(PsoDb.Zero, new string(c, 40)));
+        using (var f = File.Create(Path.Combine(install, "scskiller.db"))) PsoDb.Write(f, 'C', Pso('a').Payload);   // left by a launch, not imported
+        // the session the recorder there saw, moved by hand into the root: the game page shows it after the move too
+        const long at = 1_700_000_000_000;
+        File.WriteAllLines(Path.Combine(install, "scskiller_creates.csv"), [$"#session,{at},witcher3.exe", "#clock,10.0", "20.0,G,0,0,250.0", $"#end,{at + 60_000},60010.0"]);
+        File.WriteAllBytes(Path.Combine(install, FrameLog.FileName), FrameLogTests.Launch(at, 10_000, Enumerable.Range(1, 5000).Select(i => 10.0 + i * 10)));
+        File.WriteAllText(Path.Combine(install, "scskiller.log"), "the root's log");
+        if (handCopy)
+        {
+            File.Copy(_proxy, Path.Combine(bin, "d3d12.dll"));
+            File.WriteAllText(Path.Combine(bin, FrameLog.FileName), "an older launch's");   // replaced
+            File.SetLastWriteTimeUtc(Path.Combine(bin, FrameLog.FileName), DateTime.UtcNow.AddDays(-1));
+            File.WriteAllText(Path.Combine(bin, "scskiller.log"), "a later launch's");      // kept
+            File.SetLastWriteTimeUtc(Path.Combine(bin, "scskiller.log"), DateTime.UtcNow.AddDays(1));
+        }
+
+        File.WriteAllText(Path.Combine(install, "launcher-configuration.json"), DiscoveryAndVendorTests.RedConfig());
+        var game = was with { ExePath = Core.Games.GameFiles.FindExe(install)! };
+        Assert.Equal(Path.Combine(bin, "witcher3.exe"), game.ExePath);
+        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" };
+        var k = RecordKiller([game], running: () => running);
+        await k.ScanAsync(default);
+        k.ReconcileRecorders();
+        Assert.Equal("moves when the game exits", k.Games.Single().RecorderNote);
+        Assert.True(ScsKiller.IsOurProxy(Path.Combine(install, "d3d12.dll")));
+        Assert.Equal(launcher, k.Store.LoadGame(game.Id).RecorderExe);   // the uninstall hook still finds it
+
+        running.Clear();
+        k.ReconcileRecorders(game.Id);
+        Assert.Null(k.Games.Single().RecorderNote);
+        foreach (var f in new[] { "d3d12.dll", "scskiller.ini", "scskiller.db", "scskiller.keys", "scskiller_creates.csv", "scskiller.log", FrameLog.FileName })
+            Assert.False(File.Exists(Path.Combine(install, f)), f);
+        Assert.Equal(handCopy ? "a later launch's" : "the root's log", File.ReadAllText(Path.Combine(bin, "scskiller.log")));
+        var csv = Path.Combine(bin, "scskiller_creates.csv");
+        Assert.Equal(1, SessionLog.Read(csv, "witcher3.exe").Last!.Compiles);
+        Assert.Equal(4999, FrameLog.Read(Path.Combine(bin, FrameLog.FileName), csv, "witcher3.exe")!.Frames);
+        var s = k.Games.Single();
+        Assert.Equal((1L, 4999L), (s.LastSession!.Compiles, s.LastFrames!.Frames));
+        Assert.Equal(File.ReadAllBytes(_proxy), File.ReadAllBytes(Path.Combine(bin, "d3d12.dll")));
+        Assert.False(File.Exists(Path.Combine(bin, ScsKiller.ChainName)));
+        Assert.True(File.Exists(Path.Combine(bin, "scskiller.ini")));
+        var rec = k.Store.LoadGame(game.Id);
+        Assert.Null(rec.RecorderChained);
+        Assert.Equal((game.ExePath, install), (rec.RecorderExe, rec.RecorderInstallDir));
+        Assert.Equal(["d3d12.dll", "scskiller.ini"], rec.RecorderFiles.Keys.Order());
+        Assert.Contains(Pso('a').Key, PsoDb.Read(Path.Combine(k.Store.GameDir(game.Id), "recording.db")).Select(r => r.Key));
+        Assert.Contains($"recorder removed ({install})", RecordersLog());
+    }
+
+    static PsoDb.Rec Rec(char c) => new('C', PsoDb.Compute(PsoDb.Zero, new string(c, 40)));
+
+    /// <summary>The Witcher 3's layout with a recorder installed next to its launcher (chained to a mod there when
+    /// <paramref name="mod"/>), a recording not imported yet beside it, then the launcher configuration that names the game.</summary>
+    async Task<(string Install, string Bin, Game Was, Game Game)> RecorderNextToALauncher(byte[]? mod = null)
+    {
+        var install = Path.Combine(_root, "The Witcher 3");
+        var bin = Directory.CreateDirectory(Path.Combine(install, "bin", "x64_dx12")).FullName;
+        File.WriteAllBytes(Path.Combine(install, "REDprelauncher.exe"), DiscoveryAndVendorTests.Exe("Qt5Core.dll", 100));
+        File.WriteAllBytes(Path.Combine(bin, "witcher3.exe"), DiscoveryAndVendorTests.Exe("sl.interposer.dll", 5000));
+        var was = new Game("steam:292030", "The Witcher 3", Store.Steam, install, Path.Combine(install, "REDprelauncher.exe"));
+        if (mod != null) File.WriteAllBytes(Path.Combine(install, "d3d12.dll"), mod);
+        var before = RecordKiller([was]);
+        await before.ScanAsync(default);
+        if (mod != null) before.SetRecordAlongsideMod(was.Id, true);
+        before.InstallRecorder(was.Id);
+        using (var f = File.Create(Path.Combine(install, "scskiller.db"))) PsoDb.Write(f, 'C', Rec('a').Payload);
+        File.WriteAllText(Path.Combine(install, "launcher-configuration.json"), DiscoveryAndVendorTests.RedConfig());
+        return (install, bin, was, was with { ExePath = Core.Games.GameFiles.FindExe(install)! });
+    }
+
+    [Fact]
+    public async Task Anti_cheat_found_once_the_exe_moved_takes_the_recorder_out_where_the_record_says_it_is()
+    {
+        var mod = Planning.MiddlewarePackTests.Pe("d3d12.dll", Guid.NewGuid().ToByteArray());
+        var (install, bin, _, game) = await RecorderNextToALauncher(mod);
+        Assert.True(File.Exists(Path.Combine(install, ScsKiller.ChainName)));
+        Directory.CreateDirectory(Path.Combine(install, "EasyAntiCheat"));
+
+        var k = RecordKiller([game]);
+        await k.ScanAsync(default);   // the verdict lands before any reconcile
+        Assert.Equal(AntiCheat.EasyAntiCheat, k.Games.Single().AntiCheat);
+        Assert.Equal(mod, File.ReadAllBytes(Path.Combine(install, "d3d12.dll")));
+        Assert.False(File.Exists(Path.Combine(install, ScsKiller.ChainName)));
+        Assert.False(File.Exists(Path.Combine(install, "scskiller.ini")));
+        Assert.False(File.Exists(Path.Combine(bin, "d3d12.dll")));
+        var rec = k.Store.LoadGame(game.Id);
+        Assert.Equal((null, null, 0), (rec.RecorderExe, rec.RecorderChained, rec.RecorderFiles.Count));
+    }
+
+    [Fact]
+    public async Task A_move_whose_import_fails_keeps_the_old_folder_until_it_is_imported()
+    {
+        var (install, bin, was, game) = await RecorderNextToALauncher();
+        var k = RecordKiller([game]);
+        await k.ScanAsync(default);
+        using (new FileStream(Path.Combine(install, "scskiller.db"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            k.ReconcileRecorders();
+        Assert.StartsWith("couldn't move", k.Games.Single().RecorderNote);
+        Assert.Equal(was.ExePath, k.Store.LoadGame(game.Id).RecorderMoveFrom);
+        Assert.False(File.Exists(Path.Combine(bin, "d3d12.dll")));
+
+        k.ReconcileRecorders();
+        Assert.Null(k.Games.Single().RecorderNote);
+        Assert.False(File.Exists(Path.Combine(install, "scskiller.db")));
+        Assert.Contains(Rec('a').Key, PsoDb.Read(Path.Combine(k.Store.GameDir(game.Id), "recording.db")).Select(r => r.Key));
+        Assert.True(ScsKiller.IsOurProxy(Path.Combine(bin, "d3d12.dll")));
+        Assert.Null(k.Store.LoadGame(game.Id).RecorderMoveFrom);
+    }
+
+    [Fact]
+    public async Task A_move_waiting_for_the_recording_lock_sees_the_game_start_from_the_new_folder()
+    {
+        var (install, bin, was, game) = await RecorderNextToALauncher();
+        IReadOnlySet<string> running = new HashSet<string>();
+        var k = RecordKiller([game], running: () => running);
+        await k.ScanAsync(default);
+        Task move;
+        using (Recordings.Lock(Path.Combine(k.Store.GameDir(game.Id), "recording.db")))
+        {
+            move = Task.Run(() => k.ReconcileRecorders());
+            Assert.True(SpinWait.SpinUntil(() => !File.Exists(Path.Combine(install, "d3d12.dll")), TimeSpan.FromSeconds(10)));   // the proxy went, the import waits
+            running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" };
+        }
+        await move.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal("moves when the game exits", k.Games.Single().RecorderNote);
+        Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);   // neither emptied nor deleted while it runs
+        Assert.False(File.Exists(Path.Combine(bin, "d3d12.dll")));
+        Assert.Equal((was.ExePath, game.ExePath), (k.Store.LoadGame(game.Id).RecorderMoveFrom, k.Store.LoadGame(game.Id).RecorderMoveTo));
+        ScsKiller.RemoveAllRecorders(k.Store, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" });   // the uninstall hook: it runs from the new folder
+        Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);
+
+        running = new HashSet<string>();
+        k.ReconcileRecorders();
+        Assert.False(File.Exists(Path.Combine(install, "scskiller.db")));
+        Assert.True(ScsKiller.IsOurProxy(Path.Combine(bin, "d3d12.dll")));
+        Assert.Equal((null, null), (k.Store.LoadGame(game.Id).RecorderMoveFrom, k.Store.LoadGame(game.Id).RecorderMoveTo));
+    }
+
+    [Fact]
+    public async Task A_move_put_off_because_the_game_runs_is_guarded_by_the_uninstall_hook()
+    {
+        var (install, bin, was, game) = await RecorderNextToALauncher();
+        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" };
+        var k = RecordKiller([game], running: () => running);
+        await k.ScanAsync(default);
+        k.ReconcileRecorders();
+        Assert.Equal("moves when the game exits", k.Games.Single().RecorderNote);
+        Assert.Equal((was.ExePath, game.ExePath), (k.Store.LoadGame(game.Id).RecorderMoveFrom, k.Store.LoadGame(game.Id).RecorderMoveTo));
+
+        ScsKiller.RemoveAllRecorders(k.Store, running);
+        foreach (var f in new[] { "d3d12.dll", "scskiller.ini", "scskiller.db" }) Assert.True(File.Exists(Path.Combine(install, f)), f);
+        Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);
+        Assert.False(File.Exists(Path.Combine(bin, "d3d12.dll")));
+    }
+
+    [Fact]
+    public async Task Anti_cheat_found_while_the_moved_game_runs_leaves_the_uninstall_hook_nothing_to_touch()
+    {
+        var (install, bin, was, game) = await RecorderNextToALauncher();
+        Directory.CreateDirectory(Path.Combine(install, "EasyAntiCheat"));
+        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" };
+        var k = RecordKiller([game], running: () => running);
+        await k.ScanAsync(default);   // the removal waits for the game
+        Assert.True(k.Store.LoadGame(game.Id).RecorderRollback);
+        void Untouched()
+        {
+            ScsKiller.RemoveAllRecorders(k.Store, running);
+            foreach (var f in new[] { "d3d12.dll", "scskiller.ini", "scskiller.db" }) Assert.True(File.Exists(Path.Combine(install, f)), f);
+            Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);
+        }
+        Untouched();   // before any reconcile: the install's tree has witcher3.exe
+
+        k.ReconcileRecorders();
+        Assert.Equal((was.ExePath, game.ExePath), (k.Store.LoadGame(game.Id).RecorderMoveFrom, k.Store.LoadGame(game.Id).RecorderMoveTo));
+        Untouched();
+        var rec = k.Store.LoadGame(game.Id);
+        (rec.RecorderMoveFrom, rec.RecorderMoveTo) = (null, null);   // whatever the move record says
+        k.Store.SaveGame(game.Id, rec);
+        Untouched();
+        Assert.False(File.Exists(Path.Combine(bin, "d3d12.dll")));
+    }
+
+    [Fact]
+    public async Task The_uninstall_hook_asks_what_runs_again_before_each_folder_s_writes()
+    {
+        var (install, _, _, game) = await RecorderNextToALauncher();   // recorded by the launcher, the game nested below
+        var dll = Path.Combine(install, "d3d12.dll");
+        // the game starts once the hook took the proxy out, before it deletes the data files
+        ScsKiller.RemoveAllRecorders(RecordKiller([game]).Store,
+            () => File.Exists(dll) ? new HashSet<string>() : new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" }, null);
+        Assert.False(File.Exists(dll));
+        Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);
+        Assert.Contains("the game started: the recorder's data files left", RecordersLog());
+    }
+
+    [Fact]
+    public void An_install_tree_read_past_the_deadline_counts_as_running()
+    {
+        Directory.CreateDirectory(Path.Combine(_game.InstallDir, "a", "b"));
+        Assert.Contains("Fake-Win64-Shipping", ScsKiller.InstallExeNames(_game.InstallDir, () => false)!);
+        Assert.Null(ScsKiller.InstallExeNames(_game.InstallDir, () => true));
+    }
+
+    [Fact]
+    public async Task Anti_cheat_found_after_the_exe_moved_with_the_game_stopped_still_imports_and_cleans_the_old_folder()
+    {
+        var (install, bin, was, game) = await RecorderNextToALauncher();
+        File.WriteAllText(Path.Combine(install, "scskiller_creates.csv"), "#session,1,witcher3.exe");
+        Directory.CreateDirectory(Path.Combine(install, "EasyAntiCheat"));
+        var k = RecordKiller([game]);
+        await k.ScanAsync(default);   // taken out right away
+        var rec = k.Store.LoadGame(game.Id);
+        Assert.False(File.Exists(Path.Combine(install, "d3d12.dll")));
+        Assert.Equal((null, was.ExePath, install), (rec.RecorderExe, rec.RecorderMoveFrom, rec.RecorderInstallDir));
+
+        k.ReconcileRecorders();
+        foreach (var f in new[] { "scskiller.db", "scskiller.ini", "scskiller_creates.csv" }) Assert.False(File.Exists(Path.Combine(install, f)), f);
+        Assert.Contains(Rec('a').Key, PsoDb.Read(Path.Combine(k.Store.GameDir(game.Id), "recording.db")).Select(r => r.Key));
+        Assert.Empty(Directory.GetFiles(bin).Where(f => Path.GetFileName(f).StartsWith("scskiller", StringComparison.OrdinalIgnoreCase) || f.EndsWith("d3d12.dll")));
+        Assert.Null(k.Store.LoadGame(game.Id).RecorderMoveFrom);
+    }
+
+    [Fact]
+    public async Task A_move_waiting_for_the_record_s_lock_sees_the_game_start()
+    {
+        var (install, bin, _, game) = await RecorderNextToALauncher();
+        IReadOnlySet<string> running = new HashSet<string>();
+        var k = RecordKiller([game], running: () => running);
+        await k.ScanAsync(default);
+        Task move;
+        using (new FileStream(Path.Combine(k.Store.GameDir(game.Id), "state.json.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+        {
+            move = Task.Run(() => k.ReconcileRecorders());
+            Thread.Sleep(500);   // waiting to save the move's record
+            running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "witcher3" };
+        }
+        await move.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal("moves when the game exits", k.Games.Single().RecorderNote);
+        Assert.True(ScsKiller.IsOurProxy(Path.Combine(install, "d3d12.dll")));
+        Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);
+        Assert.False(File.Exists(Path.Combine(bin, "d3d12.dll")));
+    }
+
+    [Fact]
+    public async Task A_move_whose_recording_can_t_take_the_import_keeps_the_old_folder_until_it_can()
+    {
+        var (install, bin, was, game) = await RecorderNextToALauncher();
+        var k = RecordKiller([game]);
+        await k.ScanAsync(default);
+        var store = Path.Combine(k.Store.GameDir(game.Id), "recording.db");
+        PsoDb.WriteCompact(store, [Rec('b')]);
+        File.WriteAllBytes(store, File.ReadAllBytes(store)[..^5]);   // truncated, its header kept
+        k.ReconcileRecorders();
+        Assert.Equal($"couldn't move: the recording in {install} couldn't be imported", k.Games.Single().RecorderNote);
+        Assert.Equal(was.ExePath, k.Store.LoadGame(game.Id).RecorderMoveFrom);
+        Assert.True(new FileInfo(Path.Combine(install, "scskiller.db")).Length > 0);
+        Assert.False(File.Exists(Path.Combine(bin, "d3d12.dll")));
+
+        File.Delete(store);   // repaired
+        k.ReconcileRecorders();
+        Assert.Null(k.Games.Single().RecorderNote);
+        Assert.Null(k.Store.LoadGame(game.Id).RecorderMoveFrom);
+        Assert.Contains(Rec('a').Key, PsoDb.Read(store).Select(r => r.Key));
+        Assert.True(ScsKiller.IsOurProxy(Path.Combine(bin, "d3d12.dll")));
     }
 
     [Fact]
@@ -3278,7 +3620,7 @@ public class AppTests : IDisposable
     // The bump is simulated by marking the record's plan and warm as built by the version before.
     async Task<(ScsKiller K, FakeWarmer Warmer, List<PsoDb.Rec> Records)> WarmedWithPlan()
     {
-        List<PsoDb.Rec> records = [new('B', [9]), new('P', [1]), new('P', [2]), new('C', [3])];
+        List<PsoDb.Rec> records = [new('B', [.. new byte[20], 9]), new('P', [1]), new('P', [2]), new('C', [3])];
         var warmer = new FakeWarmer();
         var k = Killer(new FakeReader(Unreal), new FakePlanner(records: records), warmer);
         k.IdleTime = () => TimeSpan.FromHours(1);   // plan checks are "when idle" items
@@ -3301,6 +3643,29 @@ public class AppTests : IDisposable
         (rec.PlanVersion, rec.WarmedPlanVersion) = (Planner.Version - 1, Planner.Version - 1);
         if (!fingerprint) (rec.PlanItems, rec.WarmedPlanItems) = (null, null);   // a record from before the fingerprint
         k.Store.SaveGame(_game.Id, rec);
+    }
+
+    /// <summary>A shipped pipeline cache added by a patch, or an inline shader's new bytes, change no ContentHash (the
+    /// community database's key) but do change the index's maps: the next compile plans again.</summary>
+    [Fact]
+    public async Task A_change_in_the_indexs_maps_alone_rebuilds_the_plan()
+    {
+        List<ShaderMap> maps = [new("m1", "lib", "PCD3D_SM6", [$"{1:x40}", $"{2:x40}"])];
+        var k = Killer(new FakeReader(Unreal, maps: maps), new FakePlanner(), new FakeWarmer());
+        await k.ScanAsync(default);
+        await Compile(k);
+        var built = k.Store.LoadGame(_game.Id).PlanBuiltAt;
+        Assert.NotNull(built);
+        await Compile(k);
+        Assert.Equal(built, k.Store.LoadGame(_game.Id).PlanBuiltAt);   // the same index: the plan is reused
+
+        maps.Add(new("Shipped:1", "PipelineCache", "PCD3D_SM6", [$"{1:x40}", $"{2:x40}"], IsPipeline: true));
+        await Compile(k);
+        var rebuilt = k.Store.LoadGame(_game.Id).PlanBuiltAt;
+        Assert.True(rebuilt > built);
+        maps[0] = maps[0] with { Shaders = [$"{1:x40}", $"{3:x40}"] };
+        await Compile(k);
+        Assert.True(k.Store.LoadGame(_game.Id).PlanBuiltAt > rebuilt);
     }
 
     [Fact]
@@ -3335,7 +3700,7 @@ public class AppTests : IDisposable
     public async Task A_newer_planner_with_new_pipelines_is_stale_with_their_count()
     {
         var (k, warmer, records) = await WarmedWithPlan();
-        records.AddRange([new('P', [4]), new('Y', [5]), new('B', [6])]);   // a root signature alone compiles nothing
+        records.AddRange([new('P', [4]), new('Y', [5]), new('B', [.. new byte[20], 6])]);   // a root signature alone compiles nothing
         OlderPlanner(k);
         k.CheckPlans = true;
         await k.ScanAsync(default);
@@ -3416,6 +3781,257 @@ public class AppTests : IDisposable
         await after.ScanAsync(default);
         Assert.Contains("100.01 -> 101.00", Assert.Single(after.DriverStaleGames()).StatusReason);
         Assert.True(after.ShouldNotifyStale());
+    }
+
+    static DxgiAdapter Listed(GpuInfo gpu, uint device = 0x10) => new(gpu, device, 0x20);
+
+    [Fact]
+    public async Task A_driver_updated_while_the_app_runs_makes_its_games_stale_at_the_next_scan()
+    {
+        var k = Killer(new FakeReader(Unreal));
+        var adapter = Gpu;
+        k.Adapters = () => [Listed(adapter)];
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);
+        var changed = 0;
+        k.GpuChanged += () => changed++;
+        await k.ScanAsync(default);
+        Assert.Equal(0, changed);
+        Assert.Empty(k.DriverStaleGames());
+
+        adapter = Gpu with { DriverVersion = "101.00", AdapterLuid = 2 };   // the same process, the same backend object
+        await k.ScanAsync(default);
+        Assert.Equal(1, changed);
+        Assert.Equal(adapter, k.Vendor.Gpu);   // the warmer reads the new LUID from it
+        var stale = Assert.Single(k.DriverStaleGames());
+        Assert.Equal(GameStatus.Stale, stale.Status);
+        Assert.Equal("driver changed: 100.01 -> 101.00", stale.StatusReason);
+        Assert.True(k.ShouldNotifyStale());
+        Assert.False(k.RedetectGpu());
+    }
+
+    [Fact]
+    public async Task A_warm_records_the_driver_it_started_on_when_the_driver_changes_during_it()
+    {
+        var adapter = Gpu;
+        ScsKiller k = null!;
+        var warmer = new FakeWarmer(() => { adapter = Gpu with { DriverVersion = "101.00" }; k.RedetectGpu(); return null; });
+        k = Killer(new FakeReader(Unreal), warmer: warmer);
+        k.Adapters = () => [Listed(adapter)];
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("101.00", k.Vendor.Gpu.DriverVersion);
+        Assert.Equal("100.01", k.Store.LoadGame(_game.Id).WarmedDriverVersion);
+        await k.ScanAsync(default);
+        Assert.Equal("driver changed: 100.01 -> 101.00", k.Games.Single().StatusReason);
+    }
+
+    [Fact]
+    public async Task A_compile_stopped_on_another_driver_starts_over_even_while_its_version_string_lags()
+    {
+        WarmResult R(WarmOutcome o, long done) => new(o, done, 10000, 0, TimeSpan.FromSeconds(10), 1 << 20, "", null);
+        var warmer = new ScriptedWarmer(R(WarmOutcome.Stopped, 4000), R(WarmOutcome.Completed, 10000));
+        var vendor = new FakeVendor(Gpu) { Label = _ => "100.01" };   // the registry still gives the old version
+        var k = Killer(new FakeReader(Unreal), warmer: warmer, vendor: vendor);
+        var adapter = Gpu;
+        k.Adapters = () => [Listed(adapter)];
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        var stopped = k.Store.LoadGame(_game.Id);
+        Assert.Equal((4000L, "0000:0010:00000020:100.01"), (stopped.ResumeAt, stopped.ResumeGpu));
+
+        adapter = Gpu with { DriverVersion = "101.00", AdapterLuid = 2 };   // its cache lacks the first 4000
+        await WarmOnce(k, _game.Id);
+        Assert.Equal([0L, 0L], warmer.StartAts);
+        var rec = k.Store.LoadGame(_game.Id);
+        Assert.Equal(("100.01", "0000:0010:00000020:101.00", 0L), (rec.WarmedDriverVersion, rec.WarmedDriverId, rec.ResumeAt));
+    }
+
+    [Theory]
+    [InlineData("26.8.1 (32.0.31041.1004)", false)]   // the version string shown now
+    [InlineData("31.0.24033.1003", false)]            // DXGI's version, as earlier builds stored it without the registry
+    [InlineData("fallback 31.0.24033.1003", false)]   // the vendor's form of it
+    [InlineData("26.7.1 (32.0.31031.1001)", true)]    // another driver's
+    public async Task An_earlier_builds_warm_takes_the_driver_id_when_its_version_string_is_the_current_drivers(string stored, bool stale)
+    {
+        var dxgi = Gpu with { DriverVersion = "31.0.24033.1003" };
+        var label = "26.8.1 (32.0.31041.1004)";
+        var vendor = new FakeVendor(dxgi with { DriverVersion = label }) { Label = _ => label };
+        var k = Killer(new FakeReader(Unreal), vendor: vendor);
+        k.Adapters = () => [Listed(dxgi)];
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);
+        var rec = k.Store.LoadGame(_game.Id);
+        (rec.WarmedDriverVersion, rec.WarmedDriverId) = (stored, null);   // as 1.1.0 left it
+        k.Store.SaveGame(_game.Id, rec);
+
+        await k.ScanAsync(default);
+        Assert.Equal(stale, k.Games.Single().Status == GameStatus.Stale);
+        Assert.Equal(stale ? null : "0000:0010:00000020:31.0.24033.1003", k.Store.LoadGame(_game.Id).WarmedDriverId);
+        if (stale) return;
+        label = "26.8.1";   // the registry read differently: the same driver, another string
+        vendor.Refresh(dxgi);
+        Assert.Equal("26.8.1", k.Vendor.Gpu.DriverVersion);
+        await k.ScanAsync(default);
+        Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
+        Assert.Empty(k.DriverStaleGames());
+    }
+
+    [Fact]
+    public async Task An_earlier_builds_warm_is_not_adopted_by_a_version_string_that_lags_a_driver_install()
+    {
+        (string?, string?) registry = ("26.8.1", "32.0.31041.1004");
+        var dxgi = Gpu with { Vendor = GpuVendor.Amd, DriverVersion = "31.0.24033.1003" };
+        var amd = new AmdBackend(dxgi, _ => registry);
+        var k = Killer(new FakeReader(Unreal), vendor: amd);
+        k.AppCache = null;   // never the real DxcCache
+        k.Adapters = () => [Listed(dxgi)];
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);
+
+        dxgi = dxgi with { DriverVersion = "31.0.24033.2001", AdapterLuid = 2 };   // installed; the registry not yet
+        Assert.True(k.RedetectGpu());
+        Assert.Equal("26.8.1 (32.0.31041.1004)", k.Vendor.Gpu.DriverVersion);
+        var rec = k.Store.LoadGame(_game.Id);
+        (rec.WarmedDriverVersion, rec.WarmedDriverId) = ("26.8.1 (32.0.31041.1004)", null);   // as 1.1.0 left it, for the old driver
+        k.Store.SaveGame(_game.Id, rec);
+        await k.ScanAsync(default);
+        Assert.Null(k.Store.LoadGame(_game.Id).WarmedDriverId);
+        var lagging = Assert.Single(k.DriverStaleGames());   // DXGI moved: the old string shown is no proof of the old driver
+        Assert.Equal("driver changed: 26.8.1 (32.0.31041.1004) -> 26.8.1 (32.0.31041.1004)", lagging.StatusReason);
+        Assert.True(k.ShouldNotifyStale());
+
+        registry = ("26.9.1", "32.0.31051.1001");
+        await k.ScanAsync(default);
+        Assert.Null(k.Store.LoadGame(_game.Id).WarmedDriverId);
+        var stale = Assert.Single(k.DriverStaleGames());
+        Assert.Equal("driver changed: 26.8.1 (32.0.31041.1004) -> 26.9.1 (32.0.31051.1001)", stale.StatusReason);
+    }
+
+    [Fact]
+    public async Task Without_a_DXGI_version_the_driver_id_stays_and_an_unknown_one_judges_nothing()
+    {
+        var k = Killer(new FakeReader(Unreal));
+        var adapter = Gpu;
+        k.Adapters = () => [Listed(adapter)];
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);
+        var id = k.DriverId;
+        Assert.Equal("0000:0010:00000020:100.01", id);
+
+        adapter = Gpu with { DriverVersion = "" };   // DXGI gave no version this time: the last one stays
+        await k.ScanAsync(default);
+        Assert.Equal(id, k.DriverId);
+        Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
+
+        // a process that never had one: nothing is stale, adopted or reset until DXGI gives one
+        var vendor = new FakeVendor(Gpu with { DriverVersion = "101.00" }) { Label = _ => "101.00" };
+        k = Killer(new FakeReader(Unreal), vendor: vendor);
+        k.Adapters = () => [Listed(adapter)];
+        await k.ScanAsync(default);
+        Assert.Null(k.DriverId);
+        Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
+        Assert.Empty(k.DriverStaleGames());
+        adapter = Gpu with { DriverVersion = "101.00" };
+        await k.ScanAsync(default);
+        Assert.Equal("0000:0010:00000020:101.00", k.DriverId);
+        Assert.Equal("driver changed: 100.01 -> 101.00", Assert.Single(k.DriverStaleGames()).StatusReason);
+    }
+
+    [Fact]
+    public async Task An_earlier_builds_skip_is_moved_to_the_driver_id_once_and_only_for_the_current_driver()
+    {
+        await Warmed();
+        var k = Killer(new FakeReader(Unreal), driver: "101.00");
+        await k.ScanAsync(default);
+        k.DismissStale();
+        var skipped = k.Store.LoadDismissed();
+        var build = skipped[_game.Id].Split('|', 2)[1];
+        k.Store.SaveDismissed(new() { [_game.Id] = $"101.00|{build}" });   // as 1.1.0 saved it
+
+        k = Killer(new FakeReader(Unreal), driver: "101.00");
+        await k.ScanAsync(default);
+        Assert.Equal($"0000:0010:00000020:101.00|{build}", k.Store.LoadDismissed()[_game.Id]);
+        Assert.False(k.ShouldNotifyStale());
+
+        k.Store.SaveDismissed(new() { [_game.Id] = $"100.50|{build}" });   // skipped for a driver before this one
+        k = Killer(new FakeReader(Unreal), driver: "101.00");
+        await k.ScanAsync(default);
+        Assert.Equal($"100.50|{build}", k.Store.LoadDismissed()[_game.Id]);
+        Assert.True(k.ShouldNotifyStale());
+    }
+
+    [Fact]
+    public async Task A_resume_point_without_its_driver_from_an_earlier_build_starts_over()
+    {
+        WarmResult R(WarmOutcome o, long done) => new(o, done, 10000, 0, TimeSpan.FromSeconds(10), 1 << 20, "", null);
+        var warmer = new ScriptedWarmer(R(WarmOutcome.Stopped, 4000), R(WarmOutcome.Completed, 10000));
+        var k = Killer(new FakeReader(Unreal), warmer: warmer);
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        var rec = k.Store.LoadGame(_game.Id);
+        Assert.Equal(4000, rec.ResumeAt);
+        rec.ResumeGpu = null;   // as 1.1.0 left it, stopped on whatever driver was there then
+        k.Store.SaveGame(_game.Id, rec);
+        await WarmOnce(k, _game.Id);
+        Assert.Equal([0L, 0L], warmer.StartAts);
+    }
+
+    [Fact]
+    public async Task A_GPU_missing_for_a_while_is_not_replaced_by_another_and_asks_for_a_restart_only_when_it_stays_gone()
+    {
+        var k = Killer(new FakeReader(Unreal));
+        var at = DateTimeOffset.UnixEpoch;
+        k.Clock = () => at;
+        var igpu = Listed(Gpu with { Name = "Other GPU", AdapterLuid = 5, DriverVersion = "200.00" }, device: 0x30);
+        IReadOnlyList<DxgiAdapter> listed = [Listed(Gpu), igpu];
+        k.Adapters = () => listed;
+        await k.ScanAsync(default);
+
+        listed = [igpu];   // the same vendor's other adapter is now the only one: never followed
+        Assert.False(k.RedetectGpu());
+        Assert.Equal(Gpu, k.Vendor.Gpu);
+        at += TimeSpan.FromMinutes(10);
+        Assert.False(k.RedetectGpu());
+        at += TimeSpan.FromMinutes(6);
+        Assert.True(k.RedetectGpu());
+        Assert.Equal("Restart SCSKiller to use Other GPU", k.GpuRestartNote);
+        Assert.Equal(Gpu, k.Vendor.Gpu);
+
+        var back = Gpu with { AdapterLuid = 7, DriverVersion = "101.00" };   // reloaded: a new LUID, the same device
+        listed = [igpu, Listed(back)];
+        Assert.True(k.RedetectGpu());
+        Assert.Null(k.GpuRestartNote);
+        Assert.Equal(back, k.Vendor.Gpu);
+    }
+
+    [Fact]
+    public async Task An_incomplete_driver_version_is_read_again_at_every_check_until_it_is_complete()
+    {
+        var vendor = new FakeVendor(Gpu);
+        var k = Killer(new FakeReader(Unreal), vendor: vendor);
+        var adapter = Gpu;
+        k.Adapters = () => [Listed(adapter)];
+        await k.ScanAsync(default);
+        var reads = vendor.Refreshes;
+
+        (vendor.Incomplete, adapter) = (true, Gpu with { DriverVersion = "101.00" });
+        Assert.True(k.RedetectGpu());
+        Assert.Equal("partial", k.Vendor.Gpu.DriverVersion);
+        Assert.False(k.RedetectGpu());   // the same adapter, read again
+        Assert.Equal(reads + 2, vendor.Refreshes);
+
+        vendor.Incomplete = false;
+        Assert.True(k.RedetectGpu());
+        Assert.Equal("101.00", k.Vendor.Gpu.DriverVersion);
+        Assert.False(k.RedetectGpu());
+        Assert.Equal(reads + 3, vendor.Refreshes);
     }
 
     [Fact]
@@ -4919,6 +5535,43 @@ public class AppTests : IDisposable
     /// <summary>Items that crash the driver are skipped by every warm on the driver they crashed; the recompile on a new driver
     /// clears them (one retry each), and one that crashes again is kept for that driver.</summary>
     [Fact]
+    public async Task An_earlier_builds_crash_keys_for_the_current_driver_stay_skipped_at_the_next_compile()
+    {
+        var warmer = new FakeWarmer { Crashed = ["aa"] };
+        var k = Killer(new FakeReader(Unreal), warmer: warmer);
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);
+        var rec = k.Store.LoadGame(_game.Id);
+        rec.CrashKeysDriver = "100.01";   // as 1.1.0 saved it, for this driver
+        k.Store.SaveGame(_game.Id, rec);
+        warmer.Crashed = null;
+        await WarmOnce(k, _game.Id);   // no evaluation in between
+        Assert.Equal(["aa"], warmer.Options!.SkipKeys!);
+        Assert.Equal("0000:0010:00000020:100.01", k.Store.LoadGame(_game.Id).CrashKeysDriver);
+
+        // the same on AMD while a registry read is partial: the version string kept, the driver unmoved
+        (string?, string?) registry = ("26.8.1", "32.0.31041.1004");
+        var dxgi = Gpu with { Vendor = GpuVendor.Amd, DriverVersion = "31.0.24033.1003" };
+        var amd = new AmdBackend(dxgi, _ => registry);
+        k = Killer(new FakeReader(Unreal), warmer: warmer, vendor: amd);
+        k.AppCache = null;   // never the real DxcCache
+        k.Adapters = () => [Listed(dxgi)];
+        await k.ScanAsync(default);
+        rec = k.Store.LoadGame(_game.Id);
+        (rec.CrashKeys, rec.CrashKeysDriver) = (["aa"], "26.8.1 (32.0.31041.1004)");   // as 1.1.0 saved them, for this driver
+        k.Store.SaveGame(_game.Id, rec);
+        (registry, dxgi) = (("26.8.1", null), dxgi with { AdapterLuid = 2 });   // read again (a new LUID), the store version missing
+        await WarmOnce(k, _game.Id);
+        Assert.Equal(["aa"], warmer.Options!.SkipKeys!);
+        Assert.Equal("26.8.1 (32.0.31041.1004)", k.Store.LoadGame(_game.Id).CrashKeysDriver);   // kept, not adopted yet
+
+        registry = ("26.8.1", "32.0.31041.1004");
+        await WarmOnce(k, _game.Id);
+        Assert.Equal(["aa"], warmer.Options!.SkipKeys!);
+        Assert.Equal("1002:0010:00000020:31.0.24033.1003", k.Store.LoadGame(_game.Id).CrashKeysDriver);   // adopted once complete
+    }
+
+    [Fact]
     public async Task Items_that_crash_the_driver_get_one_retry_on_a_new_driver()
     {
         var warmer = new FakeWarmer { Crashed = ["aa"] };
@@ -4933,7 +5586,7 @@ public class AppTests : IDisposable
 
         var k = await Compile("100.01");
         Assert.Null(warmer.Options!.SkipKeys);
-        Assert.Equal("aa@100.01", Kept(k));
+        Assert.Equal("aa@0000:0010:00000020:100.01", Kept(k));   // the driver id
         await Compile("100.01");
         Assert.Equal(["aa"], warmer.Options!.SkipKeys!);   // the same driver: never created again
 
@@ -4944,7 +5597,7 @@ public class AppTests : IDisposable
 
         warmer.Crashed = ["bb"];
         k = await Compile("102.00");
-        Assert.Equal("bb@102.00", Kept(k));
+        Assert.Equal("bb@0000:0010:00000020:102.00", Kept(k));
         await Compile("102.00");
         Assert.Equal(["bb"], warmer.Options!.SkipKeys!);
     }
@@ -4994,6 +5647,340 @@ public class AppTests : IDisposable
 
 
     /// <summary>A warm that runs until Finish(), recording its options and pause state.</summary>
+    [Fact]
+    public async Task A_chained_recorder_whose_install_was_cut_off_before_its_ini_gets_the_ini_and_its_mod_back()
+    {
+        File.WriteAllBytes(Path.Combine(_exeDir, "d3d12.dll"), Planning.MiddlewarePackTests.Pe("d3d12.dll", Guid.NewGuid().ToByteArray()));
+        var ini = Path.Combine(_exeDir, "scskiller.ini");
+        var k = Killer(new FakeReader(Unreal));
+        k.ProcessNames = () => new HashSet<string>();
+        await k.ScanAsync(default);
+        k.SetRecordAlongsideMod(_game.Id, true);   // installs, chained to the mod
+        Assert.Contains($"next={ScsKiller.ChainName}", File.ReadAllText(ini));
+
+        // the state an install leaves when the process ends after the rename and the copy, before the ini
+        File.Delete(ini);
+        var rec = k.Store.LoadGame(_game.Id);
+        rec.RecorderFiles.Remove("scskiller.ini");
+        k.Store.SaveGame(_game.Id, rec);
+        k.ReconcileRecorders(_game.Id);
+        Assert.Contains($"next={ScsKiller.ChainName}", File.ReadAllText(ini));
+        Assert.True(k.Store.LoadGame(_game.Id).RecorderFiles.ContainsKey("scskiller.ini"));   // ours: removed with the recorder
+    }
+
+    [Fact]
+    public async Task A_launch_judged_while_a_recompile_runs_doesnt_judge_the_warm_that_ends_after_it()
+    {
+        var amd = new FakeVendor(Gpu with { Vendor = GpuVendor.Amd });
+        var k = Killer(new FakeReader(Unreal), vendor: amd);
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);
+        var warmer = new ControlledWarmer();
+        k = Killer(new FakeReader(Unreal), warmer: warmer, vendor: amd);
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await Until(() => warmer.Run != null);
+        var warmedAt = k.Store.LoadGame(_game.Id).WarmedAt!.Value.ToUnixTimeMilliseconds();
+        File.WriteAllText(Path.Combine(_exeDir, "scskiller_creates.csv"), Launch(warmedAt + 1, 100, 300));   // played during the recompile
+        k.RefreshGame(_game.Id);   // its exit: judged against the warm before
+        Assert.NotNull(k.Store.LoadGame(_game.Id).FirstLaunch);
+
+        warmer.Run!.Finish();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Null(k.Store.LoadGame(_game.Id).FirstLaunch);   // the next launch judges this warm
+        var s = k.Games.Single();
+        Assert.Equal((GameStatus.Warmed, false), (s.Status, ScsKiller.IsPartlyWarmed(s)));
+    }
+
+    [Fact]
+    public async Task A_resumed_warm_reports_the_failures_of_the_segments_before_its_stop()
+    {
+        var warmer = new ControlledWarmer();
+        var k = Killer(new FakeReader(Unreal), warmer: warmer);
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await Until(() => warmer.Run != null);
+        warmer.Run!.Failed = 100;
+        k.StopQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal((QueueStage.Stopped, "100 failed (the driver rejected them)"), (k.Queue.Single().Stage, k.Queue.Single().Note));
+
+        warmer.Run = null;
+        k.StartQueue();   // continues where it stopped; this segment fails nothing
+        await Until(() => warmer.Run != null);
+        Assert.Equal(10, warmer.Options!.StartAt);
+        warmer.Run!.Finish();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal((QueueStage.Done, "100 failed (the driver rejected them)"), (k.Queue.Single().Stage, k.Queue.Single().Note));
+        Assert.Equal(100, k.Store.LoadGame(_game.Id).LastWarmFailed);
+    }
+
+    [Fact]
+    public async Task A_stopped_warm_starts_over_on_another_driver()
+    {
+        var warmer = new ControlledWarmer();
+        var k = Killer(new FakeReader(Unreal), warmer: warmer);
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await Until(() => warmer.Run != null);
+        k.StopQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(10, k.Store.LoadGame(_game.Id).ResumeAt);
+
+        warmer = new ControlledWarmer();
+        k = Killer(new FakeReader(Unreal), warmer: warmer, driver: "101.00");   // a driver update: its cache has none of the replayed ones
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await Until(() => warmer.Run != null);
+        Assert.Equal(0, warmer.Options!.StartAt);
+        warmer.Run!.Finish();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("101.00", k.Store.LoadGame(_game.Id).WarmedDriverVersion);
+    }
+
+    /// <summary><paramref name="killed"/>: the log is still next to the staged exe, below the stage folder.</summary>
+    sealed class FailingWarmer(bool killed) : IWarmer
+    {
+        public IWarmRun Start(Game game, string workDir, WarmOptions options, IProgress<WarmProgress>? progress)
+        {
+            var log = Path.Combine(workDir, "stage-1-1", "scskiller.log");   // where scskiller_warm stages and logs
+            var written = killed ? Path.Combine(workDir, "stage-1-1", "FakeGame", "Fake", "Binaries", "Win64", "scskiller.log") : log;
+            Directory.CreateDirectory(Path.GetDirectoryName(written)!);
+            File.WriteAllText(written, "device removed");
+            return new Run(new WarmResult(WarmOutcome.Failed, 3, 100, 0, TimeSpan.FromSeconds(1), 0, log, "scskiller_warm exited with code 5"));
+        }
+
+        sealed class Run(WarmResult result) : IWarmRun
+        {
+            public Task<WarmResult> Completion { get; } = Task.FromResult(result);
+            public void Pause() { }
+            public void Resume() { }
+            public void Stop() { }
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_failed_warm_names_a_log_that_outlives_the_work_folder(bool killed)
+    {
+        var k = Killer(new FakeReader(Unreal), warmer: new FailingWarmer(killed));
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        var q = k.Queue.Single();
+        Assert.Equal(QueueStage.Failed, q.Stage);
+        Assert.StartsWith("scskiller_warm exited with code 5 (log: ", q.Error);
+        var log = q.Error![(q.Error.IndexOf("(log: ") + 6)..^1];
+        Assert.False(Directory.Exists(Path.Combine(k.Store.GameDir(_game.Id), "work")));
+        Assert.Equal("device removed", File.ReadAllText(log));
+    }
+
+    [Fact]
+    public async Task A_warmed_game_whose_attributed_cache_files_are_all_gone_is_stale()
+    {
+        var warmer = new FakeWarmer(() =>
+        {
+            CacheFile("0002a91d11111111.nvph", 65536);
+            return new FileStream(CacheFile("fc52a91d11111111.nvph", 4096), FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+        });
+        var game = _game with { ExePath = Path.Combine(_exeDir, Process.GetCurrentProcess().ProcessName + ".exe") };   // this process holds them
+        var k = Killer(new FakeReader(Unreal), warmer: warmer, game: game);
+        (k.AppCache, k.RunningGameExes) = (new NvidiaAppCache(Path.Combine(_root, "DXCache")), () => new HashSet<string>());
+        await k.ScanAsync(default);
+        await WarmOnce(k, game.Id);
+        Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
+
+        File.Delete(Path.Combine(_root, "DXCache", "0002a91d11111111.nvph"));   // one of them: which warm wrote a file isn't known
+        k.RefreshGame(game.Id);
+        Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
+        File.Delete(Path.Combine(_root, "DXCache", "fc52a91d11111111.nvph"));   // a shader cache reset
+        k.RefreshGame(game.Id);
+        Assert.Equal((GameStatus.Stale, ScsKiller.TrimmedAllReason), (k.Games.Single().Status, k.Games.Single().StatusReason));
+    }
+
+    [Fact]
+    public async Task An_import_is_saved_before_it_empties_the_inbox()
+    {
+        var k = Killer(new FakeReader(Unreal));
+        k.ProcessNames = () => new HashSet<string>();
+        await k.ScanAsync(default);
+        var inbox = Path.Combine(_exeDir, "scskiller.db");
+        using (var f = File.Create(inbox))
+            PsoDb.Write(f, 'C', PsoDb.Compute(PsoDb.Zero, new string('c', 40)));
+        DateTimeOffset? stored = null;
+        k.InboxRotating = () => stored = new AppStore(k.Store.DataDir).LoadGame(_game.Id).RecordingImportedAt;   // what a crash here leaves
+        k.RefreshGame(_game.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(0, new FileInfo(inbox).Length);
+    }
+
+    [Fact]
+    public async Task An_inbox_merged_by_an_import_that_never_saved_its_record_counts_as_imported()
+    {
+        var k = Killer(new FakeReader(Unreal));
+        k.ProcessNames = () => new HashSet<string>();
+        await k.ScanAsync(default);
+        var inbox = Path.Combine(_exeDir, "scskiller.db");
+        using (var f = File.Create(inbox))
+            PsoDb.Write(f, 'C', PsoDb.Compute(PsoDb.Zero, new string('c', 40)));
+        var store = Path.Combine(k.Store.GameDir(_game.Id), "recording.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(store)!);
+        Recordings.Merge(store, inbox, null);   // the import's merge, then the process ended
+        Assert.Null(k.Store.LoadGame(_game.Id).RecordingImportedAt);
+
+        k.RefreshGame(_game.Id);   // the retry adds nothing new to the copy
+        Assert.NotNull(k.Store.LoadGame(_game.Id).RecordingImportedAt);
+        Assert.Equal(0, new FileInfo(inbox).Length);
+    }
+
+    sealed class ThrowingSizeCache : IAppCache
+    {
+        public IReadOnlyList<FileInfo> FilesOf(IEnumerable<string> keys) => [];
+        int _sized;
+        public long SizeOf(IEnumerable<string> keys) => Interlocked.Increment(ref _sized) == 1 ? throw new NotSupportedException("cache unreadable") : 0;   // once
+        public IReadOnlySet<string> KeysOpenBy(string exeFileName) => new HashSet<string> { "11111111" };
+        public int Delete(IEnumerable<string> keys) => 0;
+    }
+
+    [Fact]
+    public async Task An_exception_after_an_item_leaves_the_queue_running_the_next_ones()
+    {
+        var warmer = new FakeWarmer(() => new MemoryStream());   // runs a second: attribution samples it
+        var k = Killer(new FakeReader(Unreal), warmer: warmer);
+        k.AppCache = new ThrowingSizeCache();   // the refresh after the warm throws (the warm attributes a key)
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(2, warmer.Started.Count);
+    }
+
+    /// <summary>Unreal 5.4 until the store reports build 2, then 5.5; the engine version each index was asked for.</summary>
+    sealed class UpdatedReader : IEngineReader
+    {
+        public readonly List<string> Indexed = [];
+        public EngineInfo? Detect(Game game) => Unreal with { Version = game.Version == "2" ? "5.5" : "5.4" };
+        public ShaderIndex Index(Game game, EngineInfo e, IProgress<string>? log, CancellationToken ct)
+        {
+            lock (Indexed) Indexed.Add(e.Version);
+            return new("content-" + game.Version, ["PCD3D_SM6"], new Dictionary<string, ShaderInfo>(), []);
+        }
+        public void ReadShaders(Game game, EngineInfo e, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct) { }
+    }
+
+    /// <summary><see cref="FakePlanner"/>, but build 3 has nothing it can compile and build 4 needs a recording; with
+    /// <paramref name="recorded"/>, every build without one does.</summary>
+    sealed class UpdatedPlanner(PlanStats? stats = null, bool recorded = false) : IPlanner
+    {
+        readonly FakePlanner _inner = new(stats: stats);
+        public PlanCheck Check(Game game, EngineInfo engine, Recording? recording, VendorCaps caps) => game.Version switch
+        {
+            "3" => new(Readiness.Unsupported, "no D3D12 shaders"),
+            "4" => new(Readiness.NeedsRecording, "needs a recording"),
+            _ when recorded && recording == null => new(Readiness.NeedsRecording, "needs a recording"),
+            _ => _inner.Check(game, engine, recording, caps),
+        };
+        public Plan Build(Game game, EngineInfo engine, ShaderIndex index, Recording? recording, VendorCaps caps, string outDir, IProgress<string>? log, CancellationToken ct, bool maximum = false) =>
+            _inner.Build(game, engine, index, recording, caps, outDir, log, ct, maximum);
+        public void Materialize(Plan plan, Game game, EngineInfo engine, IEngineReader reader, Recording? recording, string workDir, CancellationToken ct) =>
+            _inner.Materialize(plan, game, engine, reader, recording, workDir, ct);
+    }
+
+    [Fact]
+    public async Task A_compile_after_an_update_the_scan_missed_plans_with_the_installed_builds_engine()
+    {
+        var source = new FakeSource([_game with { Version = "1" }]);
+        var reader = new UpdatedReader();
+        var k = new ScsKiller([source], new FakeVendor(Gpu), reader, new UpdatedPlanner(), new FakeWarmer(), Path.Combine(_root, "data"), _proxy) { LocalAppData = _root };
+        await k.ScanAsync(default);
+        Assert.Equal("5.4", k.Games.Single().Engine!.Version);
+        source.Games = [_game with { Version = "2" }];   // the store updated the game while the app ran
+        await WarmOnce(k, _game.Id);
+        Assert.Equal(["5.5"], reader.Indexed);
+        Assert.Equal("5.5", k.Games.Single().Engine!.Version);
+
+        source.Games = [_game with { Version = "3" }];   // an update to a build SCSKiller can't compile
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal((QueueStage.Failed, "not ready: no D3D12 shaders"), (k.Queue.Single().Stage, k.Queue.Single().Error));
+        Assert.Equal(["5.5"], reader.Indexed);
+    }
+
+    [Fact]
+    public async Task A_partial_ray_tracing_plan_doesnt_let_a_compile_through_that_the_planner_says_needs_a_recording()
+    {
+        var source = new FakeSource([_game with { Version = "1" }]);
+        var rt = new PlanStats(0, 40_000, 40_000, 100, true, RtLibraries: 12_000, RtUncovered: 12_000);
+        var k = new ScsKiller([source], new FakeVendor(Gpu), new UpdatedReader(), new UpdatedPlanner(rt), new FakeWarmer(), Path.Combine(_root, "data"), _proxy) { LocalAppData = _root };
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);   // everything but the ray tracing
+        Assert.Equal(GameStatus.NeedsRecording, k.Games.Single().Status);
+
+        source.Games = [_game with { Version = "4" }];   // the installed build needs a recording for more than its ray tracing
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal((QueueStage.Failed, "not ready: needs a recording"), (k.Queue.Single().Stage, k.Queue.Single().Error));
+    }
+
+    [Fact]
+    public async Task A_recording_another_process_imported_lets_a_compile_through_that_the_scan_found_needing_one()
+    {
+        var k = new ScsKiller([new FakeSource([_game])], new FakeVendor(Gpu), new FakeReader(Unreal), new UpdatedPlanner(recorded: true), new FakeWarmer(),
+            Path.Combine(_root, "data"), _proxy) { LocalAppData = _root };
+        await k.ScanAsync(default);
+        Assert.Equal(GameStatus.NeedsRecording, k.Games.Single().Status);
+
+        var other = new AppStore(k.Store.DataDir);   // the app imports one while the command line's queue shell is open
+        Directory.CreateDirectory(other.GameDir(_game.Id));
+        PsoDb.WriteCompact(Path.Combine(other.GameDir(_game.Id), "recording.db"), [new PsoDb.Rec('C', PsoDb.Compute(PsoDb.Zero, new string('c', 40)))]);
+        var rec = other.LoadGame(_game.Id);
+        rec.RecordingImportedAt = DateTimeOffset.Now;
+        other.SaveGame(_game.Id, rec);
+        await WarmOnce(k, _game.Id);
+        Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
+    }
+
+    [Fact]
+    public async Task Two_processes_compiling_one_game_take_turns()
+    {
+        var first = new ControlledWarmer();
+        var app = Killer(new FakeReader(Unreal), warmer: first);
+        var cliWarmer = new FakeWarmer();
+        var cli = Killer(new FakeReader(Unreal), warmer: cliWarmer);   // the same data folder: another process's queue
+        await app.ScanAsync(default);
+        await cli.ScanAsync(default);
+        await WarmOnce(cli, _game.Id);   // the command line's queue has finished an item before
+        app.Enqueue(_game.Id);
+        app.StartQueue();
+        await Until(() => first.Run != null);
+        cli.Enqueue(_game.Id);
+        cli.StartQueue();
+        await Until(() => cli.Queue.Single().Note == ScsKiller.AnotherCompileNote);
+        await Task.Delay(700);
+        Assert.Single(cliWarmer.Started);   // nothing of the game's plan or work folder touched meanwhile
+        Assert.True(Directory.Exists(Path.Combine(app.Store.GameDir(_game.Id), "work")));
+        cli.PauseQueue();
+        cli.ResumeQueue();
+        Assert.Equal(QueueStage.Waiting, cli.Queue.Single().Stage);   // still waiting, not the finished item's stage
+
+        first.Run!.Finish();
+        await app.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        await cli.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal((QueueStage.Done, QueueStage.Done), (app.Queue.Single().Stage, cli.Queue.Single().Stage));
+        Assert.Equal(2, cliWarmer.Started.Count);
+    }
+
     sealed class ControlledWarmer : IWarmer
     {
         public volatile ControlledRun? Run;
@@ -5040,19 +6027,20 @@ public class AppTests : IDisposable
     {
         readonly TaskCompletionSource<WarmResult> _done = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public volatile bool Paused, Stopped;
+        public long Failed;   // the driver rejected these before the stop
         public Task<WarmResult> Completion => _done.Task;
         public void Pause() => Paused = true;
         public void Resume() => Paused = false;
         public void Stop()
         {
             Stopped = true;
-            _done.TrySetResult(new WarmResult(WarmOutcome.Stopped, 10, 100, 0, TimeSpan.FromSeconds(1), 0, "", null));
+            _done.TrySetResult(new WarmResult(WarmOutcome.Stopped, 10, 100, Failed, TimeSpan.FromSeconds(1), 0, "", null));
         }
         public void Finish() => _done.TrySetResult(new WarmResult(WarmOutcome.Completed, 100, 100, 0, TimeSpan.FromSeconds(1), 0, "", null));
     }
 
     [Fact]
-    public async Task The_server_stutter_list_replaces_the_cached_one_after_a_scan_daily_or_on_a_forced_rescan()
+    public async Task The_server_stutter_list_replaces_the_cached_one_after_a_scan_daily_or_on_the_users_refresh()
     {
         static string List(string name) =>
             $$"""{"games":[{"name":"{{name}}","ids":[],"severity":"severe","reason":"r","source":"{{Core.Games.StutterList.OwnMeasurement}}","date":"2026-01-01"}]}""";
@@ -5085,10 +6073,128 @@ public class AppTests : IDisposable
             Assert.Equal(2, fake.Log.Count);   // checked less than a day ago
             await k.RescanAsync(default);
             await k.StutterUpdate;
+            Assert.Equal(2, fake.Log.Count);   // a full re-read alone isn't the user's refresh
+            await k.ScanAsync(default, userRequested: true);
+            await k.StutterUpdate;
             Assert.Equal(4, fake.Log.Count);
             Assert.NotNull(k.Games.Single().KnownStutter);
         }
         finally { Core.Games.StutterList.Current = Core.Games.StutterList.Embedded; }
+    }
+
+    [Fact]
+    public async Task The_users_refresh_fetches_the_lists_and_the_manifest_however_fresh_once_per_window_across_restarts()
+    {
+        var data = Path.Combine(_root, "data");
+        Directory.CreateDirectory(data);
+        File.WriteAllText(Path.Combine(data, "known-stutter.json"), """{"games":[]}""");   // checked just now
+        var list = $$"""{"games":[{"name":"Other Game","ids":[],"severity":"severe","reason":"r","source":"{{Core.Games.StutterList.OwnMeasurement}}","date":"2026-01-01"}]}""";
+        var manifest = CommunityTests.Manifest();
+        var up = true;
+        var fake = new CommunityTests.Fake(r =>
+            r.RequestUri!.AbsolutePath.StartsWith("/v1/manifest/") ? CommunityTests.Ours(HttpStatusCode.OK, manifest)
+            : up && r.RequestUri.AbsolutePath.EndsWith("known-stutter.json") ? CommunityTests.Ours(HttpStatusCode.OK, System.Text.Encoding.UTF8.GetBytes(list))
+            : CommunityTests.Ours(HttpStatusCode.NotFound));
+        var routes = new RouteFailover(fake, [new("https://api.test.com/")]);
+        var asked = 0;
+        ScsKiller Start()
+        {
+            var killer = Killer(new FakeReader(Unreal));
+            (killer.ContentRoutes, killer.Community) = (routes, new Community(data, (_, _) => Task.FromResult<string?>("token"), routes));
+            killer.UserFetch = () => { Interlocked.Increment(ref asked); return Task.CompletedTask; };
+            return killer;
+        }
+        var k = Start();
+        async Task<(int Content, int Manifest)> Scan(Func<Task> scan)
+        {
+            await scan();
+            await Task.WhenAll(k.StutterUpdate, k.CommunitySync, k.ServerRefresh);
+            lock (fake.Log) return (fake.Log.Count(l => l.Contains("/v1/content/")), fake.Log.Count(l => l.Contains("/v1/manifest/")));
+        }
+
+        try
+        {
+            Assert.Equal((0, 1), await Scan(() => k.ScanAsync(default)));   // no manifest copy yet; the lists are fresh
+            Assert.Equal((0, 1), await Scan(() => k.ScanAsync(default)));   // automatic: both copies fresh
+            Assert.Equal(0, asked);
+            Assert.Equal((2, 2), await Scan(() => k.ScanAsync(default, userRequested: true)));
+            Assert.Equal(ScsKiller.ServerCheck.Done, await k.ServerRefresh);
+            Assert.Equal((2, 2), await Scan(() => k.RescanAsync(default, userRequested: true)));   // a second click within the window
+            Assert.Equal(ScsKiller.ServerCheck.TooSoon, await k.ServerRefresh);
+            Assert.Equal(1, asked);
+
+            k = Start();   // a restart keeps the window
+            Assert.Equal((2, 2), await Scan(() => k.ScanAsync(default, userRequested: true)));
+            Assert.Equal(ScsKiller.ServerCheck.TooSoon, await k.ServerRefresh);
+
+            File.Delete(Path.Combine(data, "user-fetch.txt"));   // the window over, and the lists unreachable
+            up = false;
+            Assert.Equal((4, 3), await Scan(() => k.ScanAsync(default, userRequested: true)));
+            Assert.Equal(ScsKiller.ServerCheck.Unreachable, await k.ServerRefresh);
+            Assert.Equal(2, asked);
+        }
+        finally { Core.Games.StutterList.Current = Core.Games.StutterList.Embedded; }
+    }
+
+    [Fact]
+    public async Task After_a_refused_manifest_check_neither_clicks_nor_scans_check_again_before_its_retry_after()
+    {
+        var data = Path.Combine(_root, "data");
+        Directory.CreateDirectory(data);
+        var fake = new CommunityTests.Fake(r =>
+        {
+            if (!r.RequestUri!.AbsolutePath.StartsWith("/v1/manifest/")) return CommunityTests.Ours(HttpStatusCode.NotFound);
+            var limited = CommunityTests.Ours(HttpStatusCode.TooManyRequests);
+            limited.Headers.RetryAfter = new(TimeSpan.FromHours(1));
+            return limited;
+        });
+        var k = Killer(new FakeReader(Unreal));
+        k.Community = new Community(data, (_, _) => Task.FromResult<string?>("token"), new RouteFailover(fake, [new("https://api.test.com/")]));
+        async Task<int> Checks(Func<Task> scan)
+        {
+            await scan();
+            await Task.WhenAll(k.CommunitySync, k.ServerRefresh);
+            lock (fake.Log) return fake.Log.Count(l => l.Contains("/v1/manifest/"));
+        }
+
+        Assert.Equal(1, await Checks(() => k.ScanAsync(default, userRequested: true)));   // refused
+        Assert.Equal(1, await Checks(() => k.ScanAsync(default, userRequested: true)));   // inside the window: the copy (none), no check
+        Assert.Equal(1, await Checks(() => k.ScanAsync(default)));
+    }
+
+    [Fact]
+    public async Task A_refresh_during_a_community_pass_checks_the_manifest_again_once_the_pass_ends_with_the_latest_games()
+    {
+        var data = Path.Combine(_root, "data");
+        Directory.CreateDirectory(data);
+        using var release = new ManualResetEventSlim();
+        const string content = "0123456789abcdef0123456789abcdef01234567";
+        var later = _game with { Id = "test:later", Name = "Later Game", Version = "100" };
+        var manifest = CommunityTests.Manifest(CommunityTests.Alias($"{later.Id}@100", content), CommunityTests.Entry(content, "object"u8.ToArray(), 1));
+        var fake = new CommunityTests.Fake(r =>
+        {
+            if (!r.RequestUri!.AbsolutePath.StartsWith("/v1/manifest/")) return CommunityTests.Ours(HttpStatusCode.NotFound);
+            release.Wait(TimeSpan.FromSeconds(10));
+            return CommunityTests.Ours(HttpStatusCode.OK, manifest);
+        });
+        var source = new FakeSource([_game]);
+        var k = Killer(new FakeReader(Unreal), source: source);
+        k.Community = new Community(data, (_, _) => Task.FromResult<string?>("token"), new RouteFailover(fake, [new("https://api.test.com/")]));
+        await k.ScanAsync(default);   // its pass waits on the manifest
+        await k.ScanAsync(default, userRequested: true);
+        var pending = k.ServerRefresh;
+        k.StartCommunitySync(fresh: true);   // more refreshes behind the same pass: still one pass queued
+        source.Games = [_game, later];   // installed meanwhile
+        await k.ScanAsync(default, userRequested: true);   // inside the window: the pending refresh, and its pass takes this scan's games
+        Assert.Same(pending, k.ServerRefresh);
+        release.Set();
+        Assert.Equal(ScsKiller.ServerCheck.Done, await k.ServerRefresh);
+        await k.CommunitySync;
+        lock (fake.Log)
+        {
+            Assert.Equal(2, fake.Log.Count(l => l.Contains("/v1/manifest/")));
+            Assert.Contains(fake.Log, l => l.Contains("/v1/o/"));   // the game the denied click found
+        }
     }
 
     /// <summary>A scan keeps the planner's check; an engine the server's list confirms afterwards loses its note without a rescan.</summary>
@@ -5231,10 +6337,20 @@ public class AppTests : IDisposable
         public IReadOnlyList<Game> Discover() => Games;
     }
 
-    sealed class FakeVendor(GpuInfo gpu, bool perStage = false, string profile = "fake-1") : IGpuVendorBackend
+    sealed class FakeVendor(GpuInfo gpu, bool perStage = false, string profile = "fake-1") : IGpuVendorBackend, IRefreshableGpu
     {
-        public GpuVendor Vendor => gpu.Vendor;
-        public GpuInfo Gpu => gpu;
+        public GpuVendor Vendor => Gpu.Vendor;
+        public GpuInfo Gpu { get; private set; } = gpu;
+        public bool Incomplete;   // refreshes read a partial version
+        public Func<GpuInfo, string>? Label;   // the version refreshes read; null = DXGI's
+        public int Refreshes;
+        public bool Refresh(GpuInfo adapter)
+        {
+            Refreshes++;
+            Gpu = adapter with { DriverVersion = Incomplete ? "partial" : Label?.Invoke(adapter) ?? adapter.DriverVersion };
+            return !Incomplete;
+        }
+        public string FallbackVersion(string umd) => $"fallback {umd}";
         public VendorCaps Caps => new(profile, true, true, false, perStage);
         public CacheUsage GetCacheUsage() => new("", 0, true);
         public CacheLimit? GetCacheLimit() => null;
@@ -5320,7 +6436,8 @@ public class AppTests : IDisposable
         await k.CommunitySync;
         var s = k.Games.Single();
         Assert.Equal((GameStatus.Stale, "1 new pipeline recorded; compile again to include them", 1L), (s.Status, s.StatusReason, s.RecordedSinceWarm));
-        Assert.NotNull(NewShaders.Key(s, Gpu.DriverVersion));
+        Assert.Empty(k.DriverStaleGames());
+        Assert.NotNull(NewShaders.Key(s, new HashSet<string>()));
 
         using (var f = new FileStream(Path.Combine(_exeDir, "scskiller.db"), FileMode.Append))   // then played: recorded here too
             foreach (var r in PsoDb.Read(new MemoryStream(raw))) PsoDb.Write(f, r.Tag, r.Payload);
@@ -6042,7 +7159,7 @@ public class AppTests : IDisposable
     [Fact]
     public async Task A_planned_pipeline_that_crashes_this_driver_isnt_offered_again_by_a_rebuild()
     {
-        List<PsoDb.Rec> records = [new('B', [9]), new('P', [1]), new('P', [2]), new('C', [3])];
+        List<PsoDb.Rec> records = [new('B', [.. new byte[20], 9]), new('P', [1]), new('P', [2]), new('C', [3])];
         var warmer = new FakeWarmer { Crashed = [new PsoDb.Rec('P', [1]).Key] };   // the warm found it removes the device
         var k = Killer(new FakeReader(Unreal), new FakePlanner(records: records), warmer);
         k.IdleTime = () => TimeSpan.FromHours(1);
@@ -6304,12 +7421,12 @@ public class AppTests : IDisposable
         }
     }
 
-    sealed class FakeReader(EngineInfo? engine, string content = "content-1", int shaders = 3000) : IEngineReader
+    sealed class FakeReader(EngineInfo? engine, string content = "content-1", int shaders = 3000, List<ShaderMap>? maps = null) : IEngineReader
     {
         public int Detects;
         public EngineInfo? Detect(Game game) { Interlocked.Increment(ref Detects); return engine; }
         public ShaderIndex Index(Game game, EngineInfo e, IProgress<string>? log, CancellationToken ct) =>
-            new(content, ["PCD3D_SM6"], Enumerable.Range(0, shaders).ToDictionary(i => $"{i:x40}", i => (ShaderInfo)null!), []);
+            new(content, ["PCD3D_SM6"], Enumerable.Range(0, shaders).ToDictionary(i => $"{i:x40}", i => (ShaderInfo)null!), [.. maps ?? []]);
         public void ReadShaders(Game game, EngineInfo e, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct) { }
     }
 

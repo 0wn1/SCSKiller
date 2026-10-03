@@ -2850,7 +2850,8 @@ static int dxcfill(long long count, int unroll, unsigned seed, int hold) {
 
 // `selftest frames <n>`: presents on WARP through the proxy's DXGI hooks, with an overlay that hooked Present / Present1 on
 // the swap chain vtable before the proxy did (a swap chain made on a device from the system d3d12.dll first). n Presents,
-// n Present1s, one DXGI_PRESENT_TEST and one Present that the overlay turns into a nested Present1: 2n + 1 frames. Then a
+// n Present1s, one DXGI_PRESENT_TEST, three DO_NOT_WAIT Presents the overlay fails with DXGI_ERROR_WAS_STILL_DRAWING (no
+// frame) and one Present that the overlay turns into a nested Present1: 2n + 1 frames. Then a
 // second overlay hooks them after the proxy did, and a second swap chain on the same vtable presents once with each: 2
 // more frames, through both overlays. Then a compute PSO on this thread and one on another (the csv's presents column: 1,
 // then 0). Prints "overlay <calls>", "late <calls>" (the second overlay's) and "frames <n>" (scskiller_frames.bin's frames
@@ -2860,7 +2861,7 @@ static void* g_ov_present;
 static void* g_ov_present1;
 static void* g_late_present;
 static void* g_late_present1;
-static bool g_ov_nest;
+static bool g_ov_nest, g_ov_busy;
 static HRESULT STDMETHODCALLTYPE late_present(IDXGISwapChain* sc, UINT sync, UINT flags) {
     ++g_late;
     return ((HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT))g_late_present)(sc, sync, flags);
@@ -2871,6 +2872,7 @@ static HRESULT STDMETHODCALLTYPE late_present1(IDXGISwapChain1* sc, UINT sync, U
 }
 static HRESULT STDMETHODCALLTYPE ov_present(IDXGISwapChain* sc, UINT sync, UINT flags) {
     ++g_overlay;
+    if (g_ov_busy) return DXGI_ERROR_WAS_STILL_DRAWING;
     IDXGISwapChain1* sc1;
     if (g_ov_nest && SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1)))) {  // through the vtable: the proxy's hook runs again, nested
         DXGI_PRESENT_PARAMETERS p = {};
@@ -2919,6 +2921,9 @@ static int frames_rows(const std::wstring& dir, int n) {
     DXGI_PRESENT_PARAMETERS p = {};
     for (int i = 0; i < n; ++i) sc->Present(0, 0), sc->Present1(0, 0, &p);
     sc->Present(0, DXGI_PRESENT_TEST);
+    g_ov_busy = true;
+    for (int i = 0; i < 3; ++i) sc->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+    g_ov_busy = false;
     g_ov_nest = true;
     sc->Present(0, 0);
     g_ov_nest = false;
@@ -2956,6 +2961,82 @@ static int frames_rows(const std::wstring& dir, int n) {
     }
     if (fr) fclose(fr);
     printf("frames %ld\n", frames);
+    return 0;
+}
+
+// `selftest framesheld`: presents on WARP through the proxy while scskiller_frames.bin is held open by another handle, so
+// the proxy's first writes of it fail, then one present after it is let go. Prints "drift_us <n>": how far that frame's
+// time in the file is from its QueryPerformanceCounter, from the file's launch record (frames lost, never time).
+static int frames_held(const std::wstring& dir) {
+    SetEnvironmentVariableW(L"SCSKILLER_MODE", L"record");
+    HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str());
+    CHECK(m);
+    auto proxy_create = (decltype(&D3D12CreateDevice))GetProcAddress(m, "D3D12CreateDevice");
+    IDXGIFactory4* f = nullptr;
+    IDXGIAdapter* warp = nullptr;
+    CHECK(proxy_create && SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&f))) && SUCCEEDED(f->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
+    ID3D12Device* dev = nullptr;
+    CHECK(SUCCEEDED(proxy_create(warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))));
+    HANDLE held = CreateFileW((dir + L"scskiller_frames.bin").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(held != INVALID_HANDLE_VALUE);
+    HWND wnd = CreateWindowExW(0, L"STATIC", L"scskiller frames", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr, nullptr, nullptr);
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    ID3D12CommandQueue* q = nullptr;
+    DXGI_SWAP_CHAIN_DESC1 d = {64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, {1, 0}, DXGI_USAGE_RENDER_TARGET_OUTPUT, 2};
+    d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    IDXGISwapChain1* sc = nullptr;
+    CHECK(wnd && SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) && SUCCEEDED(f->CreateSwapChainForHwnd(q, wnd, &d, nullptr, nullptr, &sc)));
+    for (int i = 0; i < 10; ++i) sc->Present(0, 0), Sleep(30);
+    Sleep(2200);  // the proxy's writer tries once a second
+    CloseHandle(held);
+    sc->Present(0, 0);
+    LARGE_INTEGER at;
+    QueryPerformanceCounter(&at);
+    Sleep(2500);
+    FILE* fr = _wfopen((dir + L"scskiller_frames.bin").c_str(), L"rb");
+    CHECK(fr);
+    uint64_t head[4] = {}, us = 0, last = 0;
+    for (uint32_t r; fread(&r, 4, 1, fr) == 1;)
+        if (r == 0xFFFFFFFF) us = last = 0, fread(head, sizeof head, 1, fr);
+        else if (r >> 28 == 15) us += (uint64_t)(r & 0x0FFFFFFF) * 1000;
+        else last = us += r & 0x0FFFFFFF;
+    fclose(fr);
+    CHECK(head[3]);
+    long long want = (long long)((at.QuadPart - (long long)head[2]) * 1000000 / (long long)head[3]);
+    printf("drift_us %lld\n", want - (long long)last);
+    return 0;
+}
+
+// `selftest factory`: a device from ID3D12DeviceFactory (the proxy's D3D12GetInterface, CLSID_D3D12DeviceFactory) on WARP,
+// and a compute PSO on it. The proxy is freed once before the device: its factory hook keeps it loaded. Prints
+// "loaded <0|1>" and "created 0x<hr>", or "no factory" where the runtime has none.
+static int factory_rows(const std::wstring& dir) {
+    SetEnvironmentVariableW(L"SCSKILLER_MODE", L"record");
+    HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str());
+    CHECK(m);
+    auto get_interface = (decltype(&D3D12GetInterface))GetProcAddress(m, "D3D12GetInterface");
+    auto ser = (decltype(&D3D12SerializeRootSignature))GetProcAddress(m, "D3D12SerializeRootSignature");
+    IDXGIFactory4* f = nullptr;
+    IDXGIAdapter* warp = nullptr;
+    CHECK(get_interface && ser && SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&f))) && SUCCEEDED(f->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
+    ID3D12DeviceFactory* fac = nullptr;
+    if (FAILED(get_interface(CLSID_D3D12DeviceFactory, IID_PPV_ARGS(&fac)))) return printf("no factory\n"), 0;
+    FreeLibrary(m);
+    printf("loaded %d\n", GetModuleHandleW((dir + L"d3d12.dll").c_str()) != nullptr);
+    fflush(stdout);
+    ID3D12Device* dev = nullptr;
+    CHECK(SUCCEEDED(fac->CreateDevice(warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))));
+    D3D12_ROOT_PARAMETER up = {D3D12_ROOT_PARAMETER_TYPE_UAV};
+    D3D12_ROOT_SIGNATURE_DESC rd = {1, &up};
+    ID3DBlob *rb = nullptr, *err = nullptr;
+    ID3D12RootSignature* rs = nullptr;
+    CHECK(SUCCEEDED(ser(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err)) && SUCCEEDED(dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(&rs))));
+    ID3DBlob* cs = compile("RWByteAddressBuffer b : register(u0); [numthreads(1,1,1)] void main() { b.Store(0, " + std::to_string(GetTickCount()) + "); }", "cs_5_0");
+    CHECK(cs);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC c = {};
+    c.pRootSignature = rs, c.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+    ID3D12PipelineState* p = nullptr;
+    printf("created 0x%08x\n", (unsigned)dev->CreateComputePipelineState(&c, IID_PPV_ARGS(&p)));
     return 0;
 }
 
@@ -2997,6 +3078,8 @@ int wmain(int argc, wchar_t** argv) {
     if (argc > 2 && !wcscmp(argv[1], L"so")) return so_rows(dir, (unsigned)_wtoi(argv[2]));
     if (argc > 2 && !wcscmp(argv[1], L"frames")) return frames_rows(dir, _wtoi(argv[2]));
     if (argc > 1 && !wcscmp(argv[1], L"unload")) return unload_rows(dir);
+    if (argc > 1 && !wcscmp(argv[1], L"framesheld")) return frames_held(dir);
+    if (argc > 1 && !wcscmp(argv[1], L"factory")) return factory_rows(dir);
     if (argc > 2 && !wcscmp(argv[1], L"chain")) return chain_rows(dir, (unsigned)_wtoi(argv[2]), argc > 3 && !wcscmp(argv[3], L"swap"));
     if (argc > 1 && !wcscmp(argv[1], L"warpluid")) {  // for scskiller_warm --adapter-luid: WARP (the runtime's checks, no GPU cache)
         IDXGIFactory4* f = nullptr;

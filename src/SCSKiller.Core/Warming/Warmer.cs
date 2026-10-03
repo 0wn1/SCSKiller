@@ -55,7 +55,12 @@ public sealed class Warmer(IGpuVendorBackend vendor, string? warmExe = null) : I
     /// others on the NT heap. Both are named scskiller_warm.exe and stage themselves under the game's name.</summary>
     public static string ExeFor(GpuVendor vendor) => vendor == GpuVendor.Nvidia ? @"segheap\scskiller_warm.exe" : "scskiller_warm.exe";
 
-    public IWarmRun Start(Game game, string workDir, WarmOptions options, IProgress<WarmProgress>? progress)
+    public IWarmRun Start(Game game, string workDir, WarmOptions options, IProgress<WarmProgress>? progress) =>
+        Start(game, workDir, options, progress, vendor.Gpu);
+
+    /// <summary><paramref name="gpu"/>: the adapter the run launches on (its LUID), every process of it, as the caller
+    /// records the run for.</summary>
+    public IWarmRun Start(Game game, string workDir, WarmOptions options, IProgress<WarmProgress>? progress, GpuInfo gpu)
     {
         var exe = warmExe ?? NativeTools.Find(ExeFor(vendor.Vendor))
                   ?? throw new FileNotFoundException($"{ExeFor(vendor.Vendor)} not found next to the app or in proxy\\build\\Release");
@@ -65,7 +70,7 @@ public sealed class Warmer(IGpuVendorBackend vendor, string? warmExe = null) : I
         var reg = vendor.Vendor == GpuVendor.Amd ? Ags?.Invoke(game) : null;
         var ags = AgsArgs(vendor.Vendor, game, reg, reg == null ? null : AmdAgs.DllFor(game, NativeTools.Find(AmdAgs.DllName)), out var agsWhy);
         if (agsWhy != null) Log?.Report($"{game.Name}: {agsWhy}");
-        return new WarmRun(vendor, exe, game, workDir, options, progress, StuckAfter, stagePath, MaxRecoveries, Environment, ags, Log);
+        return new WarmRun(vendor, gpu, exe, game, workDir, options, progress, StuckAfter, stagePath, MaxRecoveries, Environment, ags, Log);
     }
 
     /// <summary>scskiller_warm's --ags arguments: on AMD, for a game that registers with AGS and isn't an Xbox package, the
@@ -130,7 +135,7 @@ sealed class WarmRun : IWarmRun
 
     public Task<WarmResult> Completion { get; }
 
-    public WarmRun(IGpuVendorBackend vendor, string exe, Game game, string workDir, WarmOptions o, IProgress<WarmProgress>? progress, TimeSpan stuckAfter, string? stagePath,
+    public WarmRun(IGpuVendorBackend vendor, GpuInfo gpu, string exe, Game game, string workDir, WarmOptions o, IProgress<WarmProgress>? progress, TimeSpan stuckAfter, string? stagePath,
         int maxRecoveries, IReadOnlyDictionary<string, string>? env, string[]? ags = null, IProgress<string>? log = null)
     {
         _stuckAfter = stuckAfter;
@@ -154,7 +159,7 @@ sealed class WarmRun : IWarmRun
             var threads = passes != null && !passes.IsFast(pass) && o.CarefulThreads > 0 ? o.CarefulThreads : o.Threads;
             foreach (var a in new[] { workDir, Path.GetFileName(game.ExePath), "--threads", threads.ToString(),
                          "--priority", o.Priority == WarmPriority.Idle ? "idle" : "below", "--start", start.ToString(),
-                         "--stop-event", stopName, "--adapter-luid", vendor.Gpu.AdapterLuid.ToString("X16") })
+                         "--stop-event", stopName, "--adapter-luid", gpu.AdapterLuid.ToString("X16") })
                 psi.ArgumentList.Add(a);
             if (o.MemoryMB > 0) { psi.ArgumentList.Add("--memory-mb"); psi.ArgumentList.Add(o.MemoryMB.ToString()); }
             if (rtThreads > 0) { psi.ArgumentList.Add("--rt-threads"); psi.ArgumentList.Add(rtThreads.ToString()); }
@@ -176,6 +181,18 @@ sealed class WarmRun : IWarmRun
         _p = Launch(from, 0, [], []);
         Completion = Task.Run(async () =>
         {
+            try { return await Run(); }
+            catch
+            {
+                Process p;
+                lock (_lock) p = _p;
+                try { p.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }   // exited meanwhile
+                throw;
+            }
+        });
+
+        async Task<WarmResult> Run()
+        {
             Stopwatch? sampled = null;
             long growth = 0;
             long Growth()   // a directory walk for NVIDIA: not on every report
@@ -184,6 +201,7 @@ sealed class WarmRun : IWarmRun
                 return growth;
             }
             long carried = 0;   // failures the earlier processes counted (before their retry point, or in earlier passes)
+            var lastCarried = false;   // the last process's failures are in carried already
             string? note = null;
             var skip = new List<long>();
             var crashed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -204,10 +222,11 @@ sealed class WarmRun : IWarmRun
                     () => { if (lastPass || _stopping) _doneSeen.TrySetResult(); }, Whole, s => stage = s);
                 await _p.WaitForExitAsync();
                 code = _p.ExitCode;
+                lastCarried = false;
                 crashed.UnionWith(done?.Crashed ?? []);
                 if (error == null && code == 0 && done is { Event: "done", Stopped: false } && !lastPass)
                 {
-                    carried += done.Failed;
+                    (carried, lastCarried) = (carried + done.Failed, true);
                     lock (_lock)
                     {
                         if (_stopping) { betweenPasses = true; break; }
@@ -219,7 +238,7 @@ sealed class WarmRun : IWarmRun
                     continue;
                 }
                 if (done is not { Event: "retry" } r || error != null) break;
-                carried += r.Failed;
+                (carried, lastCarried) = (carried + r.Failed, true);
                 if (r.FailedItem >= 0) skip.Add(r.FailedItem);
                 skipKeys.UnionWith(r.Crashed ?? []);
                 var removed = r.Reason == "removed";
@@ -248,11 +267,11 @@ sealed class WarmRun : IWarmRun
             if (outcome == WarmOutcome.Failed)
                 error ??= code != 0 ? $"scskiller_warm exited with code {code}{(stderr.IsEmpty ? "" : ": " + string.Join(" | ", stderr.TakeLast(3)))}"
                                     : "scskiller_warm exited without a done event";
-            var failed = carried + (stopped ? 0 : last?.Failed ?? 0);
+            var failed = carried + (lastCarried ? 0 : last?.Failed ?? 0);
             return new WarmResult(outcome, Whole(last?.Done ?? from), passes?.Total ?? last?.Total ?? 0, failed, clock.Elapsed, growth,
                 Path.Combine(stage ?? Path.Combine(workDir, "stage"), "scskiller.log"), outcome == WarmOutcome.Failed ? error : null,
                 Crashed: crashed.Count > 0 ? crashed : null);
-        });
+        }
     }
 
     /// <summary>A later process's progress, as the whole warm's: its failures plus the earlier ones', with the retry or pass

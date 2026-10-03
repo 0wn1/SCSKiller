@@ -115,7 +115,7 @@ public sealed class AmdAppCache(string dxcDir, string dxDir) : IAppCache
 
     /// <summary>Bytes of these keys' files. Sizes are current even while the driver has a file mapped (it grows the file;
     /// only the write time stays put).</summary>
-    public long SizeOf(IEnumerable<string> keys) => FilesOf(keys).Sum(f => f.Length);
+    public long SizeOf(IEnumerable<string> keys) => FilesOf(keys).Sum(f => f.Exists ? f.Length : 0);   // the driver trims files at any time
 
     /// <summary>Keys of the DxcCache and DxCache files a running process with this exe file name has open now: the
     /// authoritative way to learn a game's key (profiles included).</summary>

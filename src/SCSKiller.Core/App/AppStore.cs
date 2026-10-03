@@ -27,10 +27,14 @@ public sealed class GameRecord
     public bool WarmedPerStage { get; set; }                // PlanPerStage of the plan the last complete warm replayed
     public string? PlanMiddleware { get; set; }             // MiddlewarePacks.Fingerprint when the plan was built (DLL versions + pack sizes)
     public string? PlanCommunity { get; set; }              // the community recording (object id) the plan was built with; null = none
+    public string? PlanMaps { get; set; }                   // ScsKiller.MapsFingerprint of the index the plan was built from
     public long ResumeAt { get; set; }                       // Done of a stopped warm of the current plan
     public long ResumeItems { get; set; }                    // items the stopped segments of that warm created...
     public double ResumeSeconds { get; set; }                // ...and their time: a complete warm's time and rate include them
-    public string? WarmedDriverVersion { get; set; }
+    public long ResumeFailed { get; set; }                   // ...and their failures: a resumed warm counts only its own
+    public string? ResumeGpu { get; set; }                   // ...on this driver (ScsKiller.DriverId): another one's cache lacks them; null = unknown, as another
+    public string? WarmedDriverVersion { get; set; }         // shown; earlier builds also compared it
+    public string? WarmedDriverId { get; set; }              // what staleness compares (ScsKiller.DriverId); null = an earlier build's warm
     public DateTimeOffset? WarmedAt { get; set; }
     public TimeSpan? LastWarmTime { get; set; }
     public long? LastCacheGrowthBytes { get; set; }
@@ -39,7 +43,7 @@ public sealed class GameRecord
     public long? LastWarmNeedsRecording { get; set; }        // ...of those, flagged by the community recording: only a recording here has them
     public long? LastWarmCrashed { get; set; }               // ...and items skipped because they crash the GPU driver
     public HashSet<string> CrashKeys { get; set; } = [];     // record keys of items whose create removed the D3D12 device: every warm skips them
-    public string? CrashKeysDriver { get; set; }             // the driver they crashed: a warm on another driver clears them (one retry each)
+    public string? CrashKeysDriver { get; set; }             // the driver they crashed (ScsKiller.DriverId): a warm on another driver clears them (one retry each)
     public string? WarmedIndexHash { get; set; }
     public string? WarmedExeStamp { get; set; }             // exe size + write time at the warm: a game patch changes it
     public string? WarmedGameVersion { get; set; }          // Game.Version (store build id) at the warm; preferred over the exe stamp
@@ -51,6 +55,8 @@ public sealed class GameRecord
     public Dictionary<string, string> RecorderFiles { get; set; } = [];   // file name in the exe folder -> SHA-256 we installed
     public string? RecorderExe { get; set; }                 // the game's exe while a recorder is installed: uninstall finds it without a scan
     public string? RecorderInstallDir { get; set; }          // and its install root, for the running check
+    public string? RecorderMoveFrom { get; set; }            // a recorder moving next to the game's exe: the old exe, until its folder's recording is imported and its files are gone
+    public string? RecorderMoveTo { get; set; }              // ...and the game's exe it moves next to: the uninstall hook's running check covers both
     // null = not migrated: the first reconcile makes an installed recorder of ours On (the user put it there), else Default
     public RecorderOverride? Recorder { get; set; }
     public bool RecordAlongsideMod { get; set; }             // opt-in: install the recorder where a mod's d3d12.dll is, chained to it

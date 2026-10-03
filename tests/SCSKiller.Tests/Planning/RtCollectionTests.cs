@@ -207,6 +207,36 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         Assert.Equal(0, Planner.SkippedIn(Path.Combine(dir, "work")));
     }
 
+    /// <summary>A ray generation library no recorded state object has, its hit / miss libraries all recorded (so no 'Y' of
+    /// their own): its collections take the recorded collections' payloads.</summary>
+    [Fact]
+    public void RayGenerationCollectionsTakeTheRecordedPayloads()
+    {
+        var rayGen = Lib("rec-raygen");
+        var rule = new RtCollections.Rule(Hash("g"), 4, 1, 0, 8, true);
+        var dir = Ff7.TempDir("rt-recorded-payloads");
+        var recording = Path.Combine(dir, "recording.db");
+        using (var f = File.Create(recording)) Write(f, 'R', RtCollections.Collection(HitLib, Hash("rec-hit"), Hash("g"), Hash("lr"), Hash("lo"), 64, 8, 1, 4)!);
+        var plan = new Plan("t", "t", "PCD3D_SM5", "nvidia-1", new PlanStats(0, 1, 0, 0, true), Path.Combine(dir, "plan.bin"));
+        PlanFile.Write(plan, [new('Y', RtCollections.Item(rayGen.Sha1, rule.GlobalRs, Hash("lr"), Hash("lo"), rule))]);
+        new Planner().Materialize(plan, Ff7.Game, Ue427, new Shaders(new() { [rayGen.Sha1] = RayGenLib }), new Recording(recording), Path.Combine(dir, "work"), CancellationToken.None);
+        var made = Read(Path.Combine(dir, "work", "scskiller_gen.db")).Where(r => r.Tag == 'R').Select(RtCollections.Read).ToList();
+        Assert.Equal([(rayGen.Sha1, 64u)], made.Select(c => (c!.Library, c.Payload)));
+    }
+
+    /// <summary>A library with several functions of a kind (UE compiles one per library; a FromSoftware library may not):
+    /// each export its own name, a hit group per closest hit, and the collection still reads as UE-shaped.</summary>
+    [Fact]
+    public void SeveralFunctionsOfAKindGetTheirOwnExportNames()
+    {
+        var lib = Library((11, "MissA", 16), (11, "MissB", 16), (10, "HitA", 16), (10, "HitB", 16), (9, "AnyA", 16));
+        var c = RtCollections.Collection(lib, Hash("two-of-a-kind"), Hash("g"), Hash("lr"), Hash("lo"), 0, 8, 1, 4, "0123456789abcdef")!;
+        var text = System.Text.Encoding.Unicode.GetString(c);
+        foreach (var n in new[] { "Miss_0123456789abcdef_1", "CHS_0123456789abcdef_1", "HitGroup_0123456789abcdef_1" }) Assert.Contains(n, text);
+        Assert.DoesNotContain("AHS_0123456789abcdef_1", text);
+        Assert.Equal("0123456789abcdef", RtCollections.Read(new Rec('R', c))!.NameHash);
+    }
+
     /// <summary>The NVAPI state a recording's collections were created with ('N') is learned when (nearly) all carry one, goes
     /// into each 'Y', and Materialize writes an 'N' (thread scope) for every collection it makes from that 'Y'.</summary>
     [Fact]

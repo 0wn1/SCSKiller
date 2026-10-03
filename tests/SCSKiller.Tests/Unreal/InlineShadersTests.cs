@@ -151,4 +151,16 @@ public class InlineShadersTests(ITestOutputHelper output)
         Assert.Equal(version, e.Version);
         if (e.Encrypted) Assert.Contains("exe can't be read", notes);
     }
+
+    /// <summary>A 4.2x 'Z' entry is bounded like the others (64 MiB, 64x its stored size): a stream that inflates past that
+    /// isn't decoded, whatever it holds.</summary>
+    [Fact]
+    public void AZlibEntryThatInflatesPastTheBoundIsNotDecoded()
+    {
+        var vs = Code("float4 main() : SV_Position { return 0; }", "vs_5_0", 0, 0);
+        var ok = Zlib(vs);
+        Assert.NotNull(InlineShaders.Decode([.. I32(ok.Length), .. ok], 0, 'Z'));
+        var bomb = Zlib([.. vs, .. new byte[4 << 20]]);   // ~4 KB stored, 4 MB out
+        Assert.Null(InlineShaders.Decode([.. I32(bomb.Length), .. bomb], 0, 'Z'));
+    }
 }

@@ -14,7 +14,10 @@ public class NewShadersTests
             with { RecordedSinceWarm = recorded, NewPipelines = planNew, Playing = playing };
 
     static (IReadOnlyList<GameState> Due, Dictionary<string, string> Notified) Due(Dictionary<string, string> notified, params GameState[] games) =>
-        NewShaders.Due(games, [], notified, Driver);
+        NewShaders.Due(games, [], notified, DriverStale(games));
+
+    // as ScsKiller.DriverStaleGames gives them: warmed for another driver
+    static HashSet<string> DriverStale(GameState[] games) => games.Where(s => s.WarmedDriverVersion != Driver).Select(s => s.Game.Id).ToHashSet();
 
     [Fact]
     public void Only_compiled_games_with_something_new_on_this_driver_are_told_about()
@@ -71,7 +74,7 @@ public class NewShadersTests
             new("plan-check", QueueStage.Waiting, null, null, PlanCheck: true),   // a plan rebuild compiles nothing
             new("done", QueueStage.Done, null, null),
         ];
-        var (due, notified) = NewShaders.Due(games, queue, new Dictionary<string, string>(), Driver);
+        var (due, notified) = NewShaders.Due(games, queue, new Dictionary<string, string>(), DriverStale(games));
         Assert.Equal(["plan-check", "done"], due.Select(s => s.Game.Id));
         Assert.Equal(["plan-check", "done"], notified.Keys);
     }

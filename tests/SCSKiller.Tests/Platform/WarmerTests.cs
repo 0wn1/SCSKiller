@@ -45,7 +45,7 @@ public class WarmerTests : IDisposable
             Say '{"event":"done","done":7,"total":7,"failed":1,"seconds":0.1,"stopped":false}'; exit 0
         }
         if ($mode -eq 'nodone') { Say '{"event":"progress","done":10,"total":1000,"failed":0,"rate":5}'; exit 0 }
-        if ($mode -eq 'stuck') { while ($true) { Say '{"event":"progress","done":7,"total":1000,"failed":0,"rate":5}'; Start-Sleep -Milliseconds 100 } }   # deaf to the stop event
+        if ($mode -eq 'stuck') { Set-Content (Join-Path $work 'pid.tmp') $PID; Move-Item (Join-Path $work 'pid.tmp') (Join-Path $work 'pid.txt'); while ($true) { Say '{"event":"progress","done":7,"total":1000,"failed":0,"rate":5}'; Start-Sleep -Milliseconds 100 } }   # deaf to the stop event
         if ($mode -eq 'retrystuck') {   # a retry, then the second process is deaf to the stop event
             if ([array]::IndexOf($args, '--rt-threads') -lt 0) { Say '{"event":"retry","from":600,"rtThreads":8,"failedItem":-1,"done":600,"total":1000,"failed":1,"seconds":1.0}'; exit 3 }
             Set-Content (Join-Path $work 'pid.tmp') $PID; Move-Item (Join-Path $work 'pid.tmp') (Join-Path $work 'pid.txt')   # appears whole
@@ -67,7 +67,7 @@ public class WarmerTests : IDisposable
             if ($iso -ne '611') { Say '{"event":"retry","from":601,"rtThreads":4,"failedItem":-1,"done":601,"total":1000,"failed":0,"seconds":1.0,"reason":"removed","crashed":["00000000000000000000000000000000000000aa"],"isolate":[611]}'; exit 3 }
             Say '{"event":"done","done":1000,"total":1000,"failed":0,"seconds":1.0,"stopped":false,"crashed":["00000000000000000000000000000000000000AA","00000000000000000000000000000000000000bb"]}'; exit 0
         }
-        if ($mode -eq 'removedloop') { Say '{"event":"retry","from":10,"rtThreads":0,"failedItem":-1,"done":10,"total":1000,"failed":0,"seconds":1.0,"reason":"removed","crashed":[],"isolate":[10,11]}'; exit 3 }
+        if ($mode -eq 'removedloop') { Say '{"event":"retry","from":10,"rtThreads":0,"failedItem":-1,"done":10,"total":1000,"failed":1,"seconds":1.0,"reason":"removed","crashed":[],"isolate":[10,11]}'; exit 3 }
         $h = [System.Threading.EventWaitHandle]::OpenExisting($ev); $done = 0
         while (-not $h.WaitOne(0)) { $done++; Say ('{"event":"progress","done":' + $done + ',"total":1000,"failed":0,"rate":20}'); Start-Sleep -Milliseconds 50 }
         Say ('{"event":"done","done":' + $done + ',"total":1000,"failed":0,"seconds":1.0,"stopped":true}')
@@ -144,6 +144,15 @@ public class WarmerTests : IDisposable
         Assert.Equal(["--threads", "7", "--priority", "idle", "--start", "42", "--stop-event"], a[2..9]);
         Assert.Equal(["--adapter-luid", "000000001234ABCD", "--memory-mb", "6144"], a[10..14]);
         Assert.Equal(["--stage-path", @"nowhere\Binaries\Win64\Fake-Win64-Shipping.exe"], a[14..]);
+    }
+
+    [Fact]
+    public async Task A_run_launches_on_the_adapter_it_was_started_for()
+    {
+        var work = Work("complete");
+        await new Warmer(Vendor, _exe).Start(Game, work, new WarmOptions(1, WarmPriority.Idle), null, Vendor.Gpu with { AdapterLuid = 0xABC }).Completion;
+        var a = File.ReadAllLines(Path.Combine(work, "args.txt"));
+        Assert.Equal("0000000000000ABC", a[Array.IndexOf(a, "--adapter-luid") + 1]);
     }
 
     [Theory]
@@ -464,7 +473,31 @@ public class WarmerTests : IDisposable
         var r = await new Warmer(Vendor, _exe) { MaxRecoveries = 2 }.Start(Game, work, new WarmOptions(4, WarmPriority.BelowNormal), null).Completion.WaitAsync(Patience);
         Assert.Equal(WarmOutcome.Failed, r.Outcome);
         Assert.Equal("the GPU driver crashed 3 times in this compile (the D3D12 device was removed); stopped", r.Error);
-        Assert.Equal(10, r.Done);
+        Assert.Equal((10L, 3L), (r.Done, r.Failed));   // one failure per process, the last one's counted once
+    }
+
+    /// <summary>An exception while the warm is watched (the cache folder reset under a progress sample) ends its process
+    /// instead of leaving it compiling.</summary>
+    [Fact]
+    public async Task A_failure_while_watching_a_warm_ends_its_process()
+    {
+        var work = Work("stuck");
+        var run = new Warmer(new FailingCache(), _exe).Start(Game, work, new WarmOptions(1, WarmPriority.BelowNormal), new Counter());
+        await Assert.ThrowsAsync<DirectoryNotFoundException>(() => run.Completion.WaitAsync(Patience));
+        var pid = int.Parse(File.ReadAllText(Path.Combine(work, "pid.txt")).Trim());
+        try { Assert.True(Process.GetProcessById(pid).WaitForExit(Patience)); }
+        catch (ArgumentException) { }   // already gone
+    }
+
+    sealed class FailingCache : IGpuVendorBackend
+    {
+        int calls;
+        public GpuVendor Vendor => GpuVendor.Unknown;
+        public GpuInfo Gpu { get; } = new(GpuVendor.Unknown, "Fake GPU", "1.0", 1, 0);
+        public VendorCaps Caps { get; } = new("fake", true, true, false);
+        public CacheUsage GetCacheUsage() => Interlocked.Increment(ref calls) == 1 ? new("", 0, true) : throw new DirectoryNotFoundException("cache folder gone");
+        public CacheLimit? GetCacheLimit() => null;
+        public void SetCacheLimit(CacheLimit limit) => throw new NotSupportedException();
     }
 
 

@@ -115,6 +115,7 @@ public static class Souls
         switch (codec)
         {
             case "DFLT":
+                if (size < 0 || size > 1032L * data.Length) throw new InvalidDataException("DCX size past what its deflate data can hold"); // deflate expands at most 1032:1
                 output = new byte[size];
                 using (var z = new ZLibStream(new MemoryStream(data.ToArray()), CompressionMode.Decompress)) z.ReadExactly(output);
                 return output;

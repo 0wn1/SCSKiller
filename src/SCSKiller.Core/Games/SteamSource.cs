@@ -105,15 +105,16 @@ public sealed class SteamSource(string? steamRoot = null) : IGameSource
     }
 
     /// <summary>A binary KeyValues object up to its end marker: nested objects and strings kept, numbers skipped.</summary>
-    static Dictionary<string, object> Object(BinaryReader r, string[]? keys)
+    static Dictionary<string, object> Object(BinaryReader r, string[]? keys, int depth = 0)
     {
+        if (depth > 64) throw new InvalidDataException("KeyValues nested deeper than 64");
         var o = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
         for (byte t; (t = r.ReadByte()) != 8;)
         {
             var key = keys == null ? CString(r) : keys[r.ReadInt32()];
             switch (t)
             {
-                case 0: o[key] = Object(r, keys); break;
+                case 0: o[key] = Object(r, keys, depth + 1); break;
                 case 1: o[key] = CString(r); break;
                 case 2 or 3 or 4 or 6: r.ReadInt32(); break;   // int, float, pointer, color
                 case 7 or 10: r.ReadInt64(); break;              // uint64, int64

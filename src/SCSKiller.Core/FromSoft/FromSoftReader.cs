@@ -239,13 +239,14 @@ public sealed class FromSoftReader(string dataDir, Func<string, string?>? downlo
     }
 
     /// <summary>DCX -> its content, BND4 -> each file ("binder|file"), anything else: the containers carved from it.</summary>
-    static void Visit(string name, byte[] b, Action<string, byte[]> found, CancellationToken ct)
+    static void Visit(string name, byte[] b, Action<string, byte[]> found, CancellationToken ct, int depth = 0)
     {
         ct.ThrowIfCancellationRequested();
-        if (Souls.IsDcx(b)) { Visit(name, Souls.Dcx(b), found, ct); return; }
+        if (depth > 8) throw new InvalidDataException($"{name}: binders nested deeper than 8");
+        if (Souls.IsDcx(b)) { Visit(name, Souls.Dcx(b), found, ct, depth + 1); return; }
         if (Souls.IsBnd4(b))
         {
-            foreach (var (file, data) in Souls.Bnd4(b)) Visit($"{name}|{file}", data, found, ct);
+            foreach (var (file, data) in Souls.Bnd4(b)) Visit($"{name}|{file}", data, found, ct, depth + 1);
             return;
         }
         foreach (var (_, c) in Dxbc.Containers(b)) found(name, c);

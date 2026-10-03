@@ -83,6 +83,41 @@ public class StateObjectTests
         Assert.Equal(new[] { Lib.Sha, Rs.Sha, Lrs.Sha, Rg.Sha }.Order(), Rehydrate.References([c1, Link(c1), add]).Order()); // blobs, never record keys
     }
 
+    /// <summary>A long AddToStateObject chain splits into uploads in one walk of it (no recursion as deep as the chain, no
+    /// closure rebuilt per link); the links whose closure is over an upload's records are left out.</summary>
+    [Fact]
+    public void ChunksTakeALongAdditionChain()
+    {
+        var chain = new List<PsoDb.Rec> { new('R', new Body().U32(3).U32(1).U32(5).H(Lib.Sha).U32(0).Bytes) };
+        while (chain.Count < Sharing.ChunkRecords + 10_000) chain.Add(Add(chain[^1], Lib.Sha));
+        var whole = HashOnly.Canonical(chain, local: false, out _);
+        var chunk = Assert.Single(HashOnly.Chunks(whole, Sharing.ChunkRecords, Sharing.ChunkRaw, out var skipped));
+        Assert.Equal(10_000, skipped);
+        Assert.Equal(whole.Take(Sharing.ChunkRecords).Select(r => r.Key), chunk.Select(r => r.Key));
+    }
+
+    /// <summary>A chunk's bytes count the root signatures its records name, not the recording's others; a PSO that is over
+    /// the bytes with its own is left out.</summary>
+    [Fact]
+    public void ChunkBytesCountTheirOwnRootSignatures()
+    {
+        var recs = new List<PsoDb.Rec>();
+        for (var i = 0u; i < 3; i++)
+        {
+            var rs = RootSig.Serialize(new RootSig.Desc(0, [.. Enumerable.Range(0, 64).Select(k => new uint[] { 1, 0, (uint)k, i, 1 })]), []);
+            var sha = PsoDb.Hex(SHA1.HashData(rs));
+            recs.Add(new('B', [.. Convert.FromHexString(sha), .. rs]));
+            recs.Add(new('C', PsoDb.Compute(sha, new string((char)('a' + i), 40))));
+        }
+        var whole = HashOnly.Canonical(recs, local: false, out _);
+        var one = 5L + whole.First(r => r.Tag == 'B').Payload.Length + 5L + whole.First(r => r.Tag == 'C').Payload.Length;
+        var chunks = HashOnly.Chunks(whole, 100, one);
+        Assert.Equal(3, chunks.Count);
+        Assert.All(chunks, c => Assert.Equal("BC", string.Concat(c.Select(r => r.Tag))));
+        Assert.Empty(HashOnly.Chunks(whole, 100, one - 1, out var skipped));
+        Assert.Equal(3, skipped);
+    }
+
     sealed class Install(params (string Sha, byte[] Bytes)[] blobs) : IEngineReader
     {
         public EngineInfo? Detect(Game game) => Engine;

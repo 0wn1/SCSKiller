@@ -186,7 +186,9 @@ public sealed class Account
 
     async Task NewAccessTokenAsync(CancellationToken ct)
     {
-        using var r = await SendAsync(HttpMethod.Post, "v1/token", deviceToken, ct);
+        var token = deviceToken;
+        using var r = await SendAsync(HttpMethod.Post, "v1/token", token, ct);
+        if (deviceToken != token) return;   // signed out, or in as another device, meanwhile: the answer is about a device no longer used
         if (r.StatusCode == HttpStatusCode.Unauthorized)   // revoked: removed from the account, 6th device, or 90 days unused (§2.4, §2.5)
         {
             Forget();

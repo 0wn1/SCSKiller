@@ -48,6 +48,7 @@ Everything vendor- or engine-specific sits behind one interface: a new GPU vendo
 | `src/SCSKiller.Core/Unity/` | `IEngineReader` for Unity |
 | `src/SCSKiller.Core/FromSoft/` | `IEngineReader` for FromSoftware games |
 | `src/SCSKiller.Core/ReEngine/` | `IEngineReader` for Capcom's RE Engine |
+| `src/SCSKiller.Core/RedEngine/` | `IEngineReader` for REDengine 3 (The Witcher 3, DX12) |
 | `src/SCSKiller.Core/Carved/` | `IEngineReader` for any game that ships raw DXBC/DXIL containers in its files |
 | `src/SCSKiller.Core/Planning/` | The planner, root-signature rules, the plan and recording formats, materialization |
 | `src/SCSKiller.Core/Vendors/` | NVIDIA and AMD backends and their per-application cache (`IAppCache`) |
@@ -72,7 +73,7 @@ Everything lives under `%LOCALAPPDATA%\SCSKiller\`:
     holder changed since loading the record, onto the stored one re-read under a lock across processes (sets merge
     by what was added and removed), so a long compile never puts back what a game's exit saved meanwhile;
   - `*.lock`: the locks the app, the command line and scheduled tasks take turns on, in any session (the file opened
-    exclusively), for `state.json` and `recording.db`;
+    exclusively), for `state.json` and `recording.db`, and `compile.lock`, held for a whole compile of the game;
   - `plan.bin`: the plan (hash-only); `plan-<hash>.keys`: its planner-made pipelines; `warm-<hash>.keys`: the inputs of
     the last complete warm (sorted 20-byte record keys; named by a hash of their contents and never rewritten, so
     `state.json`, which names the current ones, always names what it was saved with);
@@ -81,7 +82,7 @@ Everything lives under `%LOCALAPPDATA%\SCSKiller\`:
     [Recorder](#recorder));
   - `community.db`: the community database's hash-only recording for the game's build, merged with `recording.db` in
     `work\` when a compile plans;
-  - `work\`: the materialized plan, deleted after a warm;
+  - `work\`: the materialized plan, deleted after a warm; `warm-failed.log`: the last failed warm's log, kept from it;
   - keys found for the game, kept locally only: `aes.key` (an Unreal pak key), `archive.keys` (FromSoftware archive
     keys, with the SHA-256 of the exe they came from), `pak.modulus` (RE Engine table key);
   - `inline.idx`: for an Unreal game without shader libraries, where each shader sits in its package.
@@ -118,6 +119,7 @@ pipelines, not taken from documentation. `VendorCaps` holds the result per vendo
   (observed, not derivable). `fc52` is the shader cache shared with D3D11, `0002` is D3D12, `c54e` holds ray tracing
   state objects. The driver keeps them open while the device lives, which is how `NvidiaAppCache` learns a game's keys.
   Files are pre-sized in powers of two, so on-disk size is an upper bound; no size cap or eviction shows up to 12 GB.
+  A warmed game none of whose warm's keys has a file left (a shader cache reset) is Stale (`GameRecord.WarmedKeys`).
 - **A second process with the same name running at the same time gets its own files** (key + 1). So a game and its warm
   must never run together: the queue doesn't start a warm while the game runs, and stops a running warm gracefully when
   the game starts, resuming from its `done` afterwards.
@@ -251,13 +253,21 @@ open game files read-only and never launch or attach to the game.
   serialized layout. Windows builds ship DXBC for the `d3d11` platform, which both the D3D11 and D3D12 players
   run. The API comes from `Player.log` of the last run, else the build's API list. Unity builds root signatures at run
   time, so D3D12 Unity games need a recording.
-- **FromSoftware** (`FromSoft/`): BHD5/BDT archives, DCX (zlib, Oodle, zstd) and BND3/BND4 binders. The archives'
+- **FromSoftware** (`FromSoft/`): BHD5/BDT archives, DCX (zlib, Oodle, zstd) and BND4 binders; a BND3 binder is only
+  carved for raw containers, so its compressed entries yield no shaders. The archives'
   public RSA keys are read from the game's exe (`SoulsKeys`), else downloaded from a pinned commit of UXM, and kept in
   `archive.keys`. Oodle comes from CUE4Parse's download, never from the game's DLL.
 - **RE Engine** (`ReEngine/`): KPKA packages with encrypted entry tables. The table key needs the game's public RSA
   modulus, which isn't on disk in the clear; it's downloaded from a pinned commit of ree-pak-rs, or given by hand in
   `pak.modulus`. Shaders are in master material files, found by their magic since file names are hashes. RE Engine
   builds root signatures at run time, so D3D12 games need a recording.
+- **REDengine 3** (`RedEngine/`): The Witcher 3's DX12 caches in `content\content0`. `shaderdx12_0.cache` holds the
+  material shaders (zlib) and the techniques, each naming one pipeline's shaders by key: every distinct technique is an
+  exact shader map (438,220 techniques, 60,674 distinct pipelines). `staticshaderDx12_0.cache` holds the engine's own
+  shaders, one pool paired by linkage. A technique plans only when each key is a shader of its slot's stage and the set
+  is one the root signatures are confirmed for; its compute shader is a pipeline of its own. Counts and lengths are
+  bounded by the bytes they need. A cache that doesn't read whole, or whose first techniques name no usable pipeline,
+  isn't detected: the carver gets the game under its own engine. `psodx12.cache` names material shaders by an id neither cache holds, so it isn't read.
 - **Carved** (`Carved/`): any other game that ships raw DXBC/DXIL containers. Files are carved, each container
   validated and reflected; a file of pipeline records becomes one shader map per record.
 
@@ -278,6 +288,10 @@ name:
 - unbounded bindless SRV ranges in dedicated spaces, which get one table each (`RootSig.BindlessTables`,
   `RootSig.SpaceBindlessTables`);
 - a raised MAX_SRVS when a shader binds more SRVs than the stock table (`RootSig.MaxSrvsFor`).
+
+REDengine 3 has three root signatures, chosen by the pipeline's stages (`RootSig.Rule.Red3`): compute, VS (+ PS), and with
+a GS, HS or DS a wider one; The Witcher 3's recording uses them for all 586 PSOs of its own shaders. Only the stage sets
+it confirms get one (`RootSig.Red3Validated`); any other is left out.
 
 `RootSig.Verified` holds for the versions and forks a real game has confirmed (`ConfirmedEngines`:
 `confirmed-engines.json`, embedded, plus the entries of the copy the server serves as a content file); any other gets
@@ -428,10 +442,21 @@ The recorder is `proxy/`'s `d3d12.dll`, placed next to the game's exe with a `sc
   be written), or, while the game runs or holds the proxy, as soon as it exits; a failed install's leftovers go the
   same way. Removal deletes exactly the files installed, checked by hash, then the recorder's data files as the
   uninstall below does; the recording is imported first. In a folder with no recorder of ours (no proxy, no
-  `RecorderExe`), every scan deletes those data files if any are left, unless the game runs.
+  `RecorderExe`), every scan deletes those data files if any are left, unless the game runs. A recorder whose
+  `RecorderExe` is in another folder than the game's exe (one installed next to a launcher discovery took for the
+  game) is removed from there the same way, then installed next to the game's exe; the last session's csv, log and
+  frame log move along (of two with the same name, the newer stays), so the game page keeps its report. While it moves,
+  every running check covers both exe folders and the install root, the uninstall hook's too; both stay recorded
+  (`GameRecord.RecorderMoveFrom`, `RecorderMoveTo`) until the old folder's recording is imported and its files are gone
+  (a failed import or merge keeps them, and the next reconcile tries again; an anti-cheat removal records them too, and
+  then nothing of ours goes into the new folder), and an anti-cheat removal
+  takes the recorder out where the record says it is.
 - **Uninstall** (Velopack's uninstall hook, `ScsKiller.RemoveAllRecorders`): removes the recorder the same way from
   every folder a `GameRecord.RecorderExe` names, then the recorder's `scskiller.db` once merged into `recording.db`,
-  and its csv, frame log, log and keys file. A running game's folder is left, and `recorders.log` says so.
+  and its csv, frame log, log and keys file. A running game's folder is left, and `recorders.log` says so: running is
+  also a process named like any exe in the install's whole tree (its names read once per game, the anti-cheat scan's
+  entry cap; a tree it can't read whole, or by the hook's deadline, counts as running), since the record's folders may
+  be another exe's than the game's. The running processes are asked again before each folder's writes.
 - **Recording alongside a mod**: a foreign `d3d12.dll` (ReShade or another wrapper) is chained only when the user turns
   that on for the game. The mod is renamed to `d3d12.scskiller-next.dll` (bytes untouched, its SHA-256 saved), and the
   recorder loads it via `next=` in `scskiller.ini`. The recorder hooks both the device the mod returns and the system

@@ -134,6 +134,8 @@ public static class UnityFiles
             {
                 int us = (int)bi.U32(), cs = (int)bi.U32(), bf = bi.U16();
                 if (us < 0 || cs < 0) throw new InvalidDataException("UnityFS block over 2 GB");
+                if (c + cs > length) throw new InvalidDataException("UnityFS block past the end of the file");
+                if ((bf & 0x3F) is 2 or 3 && us > 256L * cs + 64) throw new InvalidDataException("UnityFS block larger than LZ4 can expand to");
                 blocks[i] = (u, us, c, cs, bf & 0x3F);
                 u += us; c += cs;
             }
@@ -172,7 +174,11 @@ public static class UnityFiles
             return cache[i] = Decompress(src, us, comp);
         }
 
-        public void Dispose() => file.Dispose();
+        public void Dispose()
+        {
+            file.Dispose();
+            cache.Clear();
+        }
     }
 
     /// <summary>UnityFS compression: 0 none, 1 LZMA (5 property bytes, then the raw stream), 2 LZ4, 3 LZ4HC.</summary>

@@ -318,4 +318,31 @@ public class FromSoftFormatTests
         foreach (var x in stored) w.Write(x);
         return b.ToArray();
     }
+
+    /// <summary>A binder whose one file is the binder itself: refused, not a stack overflow that ends the process.</summary>
+    [Fact]
+    public void ASelfReferentialBinderIsRefused()
+    {
+        var dir = Ff7.TempDir("fromsoft-self");
+        File.WriteAllBytes(Path.Combine(dir, "DarkSoulsRemastered.exe"), []);
+        Directory.CreateDirectory(Path.Combine(dir, "shader"));
+        var bnd = Bnd4([("A.vpo", new byte[16], false)], false);
+        BinaryPrimitives.WriteInt64LittleEndian(bnd.AsSpan(0x40 + 8), bnd.Length);   // the file's size: the whole binder
+        BinaryPrimitives.WriteInt32LittleEndian(bnd.AsSpan(0x40 + 24), 0);           // its offset: the binder's start
+        File.WriteAllBytes(Path.Combine(dir, "shader", "A_DX11.shaderbnd.dcx"), bnd);
+        var game = new Game("test:dsr-self", "dsr", Store.Steam, dir, Path.Combine(dir, "DarkSoulsRemastered.exe"));
+        Assert.Contains("nested", Assert.Throws<InvalidDataException>(() => new FromSoftReader(Path.Combine(dir, "data")).Detect(game)).Message);
+    }
+
+    /// <summary>A DFLT DCX claiming 1 GiB over one byte of data is refused before its output is allocated.</summary>
+    [Fact]
+    public void ADcxClaimingMoreThanItsDataCanHoldIsRefusedWithoutAllocatingIt()
+    {
+        var dcx = Dflt(new byte[100]);
+        BinaryPrimitives.WriteInt32BigEndian(dcx.AsSpan(0x1C), 1 << 30);
+        BinaryPrimitives.WriteInt32BigEndian(dcx.AsSpan(0x20), 1);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        Assert.Throws<InvalidDataException>(() => Souls.Dcx(dcx.AsSpan(0, 0x4C + 1)));
+        Assert.True(GC.GetAllocatedBytesForCurrentThread() - before < 16 << 20);
+    }
 }

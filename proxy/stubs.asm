@@ -15,7 +15,6 @@ STUB D3D12CreateVersionedRootSignatureDeserializer
 STUB D3D12DeviceRemovedExtendedData
 STUB D3D12EnableExperimentalFeatures
 STUB D3D12GetDebugInterface
-STUB D3D12GetInterface
 STUB D3D12PIXEventsReplaceBlock
 STUB D3D12PIXGetThreadInfo
 STUB D3D12PIXNotifyWakeFromFenceSignal

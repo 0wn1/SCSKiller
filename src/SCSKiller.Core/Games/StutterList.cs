@@ -40,7 +40,7 @@ public sealed class StutterList
     public static StutterList? TryParse(string json) =>
         ContentFile.Read<ListFile>(json) is { Games.Length: >= 1 and <= MaxGames } f && (f.About == null || Text(f.About, 1000)) && f.Games.All(Valid) ? new(f) : null;
 
-    static bool Valid(Entry e) =>
+    static bool Valid(Entry? e) => e is not null &&
         Text(e.Name, 100) && Key(e.Name).Length > 0 && Text(e.Reason, 300)
         && e.Ids is { Length: <= 8 } && e.Ids.All(IsId)
         && e.Severity is "severe" or "moderate"

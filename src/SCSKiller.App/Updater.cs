@@ -23,6 +23,7 @@ public static class Updater
     static volatile Download? ready;   // one reference: the UI reads it whole while a check replaces it
     static Timer? timer;
     static int failures;   // consecutive checks that couldn't reach the feed
+    static long retryAt;   // a 429's Retry-After, on Environment.TickCount64: no check before (a clock change doesn't move it)
 
     /// <summary>Raised on any thread after <see cref="Ready"/>, <see cref="Checking"/> or <see cref="Problem"/> changed.</summary>
     public static event Action? Changed;
@@ -138,21 +139,30 @@ public static class Updater
     }
 
     /// <summary>Checks the effective channel's signed feed and downloads a newer version. <paramref name="backToStable"/>:
-    /// "Go back to stable now", the stable feed with a downgrade allowed once.</summary>
-    public static async Task CheckAsync(bool backToStable = false)
+    /// "Go back to stable now", the stable feed with a downgrade allowed once. Not <paramref name="download"/>: a newer
+    /// version is made ready only when its package is already on disk.</summary>
+    public static async Task CheckAsync(bool backToStable = false, bool download = true)
     {
-        if (!Installed || !await One.WaitAsync(backToStable ? Timeout.InfiniteTimeSpan : TimeSpan.Zero)) return;   // the user's click waits for a running check
+        if (!Installed || Environment.TickCount64 < Volatile.Read(ref retryAt)) return;
+        if (!await One.WaitAsync(backToStable ? Timeout.InfiniteTimeSpan : TimeSpan.Zero)) return;   // the user's click waits for a running check
+        if (Environment.TickCount64 < Volatile.Read(ref retryAt))   // the check it waited for got a 429
+        {
+            One.Release();
+            return;
+        }
         (Checking, Problem) = (true, null);
         Changed?.Invoke();
         try
         {
-            await App.Account.GetAccessTokenAsync();   // reads the entitlements
+            // reads the entitlements; stable's feed is on GitHub and needs no token, so a backend that's down mustn't stop it
+            try { await App.Account.GetAccessTokenAsync(); }
+            catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException or AccountException) { }
             var channel = backToStable ? UpdateChannels.Stable : Chosen();
             if (ready?.Channel != channel) ready = null;   // another channel's download, even if this check fails
             var m = Manager(channel, backToStable);
             var found = await m.CheckForUpdatesAsync();
             failures = 0;
-            if (found is { } info)
+            if (found is { } info && (download || await m.OnDisk(info.TargetFullRelease)))
             {
                 await m.DownloadUpdatesAsync(info);
                 if (channel == Chosen()) ready = new(m, info.TargetFullRelease, channel);   // the choice may have changed meanwhile
@@ -253,7 +263,26 @@ public static class Updater
     {
         static readonly HttpClient Http = new(RouteFailover.Default, disposeHandler: false) { Timeout = Timeout.InfiniteTimeSpan };
 
+        /// <summary>The channel's feed, plus the full packages of the channels after it (§4.1): their own feeds, read here
+        /// too, so a release published after this channel's last feed (a stable fix, a beta promoted) still reaches it. A
+        /// later feed that can't be fetched is left out; one that fails its signature fails the check.</summary>
         public async Task<VelopackAssetFeed> GetReleaseFeed(IVelopackLogger logger, string? appId, string channel, Guid? stagingId = null, VelopackAsset? latestLocalRelease = null)
+        {
+            VelopackAssetFeed parsed;
+            try { parsed = await Signed(channel); }
+            catch (HttpRequestException e) when (e.StatusCode == System.Net.HttpStatusCode.NotFound && channel != UpdateChannels.Stable) { parsed = new() { Assets = [] }; }   // none yet
+            foreach (var later in UpdateChannels.All.TakeWhile(c => c != channel))
+            {
+                VelopackAssetFeed more;
+                try { more = await Signed(later); }
+                catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException or InvalidOperationException or AccountException) { continue; }
+                var have = parsed.Assets.Select(a => a.FileName).ToHashSet();
+                parsed.Assets = [.. parsed.Assets, .. more.Assets.Where(a => a.Type == VelopackAssetType.Full && !have.Contains(a.FileName))];
+            }
+            return parsed;
+        }
+
+        static async Task<VelopackAssetFeed> Signed(string channel)
         {
             var name = $"releases.{channel}.json";
             var feed = await GetAsync(UpdateFeeds.Feed(channel, name), channel);
@@ -273,6 +302,7 @@ public static class Updater
             headers.CancelAfter(TimeSpan.FromMinutes(1));
             using var r = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, headers.Token);
             headers.CancelAfter(Timeout.InfiniteTimeSpan);   // the body has its own stall limit
+            Limited(r);
             r.EnsureSuccessStatusCode();
             await using var file = File.Create(localFile);
             await using var body = await r.Content.ReadAsStreamAsync(ct);
@@ -284,8 +314,18 @@ public static class Updater
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(1));
             using var request = await RequestAsync(url, channel);
             using var r = await Http.SendAsync(request, cts.Token);
+            Limited(r);
             r.EnsureSuccessStatusCode();
             return await r.Content.ReadAsByteArrayAsync(cts.Token);
+        }
+
+        static void Limited(HttpResponseMessage r)
+        {
+            if (r.StatusCode != System.Net.HttpStatusCode.TooManyRequests) return;
+            var wait = r.Headers.RetryAfter is { Delta: { } d } ? d : r.Headers.RetryAfter?.Date - DateTimeOffset.UtcNow ?? TimeSpan.FromHours(1);
+            // the edge's longest window is a day: a larger or negative value is not believed
+            wait = wait < TimeSpan.Zero ? TimeSpan.Zero : wait > TimeSpan.FromDays(1) ? TimeSpan.FromDays(1) : wait;
+            Volatile.Write(ref retryAt, Environment.TickCount64 + (long)wait.TotalMilliseconds);
         }
 
         // The edge's channels need the access token; GitHub (stable) gets none.

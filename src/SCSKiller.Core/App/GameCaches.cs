@@ -36,12 +36,12 @@ public static class D3DSCache
                 using var s = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 var bytes = new byte[s.Length];
                 s.ReadExactly(bytes);
-                foreach (Match m in WalExe.Matches(Encoding.Latin1.GetString(bytes))) paths.Add(m.Value);
+                foreach (Match m in WalExe.Matches(Encoding.UTF8.GetString(bytes))) paths.Add(m.Value);   // SQLite text is UTF-8
             }
         return paths;
     }
 
-    static readonly Regex WalExe = new(@"[A-Za-z]:\\[ -~]{3,}?\.[Ee][Xx][Ee]");
+    static readonly Regex WalExe = new(@"[A-Za-z]:\\[^\x00-\x1F\x7F�]{3,}?\.[Ee][Xx][Ee]");   // U+FFFD: a byte that isn't UTF-8 text ends a path
 
     /// <summary>The runtime's files in a cache folder, nothing else it may hold: <c>&lt;GUID&gt;[_VEN_..&amp;DEV_..&amp;SUBSYS_..&amp;REV_..]</c>
     /// with .dxcache (and its -shm, -wal) or the older .idx, .val, .lock.</summary>

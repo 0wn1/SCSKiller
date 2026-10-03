@@ -141,9 +141,11 @@ public static class ShaderContainer
             {
                 if (version >> 16 == 2 && U(psv, 0) >= 4) gsInput = (int)U(psv, 4); // RuntimeInfo starts with the stage union: GSInfo.InputPrimitive first
                 var o = 4 + (int)U(psv, 0);
-                for (var i = 0; i < (int)U(psv, o); i++)
+                var n = (int)U(psv, o);
+                var stride = n > 0 ? (int)U(psv, o + 4) : 0; // DXC writes the stride only when there are resources
+                for (var i = 0; i < n && stride >= 16; i++) // a record reads 16 bytes: a shorter stride isn't PSV0
                 {
-                    var r = o + 8 + i * (int)U(psv, o + 4);
+                    var r = o + 8 + i * stride;
                     var cls = U(psv, r) switch { 1 => "sampler", 2 => "cbv", 3 or 4 or 5 => "srv", 6 or 7 or 8 or 9 => "uav", _ => "unknown" };
                     var (lo, hi) = (U(psv, r + 8), U(psv, r + 12));
                     bindings.Add(new Binding(cls, (int)U(psv, r + 4), (int)lo, hi == uint.MaxValue ? -1 : (int)(hi - lo + 1)));
@@ -241,7 +243,7 @@ public static class ShaderContainer
         if (!parts.TryGetValue(1, out var strings)) return (fns, res);
         string Str(uint off) { var from = strings + (int)off; return Encoding.ASCII.GetString(r, from, Array.IndexOf(r, (byte)0, from) - from); }
         if (parts.TryGetValue(3, out var rt)) // RuntimeDataResourceInfo: class, kind, id, space, lower, upper, name, flags
-            for (var k = 0; k < (int)U(r, rt); k++)
+            for (var k = 0; k < (int)U(r, rt) && (int)U(r, rt + 4) >= 24; k++)
             {
                 var q = rt + 8 + k * (int)U(r, rt + 4);
                 var cls = U(r, q) switch { 0 => "srv", 1 => "uav", 2 => "cbv", 3 => "sampler", _ => "unknown" };
@@ -249,7 +251,7 @@ public static class ShaderContainer
                 res.Add(new Binding(cls, (int)U(r, q + 12), (int)lo, hi == uint.MaxValue ? -1 : (int)(hi - lo + 1)));
             }
         if (parts.TryGetValue(4, out var ft)) // RuntimeDataFunctionInfo: name, unmangled name, resources, dependencies, kind, payload, attributes, ...
-            for (var k = 0; k < (int)U(r, ft); k++)
+            for (var k = 0; k < (int)U(r, ft) && (int)U(r, ft + 4) >= 28; k++)
             {
                 var q = ft + 8 + k * (int)U(r, ft + 4);
                 fns.Add(new LibraryFunction((int)U(r, q + 16), Str(U(r, q + 4)), (int)U(r, q + 20), (int)U(r, q + 24)));

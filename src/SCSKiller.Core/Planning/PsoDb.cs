@@ -131,6 +131,7 @@ public static class PsoDb
         while (f.ReadAtLeast(head, 5, false) == 5)
         {
             var len = BinaryPrimitives.ReadUInt32LittleEndian(head.AsSpan(1));
+            if (head[0] == 'B' && len < 20) throw new InvalidDataException($"a 'B' record of {len} bytes, short of its SHA-1");
             if (f.CanSeek && len > f.Length - f.Position) yield break;   // a torn tail, or a stray file's "length": nothing allocated
             byte[] body;
             if (f.CanSeek || len <= 1 << 20)

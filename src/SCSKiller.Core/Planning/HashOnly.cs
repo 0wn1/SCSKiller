@@ -197,51 +197,79 @@ public static class HashOnly
     /// <paramref name="maxRecords"/> PSO and state object records, about <paramref name="maxRaw"/> bytes and at most
     /// <see cref="MaxStateObjectRefs"/> state object references each, every one
     /// valid on its own: a state object travels with every record it builds on (a shared base then goes in several), a record
-    /// with its 'N' and 'L', and each with the root signatures its records name. A state object whose closure alone names
-    /// more than an upload may is left out (<paramref name="skipped"/>: how many); the rest still go.</summary>
+    /// with its 'N' and 'L', and each with the root signatures its records name (counted in its bytes). A state object whose
+    /// closure alone is over those sizes is left out, with what builds on it (<paramref name="skipped"/>: how many); the rest
+    /// still go.</summary>
     public static List<List<Rec>> Chunks(IReadOnlyList<Rec> canonical, int maxRecords, long maxRaw) => Chunks(canonical, maxRecords, maxRaw, out _);
 
     public static List<List<Rec>> Chunks(IReadOnlyList<Rec> canonical, int maxRecords, long maxRaw, out int skipped)
     {
         skipped = 0;
         var blobs = canonical.Where(r => r.Tag == 'B').ToList();
-        var states = canonical.Where(r => r.Tag is 'R' or 'A').ToDictionary(r => r.Key);
+        var blobOf = blobs.ToDictionary(b => Hex(b.Payload.AsSpan(0, 20)));
+        var states = canonical.Where(r => r.Tag is 'R' or 'A').ToDictionary(r => r.Key, r => (Rec: r, So: ParseStateObject(r)));
         var about = canonical.Where(r => r.Tag is 'N' or 'L').ToLookup(Target);
-        void Close(Rec r, Dictionary<string, Rec> into)
+        var tooBig = new HashSet<string>();
+        // a chunk holds whole closures, so the walk stops at its records; null: it builds on one no upload can carry
+        List<Rec>? Close(Rec r, Dictionary<string, Rec> have)
         {
-            if (!into.TryAdd(r.Key, r)) return;
-            foreach (var a in about[r.Key]) into.TryAdd(a.Key, a);
-            if (r.Tag is 'R' or 'A') foreach (var d in ParseStateObject(r).Depends) Close(states[d], into);
+            var into = new Dictionary<string, Rec>();
+            for (var stack = new Stack<Rec>([r]); stack.TryPop(out var x);)
+            {
+                if (tooBig.Contains(x.Key)) return null;
+                if (have.ContainsKey(x.Key) || !into.TryAdd(x.Key, x)) continue;
+                foreach (var a in about[x.Key]) into.TryAdd(a.Key, a);
+                if (x.Tag is 'R' or 'A') foreach (var d in states[x.Key].So.Depends) stack.Push(states[d].Rec);
+            }
+            return [.. into.Values];
         }
         var chunks = new List<List<Rec>>();
         var chunk = new Dictionary<string, Rec>();
-        long raw = 0, refs = 0;
+        var size = new Size(0, 0, 0);
+        var chunkRs = new HashSet<string>();
         void Flush()
         {
             if (chunk.Count > 0) chunks.Add(Canonical([.. blobs, .. chunk.Values], local: false, out _));
             chunk = [];
-            raw = refs = 0;
+            chunkRs = [];
+            size = new Size(0, 0, 0);
         }
         // what a state object names: an upload's are capped (MaxStateObjectRefs)
-        static long Refs(Rec u) => u.Tag is 'R' or 'A' && ParseStateObject(u) is var so ? so.Libraries.Count + so.RootSignatures.Count + so.Depends.Count : 0;
+        long Refs(Rec u) => u.Tag is 'R' or 'A' && states[u.Key].So is var so ? so.Libraries.Count + so.RootSignatures.Count + so.Depends.Count : 0;
+        IEnumerable<string> Named(Rec u) => u.Tag is 'R' or 'A' ? states[u.Key].So.RootSignatures : u.Tag is 'G' or 'C' or 'S' ? [Parse(u).Rs] : [];
+        // what records add to the chunk, the root signatures it doesn't name yet included
+        Size Of(List<Rec> l)
+        {
+            var rs = l.SelectMany(Named).Where(h => blobOf.ContainsKey(h) && !chunkRs.Contains(h)).Distinct();
+            return new(l.Count(u => u.Tag is not ('N' or 'L')), l.Sum(u => 5L + u.Payload.Length) + rs.Sum(h => 5L + blobOf[h].Payload.Length), l.Sum(Refs));
+        }
+        bool Over(Size s) => s.Refs > MaxStateObjectRefs || s.N > maxRecords || s.Raw > maxRaw;
         foreach (var r in canonical.Where(r => r.Tag is not ('B' or 'N' or 'L')))
         {
-            var unit = new Dictionary<string, Rec>();
-            Close(r, unit);
-            if (unit.Values.Sum(Refs) > MaxStateObjectRefs) { skipped++; continue; }   // no upload could carry it
-            var add = unit.Values.Where(u => !chunk.ContainsKey(u.Key)).ToList();
-            if (chunk.Count > 0 && (chunk.Count + add.Count > maxRecords || raw + add.Sum(u => 5L + u.Payload.Length) > maxRaw
-                    || refs + add.Sum(Refs) > MaxStateObjectRefs))
+            var add = Close(r, chunk);
+            if (add != null && chunk.Count > 0 && Over(size + Of(add)))
             {
                 Flush();
-                add = [.. unit.Values];
+                add = Close(r, chunk);
             }
+            var added = add == null ? default : Of(add);
+            if (add == null || chunk.Count == 0 && Over(added))
+            {
+                tooBig.Add(r.Key);
+                skipped++;
+                continue;
+            }
+            size += added;
             foreach (var u in add) chunk[u.Key] = u;
-            raw += add.Sum(u => 5L + u.Payload.Length);
-            refs += add.Sum(Refs);
+            chunkRs.UnionWith(add.SelectMany(Named));
         }
         Flush();
         return chunks;
+    }
+
+    readonly record struct Size(long N, long Raw, long Refs)
+    {
+        public static Size operator +(Size a, Size b) => new(a.N + b.N, a.Raw + b.Raw, a.Refs + b.Refs);
     }
 
     /// <summary>The db bytes of <paramref name="records"/>, Brotli (quality 11): an object of the community database. Encoded

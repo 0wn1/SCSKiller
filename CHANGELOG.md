@@ -5,6 +5,57 @@ All notable changes to the SCSKiller app and command line. The format follows
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-03
+
+### Added
+
+- The Witcher 3: Wild Hunt's DirectX 12 build compiles without a recording on NVIDIA: SCSKiller reads its shader caches
+  and the pipelines its materials use.
+
+### Changed
+
+- Clicking the Library's refresh button also fetches everything from the server, whatever its age (at most every 10
+  minutes): the known-stutter and tested-engine lists, community recordings and shared packs, your supporter status and
+  the update check.
+- Every game's compile plan is rebuilt once after this update, while the PC is idle; a compiled game whose new plan adds
+  pipelines says how many more it can compile. Plans for games with tessellation and geometry shaders, or with ray
+  tracing, cover more pipelines.
+
+### Fixed
+
+- A game started through its launcher, such as The Witcher 3's REDprelauncher, is found by the exe the launcher starts,
+  so its recorder goes where the game loads it. A recorder already next to the launcher moves there once neither runs,
+  with the last session's report and frame times.
+- A GPU driver updated while SCSKiller runs is noticed within minutes: the driver shown, the games that need compiling
+  again and the driver-update notification follow it without a restart. A GPU of another vendor asks for a restart.
+- The app, the command line and the scheduled task no longer compile the same game at once: the second one waits.
+- A compile that was stopped and then continued reports the pipelines that failed before the stop, and starts over
+  after a driver update.
+- A game updated since the last scan is compiled with the engine and checks of the installed build.
+- NVIDIA: a compiled game whose shader cache was removed (a shader cache reset) shows as needing a compile again.
+- A failed compile's message points to a log that is still there.
+- A recorder chained to a mod's d3d12.dll whose install was cut off gets its settings file back, so the mod loads.
+- A launch played while a recompile ran no longer judges the compile that ends after it.
+- A recording imported just before SCSKiller was closed or crashed is always taken into the next compile.
+- Turning "Share anonymous shader hashes" off stops a sharing pass already under way: nothing more is uploaded.
+- Signing out and in again while the app renews its sign-in in the background no longer signs the new sign-in out.
+- A damaged record in a game's scskiller.db fails only that game's import, not the whole library scan.
+- A known-stutter or tested-engines list from the server with an empty entry is ignored instead of stopping the other
+  list from updating.
+- While the community database refuses or can't be reached, the app waits before asking again instead of asking once
+  per game.
+- Clear cache also finds a game's D3D shader cache when its path has non-ASCII characters (an accented user name), and
+  deletes read-only cache files too.
+- Stable updates are found while the SCSKiller server is down, also with an expired sign-in. Beta and alpha also offer a
+  newer stable release.
+- A game update that changes only its shipped pipeline list or its inline shaders gets a new plan.
+- Games are found more reliably: an Epic game whose manifest names itself as the main game, Xbox games on any drive,
+  and games installed under a folder named like Setup or Redist.
+- A RE Engine game with a patch file that can't be read shows as unsupported instead of compiling outdated shaders.
+- Frame times: failed presents no longer count as frames, and a frame file that can't be written no longer shifts the
+  times after it. Games that create their device through `ID3D12DeviceFactory` are recorded.
+- A compile that fails while it is being watched no longer leaves its process running.
+
 ## [1.1.0] - 2026-10-02
 
 ### Added

@@ -363,6 +363,38 @@ public class AccountTests : IDisposable
     }
 
     [Fact]
+    public async Task A_late_answer_about_a_device_signed_out_meanwhile_leaves_the_new_sign_in_alone()
+    {
+        SignedInAlready();
+        var late = new TaskCompletionSource<HttpResponseMessage>();
+        var fake = new Fake((r, _) => r.RequestUri!.AbsolutePath switch
+        {
+            "/v1/token" when r.Headers.Authorization!.Parameter == "sd1_stored" => late.Task,   // the old device's renewal, answered later
+            "/v1/auth/exchange" => Task.FromResult(Ours(json: new { device_token = "sd1_new", device_id = "d2", access_token = "v4.public.new",
+                exp = (_clock.Now + TimeSpan.FromHours(24)).ToString("O"), ent = new[] { "db" }, until = (string?)null })),
+            _ => Task.FromResult(Ours(HttpStatusCode.NoContent)),
+        });
+        Task? browser = null;
+        var account = new Account(_dir, Routes(fake), url =>
+        {
+            var q = HttpUtility.ParseQueryString(url.Query);
+            browser = Browse($"http://127.0.0.1:{q["port"]}/cb?code=O&state={q["state"]}");
+        }, _clock);
+
+        var renewal = account.GetAccessTokenAsync();
+        await account.SignOutAsync();
+        Assert.True(await account.SignInAsync(), account.Problem);
+        await browser!;
+        late.SetResult(Ours(HttpStatusCode.Unauthorized, new { error = "invalid_token" }));   // the old device was revoked
+        Assert.Equal("v4.public.new", await renewal);
+
+        Assert.True(account.SignedIn);
+        Assert.True(account.HasDb);
+        Assert.True(File.Exists(Path.Combine(_dir, "auth.dat")));
+        Assert.True(new Account(_dir, Routes(fake)).SignedIn);
+    }
+
+    [Fact]
     public async Task Refresh_status_on_a_revoked_device_signs_this_pc_out()
     {
         SignedInAlready();

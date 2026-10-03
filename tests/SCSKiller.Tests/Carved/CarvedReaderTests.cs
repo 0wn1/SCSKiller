@@ -188,4 +188,16 @@ public class CarvedReaderTests
         Assert.Equal("605500aca5e115987aa01fcdb37aa13377bd700f18275629ed9535cdb3ffe18c", MaterializeOutputTests.Digest(work));
         Ff7.CheckWarmReady(work);
     }
+
+    /// <summary>A cancelled index stops in a shader-named file that holds no container (the only check was in the per-container callback).</summary>
+    [Fact]
+    public void ACancelledIndexStopsInAFileWithoutShaders()
+    {
+        var dir = Ff7.TempDir("carved-cancel");
+        File.WriteAllBytes(Path.Combine(dir, "shaders.bin"), new byte[4 << 20]);
+        var game = new Game("test:carved-cancel", "c", Store.Other, dir, Path.Combine(dir, "game.exe"));
+        var engine = new EngineInfo(CarvedReader.Family, "DXBC", null, "D3D12", false, null);
+        Assert.Throws<OperationCanceledException>(() => new CarvedReader().Index(game, engine, null, new CancellationToken(true)));
+        Directory.Delete(dir, true);
+    }
 }

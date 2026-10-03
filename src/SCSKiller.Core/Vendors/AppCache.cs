@@ -35,6 +35,7 @@ public static class AppCacheFiles
                     var users = ProcessesUsing(f.FullName).Select(Describe).ToList();
                     throw new InvalidOperationException($"files in use by {(users.Count > 0 ? string.Join(", ", users) : "another process")} ({f.Name})", e);
                 }
+            foreach (var f in files) if (f.IsReadOnly) f.IsReadOnly = false;   // Delete refuses a read-only file: none is deleted before all can be
             foreach (var f in files) f.Delete();   // gone once our handles close
             return files.Count;
         }

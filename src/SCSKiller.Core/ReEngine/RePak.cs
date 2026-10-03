@@ -73,7 +73,7 @@ public sealed class RePak : IDisposable
                 var ct = Bytes(at, 8);
                 blockSize = BinaryPrimitives.ReadInt32LittleEndian(ct);
                 var n = BinaryPrimitives.ReadInt32LittleEndian(ct.AsSpan(4));
-                if (blockSize <= 0 || n < 0 || at + 8 + 8L * n > len) throw new InvalidDataException("bad chunk table");
+                if (blockSize is <= 0 or > 64 << 20 || n < 0 || at + 8 + 8L * n > len) throw new InvalidDataException("bad chunk table");
                 var raw = Bytes(at + 8, n * 8);
                 chunks = new (long, int)[n];
                 long high = 0;
@@ -145,11 +145,12 @@ public sealed class RePak : IDisposable
 
     void ReadChunks(Entry e, Span<byte> dst)
     {
-        var block = new byte[blockSize];
+        byte[]? block = null;
         using var zstd = new Decompressor();
         for (long i = e.Offset; dst.Length > 0; i++)
         {
             if (i >= chunks.Length) throw new InvalidDataException($"chunk {i} past the chunk table");
+            block ??= new byte[blockSize];
             var (start, packed) = chunks[i];
             var src = Bytes(start, packed);
             if (packed == blockSize) src.CopyTo(block, 0);

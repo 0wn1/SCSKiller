@@ -63,9 +63,8 @@ public sealed class ReEngineReader(string dataDir, Func<string, string?>? downlo
     {
         var paks = new Paks(dir, Moduli(game));
         if (paks.Error?.EndsWith(RePak.NoModulus) != true) return paks;
-        // none given: the published one, kept only if it opens the base package (tried every Detect until one does)
-        var basePak = Path.Combine(dir, "re_chunk_000.pak");
-        if ((download ?? Download.Text)(ReePakRs) is { } source && ReePakModuli(source).FirstOrDefault(b => Opens(basePak, BothOrders(b))) is { } m)
+        // none given: the published one, kept only if it opens the package that needs it (tried every Detect until one does)
+        if ((download ?? Download.Text)(ReePakRs) is { } source && ReePakModuli(source).FirstOrDefault(b => Opens(paks.Failed!, BothOrders(b))) is { } m)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(ModulusFile(game))!);
             File.WriteAllText(ModulusFile(game), Convert.ToHexString(m));
@@ -218,6 +217,7 @@ public sealed class ReEngineReader(string dataDir, Func<string, string?>? downlo
         public readonly List<RePak> All = [];
         public readonly RePak? Base;
         public string? Error;
+        public string? Failed;   // the package Error is about
 
         static readonly Regex Patch = new(@"\.patch_(\d+)\.pak$", RegexOptions.IgnoreCase);
 
@@ -231,7 +231,8 @@ public sealed class ReEngineReader(string dataDir, Func<string, string?>? downlo
                 try { All.Add(RePak.Open(p, moduli)); }
                 catch (Exception e) when (e is InvalidDataException or IOException or UnauthorizedAccessException)
                 {
-                    if (Path.GetFileName(p).Equals("re_chunk_000.pak", StringComparison.OrdinalIgnoreCase)) Error = $"re_chunk_000.pak: {e.Message}";
+                    // a patch replaces base files: without it the index would be of the unpatched game. A DLC package only adds.
+                    if (Path.GetFileName(p).Equals("re_chunk_000.pak", StringComparison.OrdinalIgnoreCase) || Patch.IsMatch(p)) (Error, Failed) = (Error ?? $"{Path.GetFileName(p)}: {e.Message}", Failed ?? p);
                 }
             Base = All.FirstOrDefault(p => Path.GetFileName(p.Path).Equals("re_chunk_000.pak", StringComparison.OrdinalIgnoreCase));
         }
@@ -242,7 +243,7 @@ public sealed class ReEngineReader(string dataDir, Func<string, string?>? downlo
             var last = new Dictionary<ulong, (RePak, int)>();
             foreach (var p in All)
                 for (var i = 0; i < p.Entries.Count; i++) last[p.Entries[i].Hash] = (p, i);
-            return last.Values.Where(f => f.Item1.Entries[f.Item2].Size > 0);
+            return last.Values.Where(f => f.Item1.Entries[f.Item2] is var e && (e.Size > 0 || e.Chunked && e.Packed > 0)); // a chunked entry may give its length as Packed (RePak.Read)
         }
 
         public void Dispose() { foreach (var p in All) p.Dispose(); }

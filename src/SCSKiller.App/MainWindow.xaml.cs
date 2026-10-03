@@ -7,6 +7,7 @@ using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.UI.Xaml.Navigation;
 using SCSKiller.App.Design;
 using SCSKiller.App.Pages;
+using SCSKiller.Core.App;
 using Windows.Graphics;
 using Windows.Graphics.Imaging;
 
@@ -30,8 +31,7 @@ public sealed partial class MainWindow : Window
         Resize(1280);
         SetMinimumSize();
         Root.Loaded += (_, _) => Root.XamlRoot.Changed += (_, _) => SetMinimumSize();   // the window moved to a monitor with another DPI
-        GpuName.Text = App.Core.Vendor.Gpu.Name;
-        GpuDriver.Text = "Driver " + App.Core.Vendor.Gpu.DriverVersion;
+        ShowGpu();
         Nav.SelectedItem = LibraryItem;
         Updater.Changed += () => DispatcherQueue.TryEnqueue(ShowUpdate);
         ShowUpdate();
@@ -42,6 +42,12 @@ public sealed partial class MainWindow : Window
             e.Cancel = true;
             App.HideToTray();
         };
+    }
+
+    public void ShowGpu()
+    {
+        GpuName.Text = App.Core.Vendor.Gpu.Name;
+        GpuDriver.Text = (App.Core as ScsKiller)?.GpuRestartNote ?? "Driver " + App.Core.Vendor.Gpu.DriverVersion;
     }
 
     public void Navigate(Type page, object? arg = null) => ContentFrame.Navigate(page, arg);

@@ -200,4 +200,31 @@ public class UnrealReaderTests(ITestOutputHelper output)
         }
         Assert.Null(reader.Detect(new Game("test", "none", Store.Other, Directory.CreateTempSubdirectory().FullName, "")));
     }
+
+    /// <summary>PSV0 and RDAT tables whose record stride can't hold a record (0 here) give no bindings instead of the same
+    /// record appended a billion times.</summary>
+    [Fact]
+    public void ZeroStrideBindingTablesAreNotRepeated()
+    {
+        static byte[] Container(params (string FourCC, byte[] Data)[] parts)
+        {
+            var head = 32 + 4 * parts.Length;
+            var o = new MemoryStream();
+            var w = new BinaryWriter(o);
+            w.Write("DXBC"u8); w.Write(new byte[16]); w.Write(1); w.Write(head + parts.Sum(p => 8 + p.Data.Length)); w.Write(parts.Length);
+            for (int i = 0, at = head; i < parts.Length; at += 8 + parts[i].Data.Length, i++) w.Write(at);
+            foreach (var (cc, d) in parts) { w.Write(System.Text.Encoding.ASCII.GetBytes(cc)); w.Write(d.Length); w.Write(d); }
+            return o.ToArray();
+        }
+        byte[] psv = [.. BitConverter.GetBytes(0), .. BitConverter.GetBytes(1_000_000), .. BitConverter.GetBytes(0), 2, 0, 0, 0, .. new byte[12]];   // one cbv record, stride 0
+        var vs = Container(("DXIL", BitConverter.GetBytes(1u << 16 | 0x60)), ("PSV0", psv));   // vs_6_0
+        var info = ShaderContainer.Parse(vs, "", new(0, 0, 0, 0))!;
+        Assert.Equal((Stage.Vertex, 0), (info.Stage, info.Bindings.Count));
+        byte[] none = [.. BitConverter.GetBytes(24), .. new byte[24], .. BitConverter.GetBytes(0)];   // no resources: DXC writes no stride
+        Assert.Empty(ShaderContainer.Parse(Container(("DXIL", BitConverter.GetBytes(1u << 16 | 0x60)), ("PSV0", none)), "", new(0, 0, 0, 0))!.Bindings);
+        byte[] rdat = [.. BitConverter.GetBytes(0), .. BitConverter.GetBytes(2), .. BitConverter.GetBytes(16), .. BitConverter.GetBytes(28),
+            .. BitConverter.GetBytes(1), .. BitConverter.GetBytes(4), 0, 0, 0, 0,                                          // string table: one empty string
+            .. BitConverter.GetBytes(3), .. BitConverter.GetBytes(32), .. BitConverter.GetBytes(1_000_000), .. BitConverter.GetBytes(0), .. new byte[24]];   // resources, stride 0
+        Assert.Empty(ShaderContainer.Rdat(Container(("DXIL", BitConverter.GetBytes(6u << 16 | 0x63)), ("RDAT", rdat))).Resources);
+    }
 }
