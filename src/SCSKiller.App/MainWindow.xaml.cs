@@ -222,7 +222,7 @@ public sealed partial class MainWindow : Window
                 }
                 foreach (var (name, id) in new[] { ("hogwarts", "steam:990080"), ("ff7", ff7), ("ghostrunner", "steam:1139900"),
                                                    ("palworld", "xbox:1623730"), ("eldenring", "steam:1245620"),
-                                                   ("atomicheart", "xbox:Sample.AtomicHeart"), ("darwin", "epic:3300000"),
+                                                   ("atomicheart", "xbox:Sample.AtomicHeart"), ("darwin", "epic:3300000"), ("townfall", "steam:3600000"),
                                                    ("added", "manual:5f1c0e9a2b7d4c30") })
                 {
                     Navigate(typeof(DetailPage), id);

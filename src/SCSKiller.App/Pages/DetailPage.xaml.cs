@@ -38,11 +38,24 @@ public sealed partial class DetailPage : Page
         DrawFrames();
     }
 
+    async void OnGameFolder(object _, RoutedEventArgs __)
+    {
+        var game = Vm.Row.State.Game;
+        if (await GameFolderDialog.ShowAsync(XamlRoot, game, $"{game.Name}'s folder", "Save") is not { } folder) return;
+        try { await Task.Run(() => App.Core.AddManualGame(game.ExePath, folder)); }   // checks the folder again, then the game
+        catch (Exception ex)
+        {
+            await new ContentDialog { XamlRoot = XamlRoot, Title = "Couldn't set the game folder", Content = ex.Message, CloseButtonText = "OK" }.ShowAsync();
+            return;
+        }
+        Vm.Refresh();
+    }
+
     async void OnRemoveGame(object _, RoutedEventArgs __)
     {
         var id = Vm.Row.Id;
         if (!await App.ConfirmAsync(this, $"Remove {Vm.Name} from the library?",
-                "SCSKiller forgets the game. Nothing in the game's folder is touched, and you can add it again any time.",
+                "SCSKiller forgets the game and takes its recorder out of the game's folder. The game's own files stay, and you can add it again any time.",
                 "Remove")) return;
         try { await Task.Run(() => App.Core.RemoveManualGame(id)); }   // refused while a compile of it runs
         catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
@@ -125,7 +138,7 @@ public sealed partial class DetailPage : Page
         if (vm.OffersCareful)
             try { await Task.Run(() => App.Core.SetCarefulCompile(id, true)); }
             catch (Exception ex) { vm.Error = ex.Message; vm.Refresh(); return; }
-        App.Core.Enqueue(id);
+        App.Core.Compile(id);
         vm.Refresh();
     }
 
@@ -133,6 +146,10 @@ public sealed partial class DetailPage : Page
     void OnCarefulToggled(object _, RoutedEventArgs __) { if (CarefulSwitch.IsOn != Vm.CarefulOn) SetCareful(CarefulSwitch.IsOn); }
 
     void SetCareful(bool on) => Set((vm, p) => vm.CarefulPending = p, on, id => App.Core.SetCarefulCompile(id, on));
+
+    /// <summary>Never blank: an exception without a message (some WinRT ones) shows its type, and its inner one's.</summary>
+    static string Describe(Exception e) => !string.IsNullOrWhiteSpace(e.Message) ? e.Message
+        : e.GetType().Name + (e.InnerException is { } inner ? ": " + Describe(inner) : $" (0x{e.HResult:X8})");
 
     // The core's switches do file I/O: off the UI thread, the switch disabled meanwhile (pending = the state asked for).
     async void Set(Action<DetailVm, bool?> setPending, bool pending, Action<string> change)
@@ -145,7 +162,7 @@ public sealed partial class DetailPage : Page
             await Task.Run(() => change(id));
             vm.Error = null;
         }
-        catch (Exception ex) { vm.Error = ex.Message; }
+        catch (Exception ex) { vm.Error = Describe(ex); }
         setPending(vm, null);
         vm.Refresh();   // the switch shows the real state, even after a failure
     }
@@ -198,7 +215,14 @@ public sealed partial class DetailPage : Page
         vm.Refresh();
     }
 
-    void OnRecordToggled(object _, RoutedEventArgs __) { if (RecordSwitch.IsOn != Vm.RecordOn) SetRecord(RecordSwitch.IsOn); }
+    void OnRecordToggled(object _, RoutedEventArgs __)
+    {
+        var on = RecordSwitch.IsOn;   // read here: the change runs off the UI thread, where the switch can't be read
+        if (on == Vm.RecordOn) return;
+        // an eligible EasyAntiCheat game: the switch allows offline sessions
+        if (Vm.ShowOffline) Set((vm, p) => vm.OfflinePending = p, on, id => App.Core.SetOfflineRecording(id, on));
+        else SetRecord(on);
+    }
 
     void OnRecordTip(object _, RoutedEventArgs __) => SetRecord(true);
 
@@ -210,4 +234,27 @@ public sealed partial class DetailPage : Page
     void OnAlongsideToggled(object _, RoutedEventArgs __) { if (AlongsideSwitch.IsOn != Vm.AlongsideOn) SetAlongside(AlongsideSwitch.IsOn); }
 
     void SetAlongside(bool on) => Set((vm, p) => vm.AlongsidePending = p, on, id => App.Core.SetRecordAlongsideMod(id, on));
+
+    // Every launch is confirmed here: the core starts a session only with confirmed: true
+    async void OnRecordOffline(object _, RoutedEventArgs __)
+    {
+        var (vm, id) = (Vm, Vm.Row.Id);
+        if (!await App.ConfirmAsync(this, $"Start {vm.Name} offline without EasyAntiCheat?",
+                new TextBlock { TextWrapping = TextWrapping.Wrap, Text = DetailVm.OfflineRisk + " Online play isn't possible in that session." },
+                "Record offline session")) return;
+        vm.OfflineStarting = true;
+        vm.Refresh();
+        Task session;
+        try
+        {
+            session = await Task.Factory.StartNew(() => App.Core.StartOfflineSession(id, confirmed: true), CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default);
+            vm.Error = null;
+        }
+        catch (Exception ex) { (vm.Error, session) = (Describe(ex), Task.CompletedTask); }
+        vm.OfflineStarting = false;
+        vm.Refresh();
+        try { await session; }
+        catch (Exception ex) { vm.Error = Describe(ex); }
+        vm.Refresh();
+    }
 }

@@ -72,7 +72,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
         var menu = UnrealRhi.LaunchMenu(game);
         var (api, why) = UnrealRhi.Resolve(version.StartsWith('4') ? 4 : 5, platforms, s.Configs, project, UnrealRhi.UserDir(game, project), UnrealRhi.LaunchOptions(game), menu.Entries, menu.Default);
         notes = keyNote.Length > 0 ? $"{why}; AES key: {keyNote}" : why;
-        return new EngineInfo("Unreal", version, fork?.ToString(), api, encrypted, unsupported);
+        return new EngineInfo("Unreal", version, fork?.ToString(), api, encrypted, unsupported, UnrealRhi.RtPipelinesOff(s.Configs, project));
     }
 
     /// <summary>The user supplies the AES key of an encrypted game (hex, "0x" optional): stored for the game if it opens its
@@ -90,7 +90,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
     {
         if (!projects.TryGetValue(game.InstallDir, out var project) && PaksDir(game.InstallDir) is { } paks)
             projects[game.InstallDir] = project = ProjectOf(paks);   // a miss isn't kept: the install may be mid-update
-        return project == null ? "" : UnrealRhi.Stamp(game, project);
+        return project == null ? "" : UnrealRhi.Stamp(game, project) + "|" + keys.KeyStamp(game);
     }
 
     readonly ConcurrentDictionary<string, string> projects = new(StringComparer.OrdinalIgnoreCase);

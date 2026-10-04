@@ -65,6 +65,7 @@ public partial class App : Application
             real.ActiveCheck = new ActiveCheck(AppStore.DefaultDir, () => real.Settings is { ActiveCheck: true, WelcomeSeen: true }, real.Vendor.Vendor);
             // not in the unattended --driver-updated launch: nobody at the PC, no game folder is written
             real.ManageRecorders = !driverUpdated;
+            real.CleanupHelper = Environment.ProcessPath;
             real.CheckPlans = true;
             var hadDb = false;   // signed in (or the membership turned active): check at once, not at the next scan
             Account.Changed += () => { var db = Account.Status?.Ent.Contains("db") == true; if (db && !hadDb) real.StartCommunitySync(); hadDb = db; };

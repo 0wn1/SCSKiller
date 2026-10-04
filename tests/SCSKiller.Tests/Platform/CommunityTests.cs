@@ -314,18 +314,21 @@ public class CommunityTests : IDisposable
         Assert.False(File.Exists(Path.Combine(game, "community.db")));
     }
 
-    /// <summary>A body sent a few bytes at a time, <paramref name="gap"/> apart.</summary>
+    /// <summary>A body sent a few bytes at a time, <paramref name="gap"/> apart. Each read waits on the reading thread and
+    /// completes synchronously: a Task.Delay's continuation waits for a thread-pool thread, which a loaded test run starves
+    /// for seconds, so the gaps the reader saw outgrew the idle limit though the stub kept to its 250 ms.</summary>
     sealed class Dribble(byte[] data, int chunks, TimeSpan gap) : Stream
     {
         int at;
-        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
         {
-            if (at >= data.Length) return 0;
-            await Task.Delay(gap, ct);
+            if (at >= data.Length) return ValueTask.FromResult(0);
+            ct.WaitHandle.WaitOne(gap);
+            ct.ThrowIfCancellationRequested();   // given up while it waited
             var n = Math.Min(Math.Min(buffer.Length, (data.Length + chunks - 1) / chunks), data.Length - at);
             data.AsMemory(at, n).CopyTo(buffer);
             at += n;
-            return n;
+            return ValueTask.FromResult(n);
         }
         public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
         public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();

@@ -24,13 +24,17 @@ session), plans which pipelines to create, and replays them in a separate proces
 
 1. **Discover.** An `IGameSource` per store finds installed games and flags anti-cheat. `ManualSource` lists the games
    the user added by their exe (`manual-games.json` in the data folder): the pick is resolved like a store's install
-   (a launcher stub to its Shipping exe, the install root above `Engine\` or `bin\`) and checked for anti-cheat like
-   any game. Such a game never gets the recorder, since its install root is a guess that may miss the game's
-   anti-cheat: it compiles from its files, plus a community recording found by its content hash once it has been
-   indexed, and needs-a-recording games show as not supported. It yields to a store's game whose install holds its
-   exe, has no build id (the exe's size and write time mark a patch), starts its exe directly, uploads nothing and
-   fills no middleware pack (the upload key is a public store build alias, which a game added on one PC doesn't have).
-   Removing it forgets the entry and touches nothing in its folder.
+   (a launcher stub to its Shipping exe) and a game folder is suggested from its layout (above `Engine\` or `bin\`, else
+   the exe's folder; nothing above it is read, since the folders beside it may be other games). The user confirms or
+   changes that folder; a drive, a store's or Windows' folder of many games, a folder holding a game SCSKiller lists,
+   or one whose subfolders look like several games is refused (`ManualSource.RootProblem`). With its folder confirmed
+   the game follows the recorder rules of any game: the anti-cheat check covers that whole folder and the exe's
+   folder, plus the names directly in each folder above it up to a drive or a folder of many (a confirmed `win64`
+   still sees the `BattlEye` folder beside it), and the recorder is armed only for the folder that was checked (a new folder disarms it until the next
+   clean check). An entry from before the folder could be confirmed isn't recorded until it is. It yields to a store's
+   game whose install holds its exe, has no build id (the exe's size and write time mark a patch), starts its exe
+   directly, uploads nothing and fills no middleware pack (the upload key is a public store build alias, which a game
+   added on one PC doesn't have). Removing it takes its recorder out and forgets the entry.
 2. **Index.** An `IEngineReader` per engine family detects the engine and lists every shader the build ships (stage,
    SHA-1, signatures, root signature if embedded), grouped in shader maps that say which shaders can be drawn together.
 3. **Plan.** The planner (`IPlanner`) turns the index, a recording if there is one, and the GPU vendor's `VendorCaps`
@@ -267,7 +271,10 @@ open game files read-only and never launch or attach to the game.
 - **FromSoftware** (`FromSoft/`): BHD5/BDT archives, DCX (zlib, Oodle, zstd) and BND4 binders; a BND3 binder is only
   carved for raw containers, so its compressed entries yield no shaders. The archives'
   public RSA keys are read from the game's exe (`SoulsKeys`), else downloaded from a pinned commit of UXM, and kept in
-  `archive.keys`. Oodle comes from CUE4Parse's download, never from the game's DLL.
+  `archive.keys`. Oodle comes from CUE4Parse's download, never from the game's DLL. Elden Ring creates its root
+  signatures from the 1.1 ones its shaders carry (RTS0), serialized again at version 1.0 with each range at an explicit
+  offset, so the reader gives each shader that blob (`RootSig.AsVersion10`; its recording: all 9,246 PSOs of shipped
+  shaders byte for byte). Nightreign is taken to do the same, unverified.
 - **RE Engine** (`ReEngine/`): KPKA packages with encrypted entry tables. The table key needs the game's public RSA
   modulus, which isn't on disk in the clear; it's downloaded from a pinned commit of ree-pak-rs, or given by hand in
   `pak.modulus`. Shaders are in master material files, found by their magic since file names are hashes. RE Engine
@@ -341,8 +348,11 @@ seeded with the recording's own units.
 
 Where the vendor caches per collection (NVIDIA), `RtCollections` synthesizes one collection per DXIL library, with the
 engine's global and local root signatures rebuilt from the library's resource counts and its RDAT function table.
-Rules exist for UE 4.26/4.27, UE 5.1 and the forks the root-signature rules cover; with a recording, its collections'
-rule is used if at least 99% of them rebuild. FromSoftware games get a guessed rule (`RtCollections.GuessedFamilies`),
+Rules exist for UE 4.26/4.27, UE 5.0-5.4 and the forks the root-signature rules cover; with a recording, its collections'
+rule is used if at least 99% of them rebuild. The UE 5 rule is 5.1's (verified on Oblivion Remastered; 5.4 with
+MAX_SAMPLERS' 32-sampler table) and applies only when the libraries have 5.1's binding shape
+(`RtCollections.Ue5ShapeMismatch`): uniform buffers in space 1, hit-group index and vertex buffers t0/t1 in space 2, no
+bindless heap access, no shared uniform buffers in space 4. UE 5.5/5.6's bindless ray tracing has no rule without a recording. FromSoftware games get a guessed rule (`RtCollections.GuessedFamilies`),
 and the plan log says so.
 
 REDengine 3 adds its materials to a pipeline with `AddToStateObject`, many at once at startup. NVIDIA caches an addition
@@ -413,6 +423,19 @@ After a build:
   reason says a recording compiles the rest (`ScsKiller.IsPartial`).
 - **Ray tracing**: when more than 10% of the index's DXIL libraries have no synthesized collection and no recording has
   ray tracing, the game needs a recording for ray-traced effects; the rest still compiles (`ScsKiller.NeedsRtRecording`).
+  A recording imported after the plan was built may have the ray tracing (inline RayQuery PSOs, as Unreal 5's hardware
+  Lumen traces, or state objects): until the plan is rebuilt nothing is asked for, and the app queues a plan check
+  (`ScsKiller.RtPlanCheck`). A recorded launch of 5 minutes or more without a ray tracing state object
+  (`GameRecord.RtUnseen`, from the session csv) whose recording the plan still finds no ray tracing in means the
+  player's setup doesn't use it: the game is Ready or Warmed with a note, and the page still counts the libraries as
+  not compiled. A later launch with a state object clears it.
+  Unreal 5 whose index has shaders that trace rays inline (`ShaderInfo.InlineRayTracing`, counted in
+  `PlanStats.RtInline`) doesn't need a recording for its DXIL libraries: hardware Lumen traces inline, and the libraries
+  serve passes a game may never run, such as path tracing (`ScsKiller.RtInlineCovers`). The libraries stay counted as
+  uncovered, the reason says only a recording compiles them, and a recorded state object takes the DXR path. A plan
+  from before this was counted that asks for a recording is planned again by the plan check. An Unreal game whose
+  Windows device profile sets r.RayTracing.AllowPipeline=0 (`UnrealRhi.RtPipelinesOff`, `EngineInfo.NoRtPipelines`)
+  never builds a state object: its libraries count, none as uncovered.
   On AMD this always applies, since only recorded objects can be warmed. The plan's uncovered count
   (`PlanStats.RtUncovered`) is the libraries in neither a synthesized collection nor a recorded state object, also when
   the recording has ray tracing; the game page shows it.
@@ -450,8 +473,8 @@ The recorder is `proxy/`'s `d3d12.dll`, placed next to the game's exe with a `sc
   removal) checks first that the game isn't running (`GameFolderWrite`, the watcher and the uninstall hook the same
   way): no process named like an exe of its install root or exe folder, so also one a launcher started under another
   name (the uninstall hook takes the install root from `GameRecord.RecorderInstallDir`, and checks again before it
-  deletes the recorder's data). No process is ever opened, here or anywhere SCSKiller asks what runs: another program
-  with the same name only delays the write. Anti-cheat is a marker file
+  deletes the recorder's data). No process is ever opened, here or anywhere SCSKiller asks what runs (apart from the one
+  SCSKiller starts for an offline session, below, whose exit its cleanup waits on): another program with the same name only delays the write. Anti-cheat is a marker file
   or folder by name anywhere in the install (`GameFiles.DetectAntiCheat`, the only detector), hidden or system ones
   included; junctions and symlinks count by name and aren't followed (one between the install root and the exe counts
   as anti-cheat); an install it can't list whole counts as anti-cheat. The install checks again after copying (the
@@ -486,6 +509,58 @@ The recorder is `proxy/`'s `d3d12.dll`, placed next to the game's exe with a `sc
   exist in no game file, so this PC's recording is their only source. Removal renames the mod back and never
   overwrites another file that took its place. OptiScaler, Special K (they pick their role from their file name) and
   vkd3d-proton (it runs the game on Vulkan) are refused.
+- **Offline session** (`ScsKiller.StartOfflineSession`, app only): the one case where the recorder goes into an
+  anti-cheat game. Offered (`GameState.OfflineEligible`) only for a game of `Games/offline-eac.json` (Steam ids, the exe
+  each is discovered with, sources; embedded, never served): EasyAntiCheat games that run offline without it when their
+  exe is started directly with `steam_appid.txt` beside it, so the game doesn't restart through Steam and
+  `start_protected_game.exe`. The game's verdict must be EasyAntiCheat and its engine supported on D3D12. Never
+  automatic: the user allows it per game (`GameRecord.OfflineRecord`) and confirms every launch (`confirmed`, from the
+  game page's dialog). Refused, with nothing written, while the game or a compile of it runs, while a recorder removal
+  or revocation is pending, unless a fresh full check finds EasyAntiCheat and, with its markers ignored, nothing else,
+  when any of the recorder's files is already next to the exe (a mod's `d3d12.dll` included: never alongside a mod), when
+  a `steam_appid.txt` there holds another id (one with this id is the user's and stays), when ReShade is there, or when
+  Steam isn't running (the game would restart through it, with EasyAntiCheat; Steam's offline mode is fine). A leftover
+  `d3d12.dll` would still be loaded, as a pass-through, into a normal EasyAntiCheat launch, so the session is a journal:
+  under the recorder lock, before any file is written, `GameRecord.OfflineSession` keeps the folder's entry names and
+  every name the session may create there (`d3d12.dll`, `scskiller.ini`, `steam_appid.txt`, their temp names,
+  `scskiller.armed`, the recorder's data files and keys file; refused if any is already there), and the manifest names
+  the first three by hash for the anti-cheat removals and the uninstall hook. Recovery is in place before any file is
+  published: with `CleanupHelper` set (the app), an HKCU RunOnce entry (its name starts with "!", so Windows deletes it
+  only after its command ran) runs `SCSKiller.exe --offline-cleanup <id>` at the next logon, and that helper starts at
+  once, no window, outliving the app; while the journal has no pid yet it waits as long as the SCSKiller that started
+  it runs. A helper that doesn't start refuses the session. Each file is written to a temp name and renamed into place.
+  The exe is started by SCSKiller itself with `CREATE_SUSPENDED`; its pid and creation time go into the journal and the
+  attestation (`pid=` and `pid_time=`, its creation FILETIME, in the ledger entry and `scskiller.armed`), then it is
+  resumed and the journal says so (`Resumed`); a failure in between ends it. A journaled process that is alive but was
+  never resumed is SCSKiller's own suspended child (the app ended while it set the session up): the cleanup ends it,
+  its pid and creation time checked on the handle, and the helper does so after a minute. The proxy admits a bound
+  attestation only in that process, and for it drops EasyAntiCheat's names from the markers beside the exe (any other
+  marker still refuses, and an anti-cheat client loaded at the first device too). Any other launch with the files there, Steam's through
+  EasyAntiCheat included, is a pass-through. While the process runs (this app's, or one whose journaled pid and creation
+  time match a live process, as when SCSKiller opens again while the game loads), no disarm, anti-cheat removal or
+  cleanup touches its attestation; the cleanup checks that again under the recorder lock. The cleanup
+  (`ScsKiller.CleanOfflineSession`, one at a time across processes) runs the moment that process exits, by its handle, in
+  the app and in the helper (which opens the process only if its creation time is the journal's): the attestation is
+  revoked, the journaled names a launch loads (`d3d12.dll`, `scskiller.ini`, `steam_appid.txt`, the armed file, temp
+  names) are deleted first, whatever the files hold (none existed before the session), and only then is the inbox merged
+  into `recording.db` and the data files deleted, which waits while another process runs from the folder (by name, not
+  the session's pid). A name leaves the journal, saved, as soon as the folder, listed whole after each delete pass,
+  shows it gone (before the wait for the recording), so a file put there since is never deleted. A folder that can't be
+  listed proves nothing gone, unless it is gone itself while its drive is there (the nearest ancestor that can be
+  listed doesn't have it): the session is then over. The folder's names are then
+  compared with the kept ones (a difference is logged; nothing that isn't the session's is deleted). The session and its
+  RunOnce entry stay until the journal is empty; the helper tries again every few seconds for a day (and writes the entry
+  again meanwhile), and the app first in every scan and every watcher pass. An update's apply stops every process under
+  the install root, the helper too, so the two exclude each other (`ScsKiller.BeginUpdate`): from the start of an apply
+  (on quit, at start, "Restart to update" while it waits for the queue) no session starts, and the apply is skipped,
+  and checked again right before the handover, while a session starts, its process runs or its helper does (it holds a
+  named mutex). A session whose files wait for a drive that's gone doesn't hold updates back. Accepted limit: SCSKiller
+  uninstalled during a session removes the recorder by the manifest, but the helper and the logon entry go with the
+  app, so files a running game holds can stay until removed by hand; the game page's warning says not to. Its recording
+  is shared like any other. Before the data files go, the session's report (its csv, log and frame log) moves to the
+  game's data folder (`offline-session`), where the game page reads its last session and frame times while the game
+  folder has none of its own, as for any recorded game; Clear recording deletes it too. On the game page, "Record while I play"'s
+  switch allows offline sessions for such a game, and while it is on the card has the ban-risk warning and the button.
 - **Shader mods** (`Games.ReShade.Detect`): ReShade in the exe's folder, else the install root: any DLL there whose
   version resource names ReShade, or one of its usual names (dxgi.dll, d3d12.dll, ...) holding its description or its
   add-on export. Only the build with full add-on support loads add-on files; the standard one is known by its "only
@@ -595,8 +670,8 @@ The recorder is `proxy/`'s `d3d12.dll`, placed next to the game's exe with a `sc
 
   Play is what lies between startup and quitting, a frame by its end as above; the 1% low is of its frames but the pauses. A compile on a worker thread that the
   render thread waits for is still a shader stutter, so the csv's `presents` column isn't used.
-- The recorder loads NVAPI only on NVIDIA and only in games without anti-cheat, to record the shader-extension state
-  pipelines are created with.
+- The recorder loads NVAPI only on NVIDIA and only in a run it admitted (no anti-cheat running), to record the
+  shader-extension state pipelines are created with.
 
 ## scskiller_warm.exe protocol
 

@@ -71,6 +71,24 @@ public class UnrealRhiTests(ITestOutputHelper output)
         Assert.Equal("D3D11 (last run)", Api(4, Sm5, new(), UserDir("", "LogD3D11RHI: Chosen D3D11 Adapter:\n")));
     }
 
+    /// <summary>UE4 DX12 may run the SM5 libraries, so a DX11-default project that ships ray tracing (DX12-only) offers DX12 (Ghostrunner).</summary>
+    [Fact]
+    public void RayTracingOffersDx12()
+    {
+        const string rt = "[/Script/Engine.RendererSettings]\nr.RayTracing=True\n";
+        Assert.Equal(UnrealRhi.Ambiguous, Api(4, Both, Config(Rhi("DefaultGraphicsRHI_DX11"))));   // SM5 + SM6 libraries
+        Assert.Equal(UnrealRhi.Ambiguous, Api(4, Sm5, Config(rt)));
+        Assert.Equal("D3D11", Api(4, Sm5, Config(Rhi("DefaultGraphicsRHI_DX11") + "[/Script/Engine.RendererSettings]\nr.RayTracing=False\n")));
+        Assert.Equal("D3D11", Api(4, Sm5, Config(Rhi("DefaultGraphicsRHI_DX11")), UserDir("")));   // DX11 only stays DX11
+        Assert.Equal("D3D12", Api(4, Sm5, Config(Rhi("DefaultGraphicsRHI_DX12") + rt)));
+        // encrypted: unreadable before the key, the shipped config decides after it
+        Assert.Equal(UnrealRhi.Ambiguous, Api(4, Sm5, new()));
+        Assert.Equal(UnrealRhi.Ambiguous, Api(4, Sm5, Config(Rhi("DefaultGraphicsRHI_DX11") + rt)));
+        var user = UserDir("");
+        File.WriteAllText(Path.Combine(user, "Config", "Windows", "Engine.ini"), rt);
+        Assert.Equal("D3D11", Api(4, Sm5, Config(Rhi("DefaultGraphicsRHI_DX11")), user));   // the player's own ini doesn't ship ray tracing
+    }
+
     static readonly Game Drg = new("steam:548430", "Deep Rock Galactic", Store.Steam, @"C:\Steam\steamapps\common\Deep Rock Galactic",
         @"C:\Steam\steamapps\common\Deep Rock Galactic\FSD\Binaries\Win64\FSD-Win64-Shipping.exe");
 
@@ -140,18 +158,23 @@ public class UnrealRhiTests(ITestOutputHelper output)
         Assert.Equal(ScsKiller.SkipNotDx12, ScsKiller.RecorderSkip(state with { Engine = state.Engine! with { GraphicsApi = "D3D11" } }, null));
     }
 
-    /// <summary>An install whose paks aren't there yet (mid-update) gets a stamp once they are: a miss isn't kept.</summary>
+    /// <summary>An install whose paks aren't there yet (mid-update) gets a stamp once they are: a miss isn't kept. A key added changes it.</summary>
     [Fact]
     public void DetectStampFindsTheProjectOnceThePaksAppear()
     {
         var install = Ff7.TempDir("rhi-stamp-" + Guid.NewGuid().ToString("N")[..8]);
         var game = new Game("epic:stamp", "Stamp", Store.Epic, install, Path.Combine(install, "Proj", "Binaries", "Win64", "Proj-Win64-Shipping.exe"));
-        var reader = new UnrealReader(Ff7.TempDir("rhi-stamp-data"));
+        var data = Ff7.TempDir("rhi-stamp-data");
+        var reader = new UnrealReader(data);
         var engine = new EngineInfo("Unreal", "4.27", null, "D3D11", false, null);
         Assert.Equal("", reader.DetectStamp(game, engine));
         var paks = Directory.CreateDirectory(Path.Combine(install, "Proj", "Content", "Paks")).FullName;
         File.WriteAllBytes(Path.Combine(paks, "Proj-Windows.pak"), new byte[16]);
-        Assert.NotEqual("", reader.DetectStamp(game, engine));
+        var before = reader.DetectStamp(game, engine);
+        Assert.NotEqual("", before);
+        Directory.CreateDirectory(new AppStore(data).GameDir(game.Id));
+        File.WriteAllText(Path.Combine(new AppStore(data).GameDir(game.Id), "aes.key"), "0x" + new string('7', 64));
+        Assert.NotEqual(before, reader.DetectStamp(game, engine));   // a key added re-runs detection
     }
 
     [Fact]

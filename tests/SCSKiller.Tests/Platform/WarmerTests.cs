@@ -641,6 +641,26 @@ public class WarmerTests : IDisposable
         Assert.Equal(10, r.Done);
     }
 
+    /// <summary>The tree a job takes in and a pause suspends: an older process whose exited parent's pid the warm now has
+    /// (Windows reuses pids) isn't its child, nor anything under it.</summary>
+    [Fact]
+    public void A_process_tree_leaves_out_an_older_process_naming_a_reused_pid()
+    {
+        (int, int, long?)[] procs =
+        [
+            (100, 1, 50),     // the warm
+            (200, 100, 60),   // its staged child
+            (300, 200, 60),   // started in the same tick
+            (400, 100, 10),   // the runner's launcher: its parent exited long ago and 100 was reused
+            (500, 400, 20),   // what the launcher started
+            (600, 100, null), // couldn't be opened
+            (700, 600, 70),
+        ];
+        Assert.Equal([100, 200, 300], ProcessTree.Tree(100, procs));
+        Assert.Equal([100], ProcessTree.Tree(100, [(100, 1, null), (200, 100, 60)]));   // the root's time unknown: nothing under it
+        Assert.Equal([100], ProcessTree.Tree(100, [(200, 100, 60)]));                   // exited
+    }
+
     [Fact]
     public async Task Warms_and_their_children_are_in_a_job_that_kills_them_when_its_owner_ends()
     {

@@ -3026,8 +3026,11 @@ static HRESULT compute_pso(ID3D12Device* dev, ID3D12RootSignature* rs, int k) {
 // `selftest anticheat <client dll | ->`: a compute PSO on a device made through the proxy d3d12.dll next to the exe (WARP),
 // then the client dll is loaded (an anti-cheat client's module name; "-": none) and a second PSO. Prints
 // "created 0x<hr> 0x<hr>". The proxy decided admission at the device: a client loaded after it doesn't change the run.
+// "+<client dll>": the client is loaded before the device instead.
 static int anticheat_rows(const std::wstring& dir, const wchar_t* client) {
     SetEnvironmentVariableW(L"SCSKILLER_MODE", L"record");
+    const bool early = *client == L'+';
+    if (early) CHECK(LoadLibraryW(client + 1));
     HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str());
     CHECK(m);
     auto create = (decltype(&D3D12CreateDevice))GetProcAddress(m, "D3D12CreateDevice");
@@ -3043,7 +3046,7 @@ static int anticheat_rows(const std::wstring& dir, const wchar_t* client) {
     ID3D12RootSignature* rs = nullptr;
     CHECK(SUCCEEDED(ser(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err)) && SUCCEEDED(dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(&rs))));
     HRESULT a = compute_pso(dev, rs, GetTickCount());
-    if (wcscmp(client, L"-")) CHECK(LoadLibraryW(client));
+    if (wcscmp(client, L"-") && !early) CHECK(LoadLibraryW(client));
     HRESULT b = compute_pso(dev, rs, GetTickCount() + 1);
     printf("created 0x%08x 0x%08x\n", (unsigned)a, (unsigned)b);
     return 0;

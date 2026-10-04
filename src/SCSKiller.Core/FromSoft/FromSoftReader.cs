@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using SCSKiller.Core.Carved;
+using SCSKiller.Core.Planning;
 using SCSKiller.Core.Unreal;
 
 namespace SCSKiller.Core.FromSoft;
@@ -12,7 +13,8 @@ namespace SCSKiller.Core.FromSoft;
 /// whose files hold the DXBC/DXIL containers. In DS3 and Elden Ring they sit inside the BHD5/BDT archives (headers decrypted
 /// with the game's public RSA keys, read from its exe at run time: <see cref="SoulsKeys"/>), found by the hash of their
 /// well-known names. Read-only and in memory: nothing is unpacked to disk, the game's own code (and its Oodle DLL) is never
-/// loaded or run.
+/// loaded or run. The game creates its root signatures from the 1.1 ones its shaders carry (RTS0), serialized again at
+/// version 1.0 (<see cref="RootSig.AsVersion10"/>), so each shader's root signature is that blob, served by ReadShaders.
 /// EngineInfo: Family "FromSoftware", Version "&lt;title&gt; DXBC|DXIL[+RTS0]" once indexed ("&lt;title&gt;" at Detect).</summary>
 /// <param name="dataDir">the app's data folder: the archive keys found in each game's exe are kept there (local only)</param>
 /// <param name="download">see <see cref="SoulsKeys"/> (tests pass a fake)</param>
@@ -102,6 +104,9 @@ public sealed class FromSoftReader(string dataDir, Func<string, string?>? downlo
     /// process that never indexed.</summary>
     readonly ConcurrentDictionary<string, IReadOnlyDictionary<string, string>> located = new();
 
+    /// <summary>The root signatures the game creates (SHA-1 -> blob), per game id, from the last Index.</summary>
+    readonly ConcurrentDictionary<string, IReadOnlyDictionary<string, byte[]>> created = new();
+
     public ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, CancellationToken ct)
     {
         var title = TitleOf(game) ?? throw new NotSupportedException($"{game.ExePath}: not a FromSoftware title this reader knows");
@@ -111,7 +116,8 @@ public sealed class FromSoftReader(string dataDir, Func<string, string?>? downlo
         var fileOf = new Dictionary<string, string>();          // container -> its top-level shader file
         var shaders = new Dictionary<string, ShaderInfo>();
         var pools = new Dictionary<string, List<string>>();     // innermost binder -> its shaders, file order
-        var rootSigs = new RootSigCarriers();
+        var partOf = new Dictionary<string, string>();          // shader -> SHA-1 of its RTS0 part
+        var rootSigs = new Dictionary<string, (string Sha, byte[] Blob)?>(); // RTS0 part -> the root signature the game creates from it
         var platformOf = new Dictionary<string, string>();
         int bad = 0, files = 0;
         // ponytail: each shader file is decompressed whole (the ~30k-shader bundle: ~1 GB transient); stream the BND4 if memory bites
@@ -124,13 +130,19 @@ public sealed class FromSoftReader(string dataDir, Func<string, string?>? downlo
                 if (fileOf.TryAdd(sha, name))
                 {
                     var kind = Dxbc.Kind(c);
-                    rootSigs.See(c, sha, kind);
                     if (kind < 0) return;
                     try
                     {
                         if (ShaderContainer.Parse(c, sha, new(0, 0, 0, 0)) is not { } info) return;
                         shaders[sha] = info with { Counts = CarvedReader.Counts(info.Bindings) };
                         platformOf[sha] = CarvedReader.LanePlatform(Dxbc.WaveLanes(c)) ?? (Dxbc.Part(c, "DXIL"u8).IsEmpty ? D3D11 : CarvedReader.Platform);
+                        if (Dxbc.Part(c, "RTS0"u8) is { IsEmpty: false } rts && Convert.ToHexStringLower(SHA1.HashData(rts)) is var part)
+                        {
+                            partOf[sha] = part;
+                            if (!rootSigs.ContainsKey(part))
+                                try { var b = RootSig.AsVersion10(c); rootSigs[part] = (Convert.ToHexStringLower(SHA1.HashData(b)), b); }
+                                catch (RootSig.SerializeException) { rootSigs[part] = null; } // no 1.0 form: the shader plans without one
+                        }
                     }
                     catch (Exception e) when (e is ArgumentException or IndexOutOfRangeException) { bad++; return; } // valid container, odd program
                 }
@@ -140,10 +152,12 @@ public sealed class FromSoftReader(string dataDir, Func<string, string?>? downlo
                 list.Add(sha);
             }, ct);
         }
-        rootSigs.Apply(shaders);
+        foreach (var (sha, part) in partOf)
+            if (rootSigs[part] is { } rs) shaders[sha] = shaders[sha] with { RootSignature = rs.Sha };
 
         var maps = pools.SelectMany(p => p.Value.Distinct().GroupBy(s => platformOf[s])
             .Select(g => new ShaderMap(CarvedReader.Sha1Hex($"{p.Key}|{g.Key}"), p.Key, g.Key, g.ToList()))).ToList();
+        created[game.Id] = rootSigs.Values.OfType<(string Sha, byte[] Blob)>().DistinctBy(r => r.Sha).ToDictionary(r => r.Sha, r => r.Blob); // two 1.1 forms can become one 1.0 blob
         located[game.Id] = fileOf;
 
         using var content = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
@@ -169,6 +183,8 @@ public sealed class FromSoftReader(string dataDir, Func<string, string?>? downlo
         }
         var want = sha1s.Where(fileOf.ContainsKey).Select(s => fileOf[s]).ToHashSet();
         var sent = new HashSet<string>();
+        foreach (var h in sha1s)
+            if (created[game.Id].TryGetValue(h, out var rs) && sent.Add(h)) sink(h, rs);
         var dir = Path.GetDirectoryName(game.ExePath)!;
         var archives = Archives(game, dir, title, out var why) ?? throw new InvalidDataException(why);
         foreach (var (name, bytes) in ShaderFilesOf(dir, title, archives, sample: false, want, ct))

@@ -53,8 +53,10 @@
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <Button Content="Game folder…" Click="OnGameFolder" Visibility="{x:Bind Vm.IsManual, Mode=OneWay}"
+                            ToolTipService.ToolTip="The folder SCSKiller checks for anti-cheat before it records this game" />
                     <Button Content="Remove from library" Click="OnRemoveGame" Visibility="{x:Bind Vm.IsManual, Mode=OneWay}"
-                            ToolTipService.ToolTip="Forget this game. Nothing in its folder is touched." />
+                            ToolTipService.ToolTip="Forget this game. Its recorder leaves the game folder; the game's own files stay." />
                     <Grid Background="Transparent" ToolTipService.ToolTip="{x:Bind Vm.PlayTip, Mode=OneWay}" Visibility="{x:Bind Vm.ShowPlay, Mode=OneWay}">
                         <Button Content="{x:Bind Vm.PlayText, Mode=OneWay}" Click="{x:Bind Vm.Play}" IsEnabled="{x:Bind Vm.CanPlay, Mode=OneWay}" />
                     </Grid>
@@ -321,6 +323,10 @@
                                           IsOn="{x:Bind Vm.RecordOn, Mode=OneWay}" IsEnabled="{x:Bind Vm.CanToggleRecord, Mode=OneWay}" Toggled="OnRecordToggled"
                                           AutomationProperties.Name="Record while I play" AutomationProperties.HelpText="{x:Bind Vm.RecordNote, Mode=OneWay}" />
                         </Grid>
+                        <StackPanel Spacing="14" Visibility="{x:Bind Vm.ShowOfflineOn, Mode=OneWay}">
+                            <InfoBar IsOpen="True" IsClosable="False" Severity="Error" Title="Ban risk" Message="{x:Bind Vm.OfflineRiskText}" />
+                            <Button HorizontalAlignment="Right" Content="{x:Bind Vm.OfflineButtonText, Mode=OneWay}" Click="OnRecordOffline" IsEnabled="{x:Bind Vm.CanStartOffline, Mode=OneWay}" />
+                        </StackPanel>
                         <Grid ColumnSpacing="12" Visibility="{x:Bind Vm.HasMod, Mode=OneWay}">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition />

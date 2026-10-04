@@ -45,9 +45,13 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
 
         Assert.Equal((2L, 1L), (nv.Stats.RtLibraries, nv.Stats.RtUncovered)); // the rt-bindless library is left to a recording
 
-        // AMD caches whole objects only; UE 5 but 5.1 has no rule without a recording: every library is left to a recording
+        // AMD caches whole objects only; UE 5's rule needs 5.1's binding shape, which these libraries lack: every library is left to a recording
         var amd = new Planner().Build(Ff7.Game, Ue427, Index(), null, Ff7.Amd, Path.Combine(dir, "amd"), null, CancellationToken.None);
         var ue5 = new Planner().Build(Ff7.Game, Ue427 with { Version = "5.2" }, Index(), null, Nvidia, Path.Combine(dir, "ue5"), null, CancellationToken.None);
+        // r.RayTracing.AllowPipeline=0: a collection would never be linked
+        var off = new Planner().Build(Ff7.Game, Ue427 with { NoRtPipelines = true }, Index(), null, Nvidia, Path.Combine(dir, "off"), null, CancellationToken.None);
+        Assert.Empty(Items(off));
+        Assert.Equal((2L, 0L), (off.Stats.RtLibraries, off.Stats.RtUncovered));
         Assert.Empty(Items(amd));
         Assert.Empty(Items(ue5));
         Assert.Equal((2L, 2L), (ue5.Stats.RtLibraries, ue5.Stats.RtUncovered));
@@ -171,6 +175,50 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         Assert.Equal((0L, 0L), Rt("inline-only", noLibraries, Sfi0(RayQuery)));
     }
 
+    /// <summary>Unreal 5 whose game files have shaders that trace rays inline (hardware Lumen) counts them: its DXIL
+    /// libraries, still uncovered, then don't need a recording. Unreal 4 and a state object recorded keep the DXR rule.</summary>
+    [Fact]
+    public void Unreal5InlineShadersInTheGameFilesCount()
+    {
+        var dir = Ff7.TempDir("rt-ue5-inline");
+        var cs = new ShaderInfo(Hash("rq-cs"), Stage.Compute, "cs_6_5", 100, new ResourceCounts(1, 1, 1, 0), [], [], [], InlineRayTracing: true);
+        var index = new ShaderIndex("rt", ["PCD3D_SM5"], new[] { Vs, Chs, Bindless, cs }.ToDictionary(s => s.Sha1),
+            [new ShaderMap("m", "Game", "PCD3D_SM5", [Vs.Sha1, Chs.Sha1, Bindless.Sha1]), new ShaderMap("c", "Game", "PCD3D_SM5", [cs.Sha1])]);
+        PlanStats Stats(EngineInfo e, string name) => new Planner().Build(Ff7.Game, e, index, null, Nvidia, Path.Combine(dir, name), null, CancellationToken.None).Stats;
+        var ue56 = Stats(Ue427 with { Version = "5.6" }, "ue56");
+        Assert.Equal((2L, 2L, (long?)1), (ue56.RtLibraries, ue56.RtUncovered, ue56.RtInline));   // the page's count stays
+        Assert.Equal((false, true), (ScsKiller.NeedsRtRecording(ue56), ScsKiller.RtInlineCovers(ue56)));
+        Assert.True(ScsKiller.NeedsRtRecording(ue56 with { RtInline = 0 }));
+        Assert.False(ScsKiller.NeedsRtRecording(ue56 with { RtStateObjects = 1 }));   // a recording with a state object: the DXR path
+        var ue427 = Stats(Ue427 with { Version = "4.27" }, "ue427");
+        Assert.Equal((long?)0, ue427.RtInline);
+        Assert.False(ScsKiller.RtInlineCovers(ue427));
+
+        // r.RayTracing.AllowPipeline=0: no state object is ever built, the libraries are counted but uncovered by none
+        var off = Stats(Ue427 with { Version = "5.6", NoRtPipelines = true }, "off");
+        Assert.Equal((2L, 0L), (off.RtLibraries, off.RtUncovered));
+        Assert.Equal((false, false), (ScsKiller.NeedsRtRecording(off), ScsKiller.RtInlineCovers(off)));
+    }
+
+    /// <summary>The Windows device profile's r.RayTracing.AllowPipeline from the configs in the paks (SILENT HILL: Townfall's
+    /// Townfall/Platforms/Windows/Config/WindowsDeviceProfiles.ini), the project's over the engine's.</summary>
+    [Fact]
+    public void RayTracingPipelinesOffInTheWindowsDeviceProfile()
+    {
+        static string Ini(params string[] lines) => string.Join(Environment.NewLine, lines);
+        var townfall = Ini("[Windows DeviceProfile]", "DeviceType=Windows", "+CVars=r.RayTracing.AllowPipeline=0", "");
+        bool Off(params (string Path, string Text)[] files) => UnrealRhi.RtPipelinesOff(files.ToDictionary(f => f.Path, f => f.Text, StringComparer.OrdinalIgnoreCase), "Townfall");
+        const string platform = "Townfall/Platforms/Windows/Config/WindowsDeviceProfiles.ini", project = "Townfall/Config/DefaultDeviceProfiles.ini", engine = "Engine/Config/BaseDeviceProfiles.ini";
+        Assert.True(UnrealRhi.IsConfig(platform, "Townfall"));
+        Assert.True(Off((platform, townfall)));
+        Assert.False(Off());
+        Assert.False(Off((project, Ini("[WindowsNoEditor DeviceProfile]", "+CVars=r.RayTracing.AllowPipeline=0"))));   // another profile
+        Assert.False(Off((engine, townfall), (project, Ini("[Windows DeviceProfile]", "+CVars=r.RayTracing.AllowPipeline=1"))));
+        Assert.False(Off((engine, townfall), (project, Ini("[Windows DeviceProfile]", "-CVars=r.RayTracing.AllowPipeline=0"))));
+        Assert.False(Off((platform, townfall + Ini("!CVars=ClearArray"))));
+        Assert.True(Off((project, Ini("[Windows DeviceProfile]", "+CVars=r.RayTracing.AllowPipeline=1")), (platform, townfall)));   // the platform file comes last
+    }
+
     /// <summary>UE 4.26's local root signature: none for a ray generation shader; the hit group system parameters, then the
     /// shader's tables and root CBVs.</summary>
     [Fact]
@@ -183,22 +231,72 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         Assert.Equal("1,0,0,2,6", string.Join(',', RtCollections.LocalRs(new(0, 0, 0, 0), rayGen: false, systemConstants: 6).Rows[2])); // UE 5.1
     }
 
-    /// <summary>UE 5.1 without a recording: <see cref="RtCollections.Ue51Global"/>, 6 system constants, each library's own payload.</summary>
+    // UE 5.0-5.4's binding shape: a ray generation library's uniform buffers in space 1, a hit library's index and vertex buffers t0/t1 in space 2
+    static readonly ShaderInfo Rgs = Lib("rt-rgs", new Binding("cbv", 1, 0, 1), new Binding("cbv", 1, 1, 1), new Binding("srv", 1, 0, 5), new Binding("uav", 1, 0, 1));
+    static readonly ShaderInfo Hit5 = Lib("rt-hit5", new Binding("srv", 0, 0, 3), new Binding("sampler", 0, 0, 1), new Binding("cbv", 0, 0, 1), new Binding("cbv", 0, 1, 1),
+        new Binding("srv", 2, 0, 1), new Binding("srv", 2, 1, 1), new Binding("cbv", 2, 0, 1));
+    // UE 5.6's bindless ray tracing (SILENT HILL: Townfall): CBVs only, shared uniform buffers in space 4, heap access flagged
+    static readonly ShaderInfo Hit56 = new(Hash("rt-hit56"), Stage.Library, "lib_6_6", 100,
+        new ResourceCounts(2, 0, 0, 0, ShaderContainer.UeFlags.BindlessResources | ShaderContainer.UeFlags.BindlessSamplers),
+        [new Binding("cbv", 0, 0, 1), new Binding("cbv", 2, 0, 1), new Binding("cbv", 4, 0, 1), new Binding("cbv", 4, 1, 1)], [], []);
+
+    static ShaderIndex Ue5Index(params ShaderInfo[] libs) => new("rt", ["PCD3D_SM6"], libs.Prepend(Vs).ToDictionary(s => s.Sha1),
+        [new ShaderMap("m", "Game", "PCD3D_SM6", [Vs.Sha1, .. libs.Select(l => l.Sha1)])]);
+
     [Fact]
-    public void Ue51CollectionsWithoutARecording()
+    public void Ue5BindingShape()
     {
-        var dir = Ff7.TempDir("rt-ue51");
-        var ue51 = Ue427 with { Version = "5.1" };
-        var plan = new Planner().Build(Ff7.Game, ue51, Index(), null, Nvidia, dir, new Log(output.WriteLine), CancellationToken.None);
-        var y = Assert.Single(Items(plan)); // the bindless library is left out
+        Assert.Null(RtCollections.Ue5ShapeMismatch([Rgs, Hit5, Bindless]));
+        Assert.Null(RtCollections.Ue5ShapeMismatch([Rgs, Hit5 with { Bindings = [.. Hit5.Bindings.Take(4), new Binding("srv", 2, 0, 2), new Binding("cbv", 2, 0, 1)] }])); // t0-t1 as one range
+        Assert.Equal("no hit group index and vertex buffers (t0/t1 space 2)", RtCollections.Ue5ShapeMismatch([Rgs, Chs])); // t0 only
+        Assert.Equal("no uniform buffers in space 1", RtCollections.Ue5ShapeMismatch([Hit5]));
+        Assert.Equal("bindless descriptor heap access", RtCollections.Ue5ShapeMismatch([Rgs, Hit5, Hit56]));
+        Assert.Equal("bindless descriptor heap access", RtCollections.Ue5ShapeMismatch([Rgs, Hit5, Hit5 with { Sha1 = Hash("rt-heap"), Counts = Hit5.Counts with { Flags = ShaderContainer.UeFlags.BindlessResources } }]));
+        Assert.Equal("shared uniform buffers in space 4", RtCollections.Ue5ShapeMismatch([Rgs, Hit5, Hit56 with { Counts = Hit56.Counts with { Flags = 0 } }]));
+    }
+
+    /// <summary>UE 5.0-5.4 without a recording, for libraries of 5.1's binding shape: <see cref="RtCollections.Ue51Global"/>
+    /// (5.4: <see cref="RtCollections.Ue54Global"/>, its 32 samplers), 6 system constants, each library's own payload.</summary>
+    [Theory]
+    [InlineData("5.0")]
+    [InlineData("5.1")]
+    [InlineData("5.3")]
+    [InlineData("5.4")]
+    public void Ue5CollectionsWithoutARecording(string version)
+    {
+        var dir = Ff7.TempDir("rt-ue5-" + version);
+        var log = new List<string>();
+        var plan = new Planner().Build(Ff7.Game, Ue427 with { Version = version }, Ue5Index(Rgs, Hit5, Bindless), null, Nvidia, dir, new Log(l => { log.Add(l); output.WriteLine(l); }), CancellationToken.None);
+        var ys = Items(plan).ToDictionary(y => y.Library); // the bindless library is left out
+        Assert.Equal([Rgs.Sha1, Hit5.Sha1], ys.Keys.Order());
+        var y = ys[Hit5.Sha1];
         Assert.Equal((0u, 8u, 1u, 4u), (y.Payload, y.Attributes, y.Depth, y.Flags));
-        var (global, blob) = RtCollections.Serialize(RtCollections.Ue51Global, RootSig.Ue426Samplers);
+        var desc = version == "5.4" ? RtCollections.Ue54Global : RtCollections.Ue51Global;
+        var (global, blob) = RtCollections.Serialize(desc, RootSig.Ue426Samplers);
         Assert.Equal(global, y.Global);
-        Assert.Equal(["0,0,0,64,0,1,5", "0,0,3,16,0,1,1", "0,0,1,16,0,1,3", "2,0,0,1,8"], RtCollections.Ue51Global.Rows.Take(4).Select(r => string.Join(',', r)));
-        Assert.Equal("4,0,0,999,2", string.Join(',', RtCollections.Ue51Global.Rows[^1]));
+        Assert.Equal(["0,0,0,64,0,1,5", $"0,0,3,{(version == "5.4" ? 32 : 16)},0,1,1", "0,0,1,16,0,1,3", "2,0,0,1,8"], desc.Rows.Take(4).Select(r => string.Join(',', r)));
+        Assert.Equal("4,0,0,999,2", string.Join(',', desc.Rows[^1]));
         if (D3D12Runtime.Available) Assert.Equal(0, D3D12Runtime.CreateRootSignature(blob));
-        Assert.Equal(RtCollections.Serialize(RtCollections.LocalRs(Chs.Counts, false, Chs.Bindings, 6), []).Hash, y.LocalOther);
-        Assert.Equal((2L, 1L), (plan.Stats.RtLibraries, plan.Stats.RtUncovered));
+        Assert.Equal(RtCollections.Serialize(RtCollections.LocalRs(Hit5.Counts, false, Hit5.Bindings, 6), []).Hash, y.LocalOther);
+        Assert.Equal((3L, 1L), (plan.Stats.RtLibraries, plan.Stats.RtUncovered));
+        Assert.Contains(log, l => l.Contains(version == "5.1" ? "Oblivion Remastered's recording" : $"unverified for {version}"));
+    }
+
+    /// <summary>Libraries not of 5.1's binding shape (5.4 bindless, a 5.1 game whose hit libraries bind no index buffers) and
+    /// UE 5.5/5.6 (bindless ray tracing, no rule): nothing synthesized, every library left to a recording, the log says why.</summary>
+    [Theory]
+    [InlineData("5.4", "bindless descriptor heap access")]
+    [InlineData("5.1", "no hit group index and vertex buffers")]
+    [InlineData("5.5", "no collection rule for Unreal 5.5")]
+    [InlineData("5.6", "no collection rule for Unreal 5.6")]
+    public void NoUe5CollectionsForAnotherShape(string version, string why)
+    {
+        var log = new List<string>();
+        ShaderInfo[] libs = version == "5.1" ? [Rgs, Chs] : [Rgs, Hit5, Hit56];
+        var plan = new Planner().Build(Ff7.Game, Ue427 with { Version = version }, Ue5Index(libs), null, Nvidia, Ff7.TempDir("rt-ue5-off-" + version), new Log(log.Add), CancellationToken.None);
+        Assert.Empty(Items(plan));
+        Assert.Equal((libs.Length, libs.Length), ((int)plan.Stats.RtLibraries, (int)plan.Stats.RtUncovered));
+        Assert.Contains(log, l => l.StartsWith("ray tracing") && l.Contains(why) && l.Contains("none synthesized"));
     }
 
     /// <summary>A DXIL library container with just an RDAT part (a string buffer and a function table): what
@@ -443,6 +541,30 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         output.WriteLine($"{ys.Count} collections planned without the recording; recorded collections rebuilt from them: {same}/{cols.Count}");
         Assert.True(cols.Count > 500, $"only {cols.Count} recorded collections");
         Assert.Equal(cols.Count, same);
+    }
+
+    /// <summary>Darwin's Paradox (stock UE 5.4, no recording), read only: its DXIL libraries have 5.1's binding shape, so
+    /// its plan synthesizes a collection per library with <see cref="RtCollections.Ue54Global"/>, unverified in game.</summary>
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void DarwinsParadoxGetsTheUe5Rule()
+    {
+        var game = new SCSKiller.Core.Games.SteamSource().Discover().FirstOrDefault(g => g.Id == "steam:2989180");
+        if (game == null) return;
+        Ff7.Codecs();
+        var reader = new UnrealReader(Ff7.TempDir("rt-darwin-data"));
+        var engine = reader.Detect(game)!;
+        Assert.Equal(("5.4", null), (engine.Version, engine.Fork));
+        var index = reader.Index(game, engine, null, CancellationToken.None);
+        var libs = index.Shaders.Values.Where(s => s.Stage == Stage.Library).ToList();
+        Assert.Null(RtCollections.Ue5ShapeMismatch(libs));
+        var log = new List<string>();
+        var plan = new Planner().Build(game, engine, index, null, Nvidia, Ff7.TempDir("rt-darwin-plan"), new Log(log.Add), CancellationToken.None);
+        foreach (var l in log.Where(l => l.StartsWith("ray tracing"))) output.WriteLine(l);
+        var ys = Items(plan);
+        Assert.All(ys, y => Assert.Equal(RtCollections.Serialize(RtCollections.Ue54Global, RootSig.Ue426Samplers).Hash, y.Global));
+        Assert.Equal(plan.Stats.RtLibraries, ys.Count + plan.Stats.RtUncovered);
+        Assert.True(ys.Count > 0.99 * libs.Count, $"{ys.Count}/{libs.Count}");
     }
 
     const string JediInstall = @"D:\EA\Jedi Survivor";

@@ -16,6 +16,8 @@ public static class Program
     static int Main(string[] args)
     {
         Updater.RunHooks();   // first: Update.exe runs install/update/uninstall hooks through here, and they exit
+        // an offline session's cleanup helper: no window, no instance of its own
+        if (args is [Core.App.ScsKiller.CleanupArg, var game]) return Core.App.ScsKiller.RunOfflineCleanup(new Core.App.AppStore(Core.App.AppStore.DefaultDir), game, exe: Environment.ProcessPath);
         WinRT.ComWrappersSupport.InitializeComWrappers();
         if (!IsDesignRun(args) && RedirectedToRunning()) return 0;
         Microsoft.UI.Xaml.Application.Start(p =>

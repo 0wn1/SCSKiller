@@ -101,6 +101,7 @@ public static class Updater
             if (Busy.IsHeld()) return Undo("A compile started meanwhile. The update installs when SCSKiller quits after it has finished.");
             if (Usable(ready) is null) return Undo("The update channel changed meanwhile. Restart to update again once it is ready.");
             if (still?.Invoke() == false) return Undo(null);
+            if (OfflineBlocks()) return Undo(OfflineRunning);
             apply(m, r);   // its preparation too (the resume file): a failure anywhere is undone below
             return true;
         }
@@ -128,6 +129,8 @@ public static class Updater
         }
     }
 
+    const string OfflineRunning = "An offline session's game or cleanup is running. The update installs once it has ended.";
+
     public static bool Installed { get; } = Manager(UpdateChannels.Stable, false).IsInstalled;
 
     /// <summary>At app start (real data only): check soon and every 6 h. A package downloaded before isn't ready by itself:
@@ -148,8 +151,8 @@ public static class Updater
     {
         if (!Installed || Busy.Marked(DataDir)) return;
         await CheckAsync(download: false);
-        if (Usable(ready) is not null && Untouched())
-            await ApplyAsync(TimeSpan.Zero, (m, r) => m.ApplyUpdatesAndRestart(r, args), Untouched);   // exits this process
+        if (Usable(ready) is not null && Untouched() && BeginUpdate())
+            if (!await ApplyAsync(TimeSpan.Zero, (m, r) => m.ApplyUpdatesAndRestart(r, args), Untouched)) EndUpdate();   // exits this process
         if (Usable(ready) is null) await CheckAsync();   // the timer's first check skips while this one runs
 
         // on the UI thread, like Quit and the queue's changes: nothing slips in between this and the handover
@@ -204,13 +207,19 @@ public static class Updater
         }
     }
 
+    // An apply stops every process under the install root, an offline session's cleanup helper too: from its start until it
+    // is handed over, no offline session starts, and one that started before holds it back (ScsKiller.OfflineBlocksUpdate)
+    static bool BeginUpdate() => App.Core is not Core.App.ScsKiller k || k.BeginUpdate();
+    static void EndUpdate() => (App.Core as Core.App.ScsKiller)?.EndUpdate();
+    static bool OfflineBlocks() => App.Core is Core.App.ScsKiller { OfflineBlocksUpdate: true };
+
     /// <summary>App exit (the tray's Quit): hands a downloaded update to Update.exe, which swaps it in once this process
-    /// has exited. Not while a queue item runs (here or in the CLI), nor while a check still downloads after 30 s: then at
-    /// a later exit.</summary>
+    /// has exited. Not while a queue item runs (here or in the CLI), nor while a check still downloads after 30 s, nor
+    /// while an offline session is pending: then at a later start or exit.</summary>
     public static async Task ApplyOnExitAsync()
     {
-        if (Usable(ready) is null || Busy.IsHeld()) return;
-        await ApplyAsync(TimeSpan.FromSeconds(30), (m, r) => m.WaitExitThenApplyUpdates(r, silent: true, restart: false));
+        if (Usable(ready) is null || Busy.IsHeld() || !BeginUpdate()) return;
+        if (!await ApplyAsync(TimeSpan.FromSeconds(30), (m, r) => m.WaitExitThenApplyUpdates(r, silent: true, restart: false))) EndUpdate();
     }
 
     /// <summary>"Restart to update": stops the queue gracefully (in-flight compiles finish, the driver writes its cache),
@@ -219,8 +228,15 @@ public static class Updater
     public static async Task<bool> RestartAsync()
     {
         if (Usable(ready) is null) return false;
+        if (!BeginUpdate())
+        {
+            Problem = OfflineRunning;
+            Changed?.Invoke();
+            return false;
+        }
         (Restarting, Problem) = (true, null);
         Changed?.Invoke();
+        var applied = false;
         try
         {
             // plan checks aren't resumed: the next version's scan queues its own
@@ -233,7 +249,7 @@ public static class Updater
                 Problem = "The background rebuild after a driver update is compiling. The update installs when SCSKiller quits after it has finished.";
                 return false;
             }
-            return await ApplyAsync(Timeout.InfiniteTimeSpan, (m, r) =>
+            return applied = await ApplyAsync(Timeout.InfiniteTimeSpan, (m, r) =>
             {
                 if (queued.Count > 0) File.WriteAllLines(ResumeFile, queued);
                 m.ApplyUpdatesAndRestart(r);   // exits this process
@@ -241,6 +257,7 @@ public static class Updater
         }
         finally
         {
+            if (!applied) EndUpdate();
             Restarting = false;
             Changed?.Invoke();
         }

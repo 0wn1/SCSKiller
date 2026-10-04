@@ -5,7 +5,7 @@ All notable changes to the SCSKiller app and command line. The format follows
 
 ## [Unreleased]
 
-## [1.1.3] - 2026-10-03
+## [1.2.0] - 2026-10-04
 
 ### Added
 
@@ -13,10 +13,20 @@ All notable changes to the SCSKiller app and command line. The format follows
   instead of only marking every game "Not supported on this GPU yet". Close it and it stays closed for that GPU.
 - Add a game no store lists, such as one from another launcher or in a folder of its own: "Add a game…" in the Library
   asks for its .exe. A launcher picked by mistake is followed to the game it starts, and an exe of a game already listed
-  opens that game. Added games get their own Library section and compile from their game files, with a community
-  recording once one matches their files. Recording isn't available for games added by hand yet, so a game that needs
-  a recording shows as not supported. Play starts the exe. "Remove from library" on the game page forgets the game and
-  touches nothing in its folder.
+  opens that game. Before adding, SCSKiller shows the program the recorder goes next to and the game folder it
+  suggests; change the folder if it isn't the game's own ("Game folder…" on the game page changes it later). SCSKiller
+  checks that whole folder for anti-cheat before it records, as for any game, and refuses a drive or a folder that
+  holds other games. Added games get their own Library section, compile, record and show up on their game page like
+  any other, and Play starts the exe. Their recordings aren't shared with the community database. "Remove from
+  library" on the game page takes the recorder out of the game folder and forgets the game; its files stay.
+- Record an offline session without EasyAntiCheat, at your own risk, in ELDEN RING and ARMORED CORE VI: games that run
+  offline without it when their exe is started directly. Allow it in "Record while I play" on the game's page, then
+  "Record offline session" asks you to confirm every time. SCSKiller puts the recorder in, starts the game itself
+  offline, and only that process is recorded: the game started any other way, through Steam with EasyAntiCheat too,
+  isn't. Steam must be running (offline mode is fine). The moment the game exits, the files come out, the recording and
+  the session's frame times are kept, and the game folder is checked to be as it was, also when SCSKiller was closed
+  meanwhile; after a crash or power loss, at the next logon or start. The recording is shared like any other while
+  sharing is on. Never offered for other anti-cheats or other games.
 
 ### Changed
 
@@ -28,15 +38,48 @@ All notable changes to the SCSKiller app and command line. The format follows
 - The recorder records only in games SCSKiller has fully checked for anti-cheat. Any change in the game folder switches
   it off until the next clean check, and a game updated while SCSKiller was closed isn't recorded until SCSKiller has
   checked it again.
+- Anti-cheat detection knows more anti-cheats: NCGuard (AION 2), Tencent's Anti-Cheat Expert, HoYoverse's, NetEase's,
+  Nexon's BlackCipher, AhnLab HackShield, PunkBuster, EQU8, Denuvo Anti-Cheat and more of XIGNCODE3 and nProtect
+  GameGuard. Their games are never recorded, including a game added by hand.
+- For a game added by hand, the anti-cheat check also looks at what lies directly in the folders above the game's
+  folder, up to the drive or a folder of many games. A game whose confirmed folder is a subfolder, such as War Thunder's
+  `win64`, is no longer recorded when BattlEye sits in the folder above. BattlEye's client DLL beside the exe is
+  recognised too.
 - In the frame-time graph, a ray-tracing state object counts as a shader stutter when it takes 25 ms or more to create,
   not 60 ms.
+- On NVIDIA, Unreal Engine 5.0 to 5.4 games compile their ray-tracing shaders without a recording, as 5.1 games already
+  did, when their shaders are laid out like 5.1's (Darwin's Paradox). Games laid out differently, such as Unreal 5.5 and
+  5.6's bindless ray tracing, still need a recording.
 
 ### Fixed
 
+- Elden Ring and Elden Ring Nightreign: a compile without a recording now uses the root signatures the game itself
+  creates. Before, every pipeline it compiled used a slightly different form, which the driver treats as another
+  pipeline, so the compile didn't save the game any work.
+- A compile could pause, or close when SCSKiller exited, an unrelated program: Windows reuses process IDs, and a program
+  whose parent had already exited could be taken for part of the compile.
+- The game page's button compiles right away, as "Compile queue" does: "Compile" (it said "Add to queue"), "Compile
+  carefully" and "Compile without ray tracing (partial)" only added the game to the queue, so nothing compiled until the
+  queue was started. The Library's "Add to queue" still only adds.
 - Unreal games that choose DirectX 12 from Steam's launch menu, such as Deep Rock Galactic, were detected as DirectX 11,
   so the recorder wasn't offered. Detection reads the game's Steam launch menu and its last log.
+- Unreal Engine 4 games that start on DirectX 11 but ship ray tracing, such as Ghostrunner, were detected as DirectX 11
+  only. Ray tracing needs DirectX 12, so they now count as DirectX 11 or 12: SCSKiller compiles for both and offers the
+  recorder. Adding an encrypted game's AES key also re-runs the detection at the next scan.
 - The Witcher 3's compile no longer tries the ray-tracing materials and the one pipeline NVIDIA's driver rejects (92
   failures per compile); the game page counts them as not covered.
+- A game with ray tracing that SCSKiller can't compile from its files (Unreal 5 games such as SILENT HILL: Townfall)
+  kept asking for a 5-minute recording after one was made. The recording's ray tracing was only looked at on the next
+  compile, so the status never changed. A recorded session is checked as soon as the game closes (while the PC is
+  idle): hardware Lumen's ray tracing is then covered by the recording, and a session of 5 minutes or more with no ray
+  tracing (software Lumen, or ray tracing off) makes the game ready to compile in full, with a note that playing with
+  ray tracing on covers it too. Once the recorder has seen 5 minutes of play, the status says what is missing instead
+  of asking for 5 minutes again.
+- Unreal 5 games whose shaders trace rays inline (hardware Lumen) no longer need a recording for their ray tracing:
+  it compiles from the game files. A game whose Windows device profile turns ray tracing pipelines off
+  (r.RayTracing.AllowPipeline=0, as SILENT HILL: Townfall does) never uses its ray tracing libraries, and the game page
+  says so. Otherwise the page notes that ray tracing using separate pipelines (such as path tracing) is compiled only
+  from a recording, and still counts those libraries as not compiled.
 
 ## [1.1.2] - 2026-10-03
 

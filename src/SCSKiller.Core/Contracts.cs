@@ -23,7 +23,8 @@ public sealed record EngineInfo(
     string? Fork,           // engine-reader specific fork id, e.g. CUE4Parse "GAME_FinalFantasy7Rebirth"
     string GraphicsApi,     // "D3D12", "D3D11", "Vulkan…" or "D3D11 or D3D12" (see Planner.Check)
     bool Encrypted,         // shader content unreadable without a key
-    string? Unsupported);   // why it can't be indexed (e.g. "shaders stored inside materials"); null = indexable
+    string? Unsupported,    // why it can't be indexed (e.g. "shaders stored inside materials"); null = indexable
+    bool NoRtPipelines = false);   // the game never builds a ray tracing state object (Unreal: r.RayTracing.AllowPipeline=0): its DXIL libraries go unused
 
 /// <summary>Shader stage, numbered like D3D12_PIPELINE_STATE_SUBOBJECT_TYPE (the proxy's db uses the same numbers).</summary>
 public enum Stage { Vertex = 1, Pixel = 2, Domain = 3, Hull = 4, Geometry = 5, Compute = 6, Amplification = 24, Mesh = 25, Library = 100 }
@@ -46,7 +47,8 @@ public sealed record ResourceCounts(int Cb, int Srv, int Uav, int Sampler,      
 public sealed record ShaderInfo(string Sha1, Stage Stage, string ShaderModel, int Size, ResourceCounts Counts,
     IReadOnlyList<Binding> Bindings, IReadOnlyList<SigElement> Inputs, IReadOnlyList<SigElement> Outputs,
     int GsInputPrimitive = 0,   // geometry shaders: D3D_PRIMITIVE of the input (1 point, 2 line, 3 triangle, 6 line_adj, 7 tri_adj); 0 otherwise
-    string? RootSignature = null);  // SHA-1 of the root-signature blob the shader carries (RTS0), servable through ReadShaders; null = none
+    string? RootSignature = null,   // SHA-1 of the root-signature blob the game creates from the one the shader carries (RTS0), servable through ReadShaders; null = none
+    bool InlineRayTracing = false);  // traces rays inline (RayQuery: Dxbc.InlineRayTracing)
 
 /// <summary>A group of shaders that can combine. <see cref="IsPipeline"/>: the game shipped this exact stage set as one
 /// pipeline (e.g. a PSO cache record), so no pairing is needed.</summary>
@@ -159,7 +161,8 @@ public sealed record PlanStats(long Recorded, long Generated, long SynthesizedTe
     long StageSets = 0,           // distinct stage sets the planner found in the game files (0 = a plan from before this was counted)
     long LeftOut = 0,             // of those, the ones not in the plan for any reason (no root signature, no template, Uncovered, stream output)
     long MiddlewareSharedItems = 0, // of MiddlewareItems, the ones only a shared pack (downloaded from the community database) had
-    long RtStateObjects = 0);     // ray tracing state objects of the recording the plan replays (0 = none recorded, or a plan from before this was counted)
+    long RtStateObjects = 0,      // ray tracing state objects of the recording the plan replays (0 = none recorded, or a plan from before this was counted)
+    long? RtInline = null);       // Unreal 5: the index's shaders on the plan's platform that trace rays inline (0 elsewhere; null = a plan from before this was counted)
 
 /// <summary>Hash-only plan (no game bytes), persisted at <see cref="FilePath"/> in the planner's format.</summary>
 public sealed record Plan(string GameId, string IndexContentHash, string Platform, string VendorProfile, PlanStats Stats, string FilePath);
@@ -252,7 +255,14 @@ public sealed record GameState(
     double? PsoPerSecond = null,   // the game's last complete warm onto a cold cache (ScsKiller.ColdWarm); null = none measured
     FrameReport? LastFrames = null,    // the last launch's frame times (FrameLog); null = none measured
     string? ShaderMod = null,          // a ReShade add-on that replaces the game's shaders (Games.ReShade.Detect); null = none
-    bool ShaderModBlocks = false);     // ...and adds to every root signature the game creates: never compiled, recorded or shared
+    bool ShaderModBlocks = false,      // ...and adds to every root signature the game creates: never compiled, recorded or shared
+    bool RootUnconfirmed = false,      // a game the user added whose folder they haven't confirmed: never recorded (ScsKiller.SkipManual)
+    bool RtUnseen = false,             // recorded long enough without ray tracing (GameRecord.RtUnseen) and planned since: its uncovered ray tracing isn't asked for
+    bool RtToPlan = false,             // its plan asks for a ray tracing recording and a newer recording waits for the plan check (ScsKiller.RtPlanCheck)
+    bool RecordedEnough = false,       // GameRecord.RecordedLong: asking for "5 minutes" again says nothing
+    bool OfflineEligible = false,      // an EasyAntiCheat game of Games.OfflineEac on D3D12: an offline session may be offered
+    bool OfflineRecord = false,        // the user allowed offline sessions for it (IScsKiller.SetOfflineRecording)
+    bool OfflineRunning = false);      // a session SCSKiller started runs, or its files aren't out of the game folder yet
 
 /// <summary>A launch's frame times from the recorder (<see cref="App.FrameLog"/>): its length, the startup stretch before
 /// play (the game's own precompile and first load), the 1% low of play, every frame of 50 ms or more, and for a graph
@@ -342,6 +352,9 @@ public interface IScsKiller
     void Enqueue(string gameId);
     /// <summary>Runs the waiting items in order until the queue is empty, then the queue stops.</summary>
     void StartQueue();
+    /// <summary>The game page's compile button: <see cref="Enqueue"/>, and if the queue isn't running, run its waiting items.
+    /// Unlike <see cref="StartQueue"/>, finished items stay listed and stopped ones stay stopped.</summary>
+    void Compile(string gameId);
     /// <summary>Reorders a waiting item; 0 = next to run. The running item doesn't move.</summary>
     void MoveInQueue(string gameId, int index);
     void EnqueueWhenIdle(string gameId);         // same, but runs as a background rebuild only while the PC is idle
@@ -394,12 +407,26 @@ public interface IScsKiller
     /// <summary>"Record alongside &lt;mod&gt;" (<see cref="GameState.RecorderMod"/>): the recorder may take a mod's d3d12.dll
     /// place, the mod renamed and put back byte for byte when the recorder goes. Never throws for the game's state.</summary>
     void SetRecordAlongsideMod(string gameId, bool on);
+    /// <summary>Allows offline sessions without EasyAntiCheat for the game (<see cref="GameState.OfflineEligible"/>); throws
+    /// InvalidOperationException for a game that isn't eligible.</summary>
+    void SetOfflineRecording(string gameId, bool on);
+    /// <summary>Puts the recorder in, starts the game's exe itself without EasyAntiCheat, and records that process only. Throws
+    /// InvalidOperationException, with nothing written, unless the user confirmed this launch, allowed it for the game and
+    /// the game is eligible and not running. The task ends once the game exited and its folder is back to how it was.</summary>
+    Task StartOfflineSession(string gameId, bool confirmed);
     /// <summary>A running game's folder is left alone: call again when it exits. Null = every game.</summary>
     void ReconcileRecorders(string? gameId = null);
-    /// <summary>Adds the game whose exe the user picked (<see cref="Games.ManualSource"/>); the next scan lists it.
-    /// ArgumentException with the message to show when the pick can't be a game; an exe that belongs to a listed game
-    /// returns that game with <see cref="ManualAdd.Existed"/>.</summary>
-    ManualAdd AddManualGame(string exePath);
+    /// <summary>What adding the exe would add, nothing saved: the resolved exe (where the recorder goes) and the suggested game
+    /// folder; or, with <see cref="ManualAdd.Existed"/>, the listed game it belongs to. ArgumentException as AddManualGame.</summary>
+    ManualAdd PreviewManualGame(string exePath);
+    /// <summary>Why <paramref name="installDir"/> can't be the game's folder (a drive, a store's library, a folder of several
+    /// games); null = it can.</summary>
+    string? ManualFolderProblem(string exePath, string installDir);
+    /// <summary>Adds the game whose exe the user picked (<see cref="Games.ManualSource"/>); the next scan lists it. With
+    /// <paramref name="installDir"/>, the game folder the user confirmed (an added game's is replaced): the recorder may then
+    /// go in, after the anti-cheat check of that whole folder. ArgumentException with the message to show when the pick
+    /// can't be a game or the folder can't be its; an exe of a store's game returns that game with <see cref="ManualAdd.Existed"/>.</summary>
+    ManualAdd AddManualGame(string exePath, string? installDir = null);
     /// <summary>Forgets a game the user added, after taking its recorder and the recorder's files out of the game folder;
     /// nothing else of the game is deleted. InvalidOperationException while it runs or compiles, or for a store's game.</summary>
     void RemoveManualGame(string gameId);

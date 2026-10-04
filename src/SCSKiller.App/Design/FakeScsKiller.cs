@@ -83,10 +83,17 @@ public sealed class FakeScsKiller : IScsKiller
                 with { InCommunityDb = false },
             // compiled without its ray tracing (the plan can't rebuild Unreal 5's), in the community database
             G("3300000", "Darwin's Paradox", "5.3", "DarwinsParadox-Win64-Shipping.exe", 108_542, GameStatus.NeedsRecording, Core.App.ScsKiller.RtNote(true), at: "epic",
-                plan: new PlanStats(0, 96_210, 96_210, 64, false, Uncovered: 794, RtLibraries: 412, RtUncovered: 412, StageSets: 97_004, LeftOut: 794)) with
+                plan: new PlanStats(0, 96_210, 96_210, 64, false, Uncovered: 794, RtLibraries: 412, RtUncovered: 412, StageSets: 97_004, LeftOut: 794, RtInline: 0)) with
             {
                 WarmedDriverVersion = "610.88", WarmedAt = DateTimeOffset.Now.AddDays(-1).AddHours(-3), LastWarmTime = TimeSpan.FromSeconds(204), CacheOnDisk = 2_310_000_000,
                 LastWarmFailed = 0, LastWarmSkipped = 0, InCommunityDb = true, CommunityDbPsos = 2_914,
+            },
+            // r.RayTracing.AllowPipeline=0: hardware Lumen traces rays inline, compiled from its files; its DXIL libraries go unused
+            G("3600000", "SILENT HILL: Townfall", "5.6", "Townfall-Win64-Shipping.exe", 45_741, GameStatus.Ready, "planned from a recording",
+                plan: new PlanStats(12_437, 48_134, 48_134, 682, true, RtLibraries: 10_278, RtUncovered: 0, StageSets: 122_075, RtInline: 1_193)) with
+            {
+                Engine = new EngineInfo("Unreal", "5.6", null, "D3D12", false, null, NoRtPipelines: true),
+                LastSession = new SessionStats(TimeSpan.FromMinutes(12), 4_388, 0, 3_902, 486, 141.0), RecordedEnough = true, RecordingBytes = 4_200_000,
             },
             G("3200000", "Windrose Demo", "5.5", "Windrose-Win64-Shipping.exe", null, GameStatus.Unsupported, "shaders cannot be read yet", encrypted: true),
             G("554620", "Life is Strange Remastered", "4.23", "LiSRemastered.exe", null, GameStatus.Unsupported, materials, unsupported: materials),
@@ -100,12 +107,12 @@ public sealed class FakeScsKiller : IScsKiller
             },
             G("1286680", "Tiny Tina's Wonderlands", "4.21", "Wonderlands.exe", 38_112, GameStatus.NeedsRecording, Core.Planning.Planner.Record) with { Playing = true },
             G("1245620", "ELDEN RING", "-", "eldenring.exe", null, GameStatus.Unsupported, "needs a recording, which EasyAntiCheat blocks") with { AntiCheat = AntiCheat.EasyAntiCheat,
-                Engine = new EngineInfo("FromSoft", "Dantelion", null, "D3D12", false, null) },
+                Engine = new EngineInfo("FromSoft", "Dantelion", null, "D3D12", false, null), OfflineEligible = true, OfflineRecord = true },
             G("293760", "Automation", "4.27", "Automation-Win64-Shipping.exe", null, GameStatus.Unsupported, packed, unsupported: packed, at: "gog"),
             // added by the user from their exe: no store launches them
             G("5f1c0e9a2b7d4c30", "The Talos Principle 2", "5.3", "Talos2-Win64-Shipping.exe", 71_244, GameStatus.Ready, Core.Planning.Planner.NoRecording, at: "manual"),
             G("a93e4b1170cd2f86", "Satisfactory", "5.3", "FactoryGameSteam-Win64-Shipping.exe", 39_512, GameStatus.Unsupported,
-                "needs a recording, " + ScsKiller.ManualNoRecording, at: "manual") with { RecorderSkip = ScsKiller.SkipManual },
+                "needs a recording, " + ScsKiller.ManualNoRecording, at: "manual") with { RecorderSkip = ScsKiller.SkipManual, RootUnconfirmed = true },   // its folder not confirmed yet
         ];
         Vendor = vendor;
         timer = new Timer(_ => Tick(), null, 500, 500);
@@ -171,6 +178,12 @@ public sealed class FakeScsKiller : IScsKiller
         return item with { Stage = QueueStage.Stopped };
     });
 
+    public void Compile(string gameId)
+    {
+        Enqueue(gameId);
+        if (!running) StartQueue();
+    }
+
     public void StartQueue() => Update(() =>
     {
         paused = false;
@@ -232,6 +245,17 @@ public sealed class FakeScsKiller : IScsKiller
         GameChanged?.Invoke(g);
     }
     public void ReconcileRecorders(string? gameId = null) { }   // the design data installs nothing by itself
+    public void SetOfflineRecording(string gameId, bool on)
+    {
+        GameState g;
+        lock (gate)
+        {
+            int i = games.FindIndex(x => x.Game.Id == gameId);
+            games[i] = g = games[i] with { OfflineRecord = on };
+        }
+        GameChanged?.Invoke(g);
+    }
+    public Task StartOfflineSession(string gameId, bool confirmed) => Task.CompletedTask;   // the design data starts no game
     public bool ClearRecording(string gameId)
     {
         GameState g;
@@ -259,7 +283,9 @@ public sealed class FakeScsKiller : IScsKiller
     }
     public void RefreshGame(string gameId) => GameChanged?.Invoke(Games.FirstOrDefault(g => g.Game.Id == gameId) ?? throw new ArgumentException($"unknown game '{gameId}'"));
     public void RefreshCacheSizes() { }   // sample data: nothing changes on disk
-    public ManualAdd AddManualGame(string exePath) => throw new ArgumentException("The sample library can't add games.");
+    public ManualAdd PreviewManualGame(string exePath) => throw new ArgumentException("The sample library can't add games.");
+    public string? ManualFolderProblem(string exePath, string installDir) => null;
+    public ManualAdd AddManualGame(string exePath, string? installDir = null) => throw new ArgumentException("The sample library can't add games.");
     public void RemoveManualGame(string gameId)
     {
         lock (gate) games.RemoveAll(g => g.Game.Id == gameId && g.Game.Store == Store.Manual);

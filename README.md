@@ -89,7 +89,9 @@ Measured with SCSKiller's pipeline recorder. Your numbers will vary by game, GPU
 - **Play button** in the Library and on a game's page: starts the game through its store.
 - **Community shader hash database** for Patreon supporters: other players' recordings, so your games are covered
   without recording them first. Sharing your own is opt-in and anonymous: shader hashes only.
-- **Never touches anti-cheat games** beyond reading their files: no launching, no injecting, no recorder.
+- **Never touches anti-cheat games** beyond reading their files: no launching, no injecting, no recorder. The one
+  exception is opt-in, per game and confirmed every time: an offline session without EasyAntiCheat for ELDEN RING and
+  ARMORED CORE VI, at your own risk.
 
 ## Install
 
@@ -139,7 +141,14 @@ If a game says it needs a recording, turn on **Record**, play it for a few minut
 ## FAQ
 
 **Is it safe with anti-cheat games?** SCSKiller never launches them, injects into them or gives them the recorder. It
-only reads their files.
+only reads their files. The one exception is an offline session, for games that run offline without EasyAntiCheat when
+their exe is started directly (ELDEN RING, ARMORED CORE VI): allowed per game on its page, confirmed before every launch,
+and at your own risk. SCSKiller adds `d3d12.dll`, `scskiller.ini`, `scskiller.armed` and `steam_appid.txt` to the game's
+folder, starts the game's exe itself (offline, no EasyAntiCheat), and the recorder records only that process: started any
+other way, through Steam with EasyAntiCheat too, it records nothing. Steam must be running (offline mode is fine). The
+moment the game exits, SCSKiller takes those files out again, keeps the recording and the session's frame times, and
+checks the folder is as it was, also when SCSKiller itself was closed meanwhile; after a crash or power loss it does so
+at the next logon or start. If its files are still there when you start the game online, you could be banned.
 
 **What does it write, and where?** Its settings and per-game plans go in `%LOCALAPPDATA%\SCSKiller\`, and the compiled
 pipelines go in your driver's own shader cache. Game files are never modified. The one exception is the optional

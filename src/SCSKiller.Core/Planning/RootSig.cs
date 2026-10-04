@@ -351,15 +351,84 @@ public static unsafe class RootSig
             *(uint*)(pd + 24) = (uint)(samplers.Length / 52);
             *(byte**)(pd + 32) = ps;
             *(uint*)(pd + 40) = d.Flags;
-            nint blob = 0, err = 0;
-            var hr = SerializeFn(pd, &blob, &err);
-            if (err != 0) Release(err);
-            if (hr < 0) throw new SerializeException($"D3D12SerializeVersionedRootSignature failed 0x{hr:x8}");
-            var vt = *(nint**)blob; // ID3DBlob: GetBufferPointer = slot 3, GetBufferSize = slot 4
-            var bytes = new ReadOnlySpan<byte>(((delegate* unmanaged<nint, void*>)vt[3])(blob), (int)((delegate* unmanaged<nint, nuint>)vt[4])(blob)).ToArray();
-            Release(blob);
-            return bytes;
+            return Call(pd);
         }
+    }
+
+    /// <summary>A serialized root signature (a container or its RTS0) again at version 1.0, as FromSoftware's engine creates
+    /// its root signatures from the 1.1 ones its shaders carry: range and root descriptor flags dropped, each range at its
+    /// explicit offset from the table's start (Elden Ring's recording: both of its root signatures for shipped shaders, byte
+    /// for byte). A 1.2 signature's static sampler flags don't fit 1.0: SerializeException.</summary>
+    public static byte[] AsVersion10(byte[] blob)
+    {
+        var b = Rts0(blob);
+        uint U(uint o) => BitConverter.ToUInt32(b, (int)o);
+        var (ver, n, at, ns, so) = (U(0), U(4), U(8), U(12), U(16));
+        var rangeSize = ver >= 2 ? 24u : 20u;
+        var ranges = new List<uint>();
+        var first = new int[n];
+        for (var i = 0u; i < n; i++)
+        {
+            first[i] = ranges.Count;
+            if (U(at + 12 * i) != 0) continue;
+            var p = U(at + 12 * i + 8);
+            var offset = 0u;
+            for (var r = 0u; r < U(p); r++)
+            {
+                var q = U(p + 4) + rangeSize * r;
+                var count = U(q + 4);
+                var own = U(q + rangeSize - 4);
+                var start = own == Append ? offset : own;
+                ranges.AddRange([U(q), count, U(q + 8), U(q + 12), start]);
+                offset = count == Unbounded || start == Append ? Append : start + count;
+            }
+        }
+        var samplers = new byte[Math.Max(1, ns) * 52];
+        for (var s = 0u; s < ns; s++)
+        {
+            var q = (int)(so + SamplerSize(ver) * s);
+            if (ver == 3 && BitConverter.ToUInt32(b, q + 52) != 0) throw new SerializeException("a 1.2 static sampler with flags has no 1.0 form");
+            b.AsSpan(q, 52).CopyTo(samplers.AsSpan(52 * (int)s));
+        }
+        var rangeArray = ranges.Count > 0 ? ranges.ToArray() : new uint[1];
+        var parms = new byte[Math.Max(1, n) * 32];
+        var desc = new byte[48];
+        fixed (uint* pr = rangeArray) fixed (byte* pp = parms, pd = desc, ps = samplers)
+        {
+            // D3D12_ROOT_PARAMETER: type @0, union @8, visibility @24; D3D12_DESCRIPTOR_RANGE = 5 x u32; root descriptor = register, space
+            for (var i = 0u; i < n; i++)
+            {
+                var (type, payload) = (U(at + 12 * i), U(at + 12 * i + 8));
+                var p = pp + 32 * i;
+                *(uint*)p = type;
+                *(uint*)(p + 24) = U(at + 12 * i + 4);
+                if (type == 0)
+                {
+                    *(uint*)(p + 8) = U(payload);
+                    *(uint**)(p + 16) = pr + first[i];
+                }
+                else for (var k = 0u; k < (type == 1 ? 3u : 2u); k++) ((uint*)(p + 8))[k] = U(payload + 4 * k);
+            }
+            *(uint*)pd = 1; // D3D_ROOT_SIGNATURE_VERSION_1_0
+            *(uint*)(pd + 8) = n;
+            *(byte**)(pd + 16) = pp;
+            *(uint*)(pd + 24) = ns;
+            *(byte**)(pd + 32) = ps;
+            *(uint*)(pd + 40) = U(20);
+            return Call(pd);
+        }
+    }
+
+    static byte[] Call(byte* desc)
+    {
+        nint blob = 0, err = 0;
+        var hr = SerializeFn(desc, &blob, &err);
+        if (err != 0) Release(err);
+        if (hr < 0) throw new SerializeException($"D3D12SerializeVersionedRootSignature failed 0x{hr:x8}");
+        var vt = *(nint**)blob; // ID3DBlob: GetBufferPointer = slot 3, GetBufferSize = slot 4
+        var bytes = new ReadOnlySpan<byte>(((delegate* unmanaged<nint, void*>)vt[3])(blob), (int)((delegate* unmanaged<nint, nuint>)vt[4])(blob)).ToArray();
+        Release(blob);
+        return bytes;
         static void Release(nint unk) => ((delegate* unmanaged<nint, uint>)(*(nint**)unk)[2])(unk);
     }
 }

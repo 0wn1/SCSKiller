@@ -448,11 +448,39 @@ static class ProcessTree
 
     internal static List<int> WithDescendants(int root)
     {
-        var parentOf = Snapshot();
-        var tree = new List<int> { root };
+        var all = Snapshot();
+        var linked = new HashSet<int> { root };   // by the parent links alone: only these are opened for their creation times
+        for (var more = true; more;)
+        {
+            more = false;
+            foreach (var p in all) more |= linked.Contains(p.Parent) && linked.Add(p.Pid);
+        }
+        return Tree(root, all.Where(p => linked.Contains(p.Pid)).Select(p => (p.Pid, p.Parent, Created(p.Pid))));
+    }
+
+    /// <summary><paramref name="root"/> and its descendants among <paramref name="procs"/>. A child counts only if it was
+    /// created at or after its parent: Windows reuses an exited process's pid, so an older process whose parent exited names
+    /// a pid that may now be ours. A process without a creation time (it couldn't be opened) is left out with its
+    /// descendants; a root without one, or not listed, is the whole tree.</summary>
+    internal static List<int> Tree(int root, IEnumerable<(int Pid, int Parent, long? Created)> procs)
+    {
+        var all = procs.ToList();
+        if (all.FirstOrDefault(p => p.Pid == root).Created is not { } rootCreated) return [root];
+        var tree = new List<(int Pid, long Created)> { (root, rootCreated) };
+        var seen = new HashSet<int> { root };
         for (int i = 0; i < tree.Count; i++)
-            tree.AddRange(parentOf.Where(x => x.Parent == tree[i] && x.Pid != tree[i] && !tree.Contains(x.Pid)).Select(x => x.Pid));
-        return tree;
+            foreach (var p in all)
+                if (p.Parent == tree[i].Pid && p.Created is { } c && c >= tree[i].Created && seen.Add(p.Pid)) tree.Add((p.Pid, c));
+        return tree.Select(t => t.Pid).ToList();
+    }
+
+    /// <summary>The process's creation time (FILETIME); null when it can't be opened or has exited.</summary>
+    static long? Created(int pid)
+    {
+        var h = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
+        if (h == 0) return null;
+        try { return GetProcessTimes(h, out var created, out _, out _, out _) ? created : null; }
+        finally { CloseHandle(h); }
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -469,6 +497,7 @@ static class ProcessTree
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32NextW(nint snap, ref ProcessEntry32 e);
     [DllImport("kernel32.dll")] static extern nint OpenProcess(uint access, bool inherit, int pid);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(nint h);
+    [DllImport("kernel32.dll")] static extern bool GetProcessTimes(nint h, out long created, out long exited, out long kernel, out long user);
     [DllImport("ntdll.dll")] static extern int NtSuspendProcess(nint h);
     [DllImport("ntdll.dll")] static extern int NtResumeProcess(nint h);
 }

@@ -114,23 +114,40 @@ public static class GameFiles
         ("EasyAntiCheat", AntiCheat.EasyAntiCheat), ("EasyAntiCheat_EOS", AntiCheat.EasyAntiCheat), ("start_protected_game.exe", AntiCheat.EasyAntiCheat),
         ("EasyAntiCheat_EOS_Setup.exe", AntiCheat.EasyAntiCheat), ("EasyAntiCheat_Setup.exe", AntiCheat.EasyAntiCheat),
         ("BattlEye", AntiCheat.BattlEye), ("BEService.exe", AntiCheat.BattlEye), ("BEService_x64.exe", AntiCheat.BattlEye), ("BELauncher.exe", AntiCheat.BattlEye),
+        ("BEClient_x64.dll", AntiCheat.BattlEye), ("BEClient.dll", AntiCheat.BattlEye),
         ("EAAntiCheat.Installer.exe", AntiCheat.Other), ("GameGuard", AntiCheat.Other), ("XIGNCODE", AntiCheat.Other), ("nProtect", AntiCheat.Other),
         ("randgrid.sys", AntiCheat.Other),   // Ricochet (Call of Duty)
+        ("NCGuardSDK", AntiCheat.Other), ("NCGuard", AntiCheat.Other),
+        ("AntiCheatExpert", AntiCheat.Other), ("AceAntibotClient", AntiCheat.Other), ("TP3Helper.exe", AntiCheat.Other),
+        ("HoYoKProtect.sys", AntiCheat.Other), ("mhypbase.dll", AntiCheat.Other),
+        ("NeacClient.exe", AntiCheat.Other), ("NeacSafe64.sys", AntiCheat.Other), ("NeacSafe64_ex.sys", AntiCheat.Other),
+        ("BlackCall.aes", AntiCheat.Other), ("BlackCall64.aes", AntiCheat.Other), ("BlackCat64.sys", AntiCheat.Other),
+        ("HShield", AntiCheat.Other),
+        ("PunkBuster", AntiCheat.Other), ("PnkBstrA.exe", AntiCheat.Other), ("pbsvc.exe", AntiCheat.Other), ("pbsv.dll", AntiCheat.Other),
+        ("equ8_conf.json", AntiCheat.Other),
+        ("gameguard.des", AntiCheat.Other),
+        ("DenuvoAC", AntiCheat.Other), ("denuvo-anti-cheat.sys", AntiCheat.Other), ("denuvo-anti-cheat-runtime.dll", AntiCheat.Other),
+        ("denuvo-anti-cheat-update-service.exe", AntiCheat.Other), ("Denuvo Anti-Cheat Installer.exe", AntiCheat.Other),
+        ("*.xem", AntiCheat.Other), ("*_BE.exe", AntiCheat.BattlEye),
     ];
 
     /// <summary>The marker names as the proxy's built-in list has them (its check beside the exe): "*x" matches a name ending in x.</summary>
-    public static IEnumerable<string> MarkerNames => Markers.Select(m => m.Name).Append("*_BE.exe");
+    public static IEnumerable<string> MarkerNames => Markers.Select(m => m.Name);
 
     /// <summary>Looks for anti-cheat folders/files by name anywhere under the install, under the exe's folder when it is
     /// outside it, and in the names of the folders from the exe's up to the install root. A tree that can't be read whole
     /// (a folder it may not list, the root included; more than <see cref="MaxEntries"/> entries; longer than <see cref="Budget"/>) is <see cref="AntiCheat.Other"/>:
     /// not known to be clean. A junction or symlink is a name, not followed: a folder it points into inside the tree is
     /// read where it is, and one outside is another folder's; one on the way from the install root to the exe is Other. <paramref name="quick"/>: the install root's and the exe
-    /// folder's own entries only, for a recheck right after a full one. Battle.net titles are marked conservatively:
+    /// folder's own entries only, for a recheck right after a full one. A game added by hand (<see cref="Store.Manual"/>) also has
+    /// the entries of each folder above its install read, one level each, up to a drive root or a store's folder of games
+    /// (<see cref="ManualSource.IsLibrary"/>), not included: the folder the user confirmed may be a subfolder of the game's. Battle.net titles are marked conservatively:
     /// Blizzard's Warden is server-side, not a file the install carries. The only anti-cheat detector: engine readers and
-    /// middleware detection call it to skip their own work, exe discovery to read no other binary; the app's evaluation acts on its verdict.</summary>
-    public static AntiCheat DetectAntiCheat(Game game, bool quick = false, TimeSpan? budget = null)
+    /// middleware detection call it to skip their own work, exe discovery to read no other binary; the app's evaluation acts on its verdict.
+    /// <paramref name="ignore"/>: that anti-cheat's markers don't count (an offline session's check for any other).</summary>
+    public static AntiCheat DetectAntiCheat(Game game, bool quick = false, TimeSpan? budget = null, AntiCheat ignore = AntiCheat.None)
     {
+        AntiCheat Marker(string name) => GameFiles.Marker(name) is var kind && kind == ignore ? AntiCheat.None : kind;
         if (game.Id.StartsWith("battlenet:", StringComparison.Ordinal)) return AntiCheat.Other;
         var install = Path.TrimEndingDirectorySeparator(Path.GetFullPath(game.InstallDir));
         var exeDir = Path.GetDirectoryName(Path.GetFullPath(game.ExePath))!;
@@ -139,7 +156,7 @@ public static class GameFiles
         var seen = 0;
         var clock = Stopwatch.StartNew();
 
-        AntiCheat Walk(string root)
+        AntiCheat Walk(string root, bool deep = true)
         {
             var dirs = new Stack<string>([root]);
             while (dirs.TryPop(out var dir))
@@ -155,7 +172,7 @@ public static class GameFiles
                     var e = entries.Current;
                     if (++seen > MaxEntries || clock.Elapsed > (budget ?? Budget)) return AntiCheat.Other;
                     if (Marker(e.Name) is var kind and not AntiCheat.None) return kind;
-                    if (!quick && e is DirectoryInfo d && ((d.Attributes & FileAttributes.ReparsePoint) == 0 || d.LinkTarget == null)) dirs.Push(d.FullName);
+                    if (deep && !quick && e is DirectoryInfo d && ((d.Attributes & FileAttributes.ReparsePoint) == 0 || d.LinkTarget == null)) dirs.Push(d.FullName);
                 }
             }
             return AntiCheat.None;
@@ -172,6 +189,9 @@ public static class GameFiles
                 if (Walk(root) is var kind and not AntiCheat.None) return kind;
             for (var d = exeDir; d != null && Inside(d); d = Path.GetDirectoryName(d))
                 if (Marker(Path.GetFileName(d)) is var kind and not AntiCheat.None) return kind;
+            if (game.Store == Store.Manual)
+                for (var d = Path.GetDirectoryName(install); d != null && Path.GetPathRoot(d) != d && !ManualSource.IsLibrary(d); d = Path.GetDirectoryName(d))
+                    if (Walk(d, deep: false) is var kind and not AntiCheat.None) return kind;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException) { return AntiCheat.Other; }
         return AntiCheat.None;
@@ -183,26 +203,13 @@ public static class GameFiles
     /// <summary>Entries one detection reads at most (names only: an install of 170,000 entries reads in about 0.1 s warm).</summary>
     public const int MaxEntries = 2_000_000;
 
-    /// <summary>An anti-cheat marker among the folder's own entries (names only, not below); None when it can't be listed
-    /// (the install's own check, <see cref="DetectAntiCheat"/>, treats that as anti-cheat).</summary>
-    internal static AntiCheat MarkerIn(string dir)
-    {
-        try
-        {
-            foreach (var e in new DirectoryInfo(dir).EnumerateFileSystemInfos("*", AllNames))
-                if (Marker(e.Name) is var kind and not AntiCheat.None) return kind;
-            return AntiCheat.None;
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException) { return AntiCheat.None; }
-    }
-
     /// <summary>The time one detection takes at most (the slowest install measured: about 0.3 s cold).</summary>
     public static readonly TimeSpan Budget = TimeSpan.FromSeconds(30);
 
     static AntiCheat Marker(string name)
     {
         foreach (var (marker, kind) in Markers)
-            if (name.Equals(marker, StringComparison.OrdinalIgnoreCase)) return kind;
-        return name.EndsWith("_BE.exe", StringComparison.OrdinalIgnoreCase) ? AntiCheat.BattlEye : AntiCheat.None;
+            if (marker[0] == '*' ? name.EndsWith(marker[1..], StringComparison.OrdinalIgnoreCase) : name.Equals(marker, StringComparison.OrdinalIgnoreCase)) return kind;
+        return AntiCheat.None;
     }
 }

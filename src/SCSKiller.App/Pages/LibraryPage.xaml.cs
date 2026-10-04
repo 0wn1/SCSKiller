@@ -54,7 +54,8 @@ public sealed partial class LibraryPage : Page
     }
 
     void OnDismissGpuNotice(InfoBar _, object __) => Vm.DismissGpuNotice();
-    // A launcher stub is resolved to the game's own exe; an exe of a listed game opens that game instead.
+    // A launcher stub is resolved to the game's own exe, shown with the game folder to confirm; an exe of a listed game
+    // opens that game instead.
     async void OnAddGame(object _, RoutedEventArgs __)
     {
         string? path;
@@ -70,14 +71,21 @@ public sealed partial class LibraryPage : Page
         catch (Exception ex) { await Message("Couldn't open the file picker", ex.Message); return; }
         if (path == null) return;
         ManualAdd added;
-        try { added = await Task.Run(() => App.Core.AddManualGame(path)); }   // reads the install's files
-        catch (Exception ex)   // a rejection's message, or a data folder SCSKiller couldn't read or write
+        try { added = await Task.Run(() => App.Core.PreviewManualGame(path)); }   // reads the install's files
+        catch (Exception ex)   // a rejection's message, or a data folder SCSKiller couldn't read
         {
             await Message("Couldn't add this game", ex.Message);
             return;
         }
         if (!added.Existed)
         {
+            if (await GameFolderDialog.ShowAsync(XamlRoot, added.Game, $"Add {added.Game.Name}", "Add game") is not { } folder) return;
+            try { await Task.Run(() => App.Core.AddManualGame(path, folder)); }
+            catch (Exception ex)
+            {
+                await Message("Couldn't add this game", ex.Message);
+                return;
+            }
             Vm.Rescan(force: false);   // lists it under "Added by you" once its engine and anti-cheat are checked
             return;
         }

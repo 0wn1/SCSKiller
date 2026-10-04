@@ -40,6 +40,28 @@ public static class RtCollections
         .. Enumerable.Range(0, 16).Select(b => new uint[] { 2, 0, (uint)b, 1, 8 }),
         [4, 0, 0, 999, 2]]);
 
+    /// <summary>UE 5.4's, unverified: 5.1's with a sampler table of 32.</summary>
+    // 5.1's tables are D3D12RHI's MAX_SRVS/MAX_SAMPLERS/MAX_UAVS/MAX_CBS, and 5.4 raised MAX_SAMPLERS to 32 (RootSig.Rule.Ue54)
+    public static readonly RootSig.Desc Ue54Global = new(0, [
+        [0, 0, 0, 64, 0, 1, 5], [0, 0, 3, 32, 0, 1, 1], [0, 0, 1, 16, 0, 1, 3],
+        .. Enumerable.Range(0, 16).Select(b => new uint[] { 2, 0, (uint)b, 1, 8 }),
+        [4, 0, 0, 999, 2]]);
+
+    /// <summary>Why a game's DXIL libraries don't have stock UE 5.0-5.4's binding shape, which the 5.1 rule is built for
+    /// (Oblivion Remastered's and Darwin's Paradox's libraries have it); null when they do. The shape: uniform buffers as
+    /// CBVs in space 1 (ray generation), the hit groups' index and vertex buffers t0/t1 in space 2, no bindless descriptor
+    /// heap access, no shared uniform buffers in space 4 (UE 5.6's bindless ray tracing, SILENT HILL: Townfall's).</summary>
+    public static string? Ue5ShapeMismatch(IReadOnlyCollection<ShaderInfo> libs)
+    {
+        var b = libs.SelectMany(l => l.Bindings).ToList();
+        bool Binds(string cls, int space, int reg) => b.Any(x => x.Class == cls && x.Space == space && x.Lower <= reg && (x.Count < 0 || reg < x.Lower + x.Count));
+        if (libs.Any(l => (l.Counts.Flags & (ShaderContainer.UeFlags.BindlessResources | ShaderContainer.UeFlags.BindlessSamplers)) != 0)) return "bindless descriptor heap access";
+        if (b.Any(x => x is { Class: "cbv", Space: 4 })) return "shared uniform buffers in space 4";
+        if (!b.Any(x => x is { Class: "cbv", Space: 1 })) return "no uniform buffers in space 1";
+        if (!Binds("srv", 2, 0) || !Binds("srv", 2, 1)) return "no hit group index and vertex buffers (t0/t1 space 2)";
+        return null;
+    }
+
     /// <summary>Engines whose collections are GUESSED without a recording (unverified in game): their libraries carry no
     /// RDAT subobjects, so nothing says the game's root signatures or pipeline shape. Elden Ring (FromSoftware): EasyAntiCheat
     /// blocks recording.</summary>

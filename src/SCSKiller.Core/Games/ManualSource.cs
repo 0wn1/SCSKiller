@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Reflection.PortableExecutable;
 using System.Security.Cryptography;
 using System.Text;
@@ -7,8 +7,10 @@ using SCSKiller.Core.Carved;
 
 namespace SCSKiller.Core.Games;
 
-/// <summary>A game the user added by its exe: <see cref="Exe"/> is the resolved D3D12 process (<see cref="ManualSource.Resolve"/>).</summary>
-public sealed record ManualEntry(string Exe, string InstallDir, string Name);
+/// <summary>A game the user added by its exe: <see cref="Exe"/> is the resolved D3D12 process (<see cref="ManualSource.Resolve"/>).
+/// <see cref="Confirmed"/>: the user confirmed <see cref="InstallDir"/> as the game's folder (<see cref="ManualSource.RootProblem"/>
+/// passed), the folder the anti-cheat check covers before the recorder is allowed; an entry saved without one isn't.</summary>
+public sealed record ManualEntry(string Exe, string InstallDir, string Name, bool Confirmed = false);
 
 /// <summary>Games the user added (manual-games.json in the data folder). Id "manual:" + a hash of the exe's full path, so
 /// the same exe added again is the same game. No build id: a changed exe (size, write time) is what marks a patch, as for
@@ -20,10 +22,36 @@ public sealed class ManualSource(AppStore store) : IGameSource
 
     public Store Store => Store.Manual;
 
+    // game id -> its folder and whether it is confirmed, as the last read of the list had it (replaced whole under the mutex)
+    volatile Dictionary<string, (string Root, bool Confirmed)> _roots = [];
+
     public IReadOnlyList<Game> Discover() => Entries().Where(e => File.Exists(e.Exe)).Select(ToGame).ToList();
 
     /// <summary>The well-formed entries: an entry with no exe or install folder, or a path that isn't a full one, is left out.</summary>
-    public List<ManualEntry> Entries() => store.LoadManualGames().Where(Valid).ToList();
+    /// <remarks>Read under the mutex, so a read that started before a change never publishes the folders it had after it.</remarks>
+    public List<ManualEntry> Entries() => Locked(() =>
+    {
+        var list = store.LoadManualGames().Where(Valid).ToList();
+        Read?.Invoke();
+        _roots = list.GroupBy(e => IdOf(e.Exe)).ToDictionary(x => x.Key, x => (GameFiles.DirKey(x.First().InstallDir), x.First().Confirmed));
+        return list;
+    });
+
+    /// <summary>The game's folder is the one the user confirmed (as the list was last read): the recorder may go in.</summary>
+    public bool Confirmed(Game g) => _roots.TryGetValue(g.Id, out var r) && r.Confirmed && Same(r.Root, GameFiles.DirKey(g.InstallDir));
+
+    /// <summary>Tests: runs between reading the list and publishing its folders.</summary>
+    internal Action? Read { get; set; }
+
+    /// <summary><see cref="Confirmed"/>, the list read again now (under the mutex): for arming.</summary>
+    public bool ConfirmedNow(Game g)
+    {
+        Entries();
+        return Confirmed(g);
+    }
+
+    /// <summary>A copy of the game from before its folder changed: its state is for another folder than the list's.</summary>
+    public bool Stale(Game g) => _roots.TryGetValue(g.Id, out var r) && !Same(r.Root, GameFiles.DirKey(g.InstallDir));
 
     static bool Valid(ManualEntry e) =>
         e is { Exe.Length: > 0, InstallDir.Length: > 0 } && e.Exe.IndexOfAny(Path.GetInvalidPathChars()) < 0 && Path.IsPathFullyQualified(e.Exe)
@@ -35,15 +63,18 @@ public sealed class ManualSource(AppStore store) : IGameSource
     public static string IdOf(string exe) =>
         "manual:" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(exe).ToUpperInvariant())))[..16];
 
-    /// <summary>The game and whether it was already added.</summary>
+    /// <summary>The game and whether it was already added. A confirmed folder replaces the one an entry had.</summary>
     public (Game Game, bool Existed) Add(ManualEntry entry) => Locked(() =>
     {
         var list = Entries();
         var id = IdOf(entry.Exe);
-        if (list.FirstOrDefault(e => IdOf(e.Exe) == id) is { } had) return (ToGame(had), true);
-        list.Add(entry);
+        var i = list.FindIndex(e => IdOf(e.Exe) == id);
+        if (i >= 0 && !entry.Confirmed) return (ToGame(list[i]), true);
+        if (i >= 0) list[i] = list[i] with { InstallDir = entry.InstallDir, Confirmed = true };
+        else list.Add(entry);
         store.SaveManualGames(list);
-        return (ToGame(entry), false);
+        Entries();
+        return (ToGame(i >= 0 ? list[i] : entry), i >= 0);
     });
 
     public bool Remove(string gameId) => Locked(() =>
@@ -51,6 +82,7 @@ public sealed class ManualSource(AppStore store) : IGameSource
         var list = Entries();
         if (list.RemoveAll(e => IdOf(e.Exe) == gameId) == 0) return false;
         store.SaveManualGames(list);
+        Entries();
         return true;
     });
 
@@ -113,9 +145,9 @@ public sealed class ManualSource(AppStore store) : IGameSource
                 : $"{file} isn't an x64 program: SCSKiller compiles 64-bit DirectX 12 games.");
     }
 
-    /// <summary>Unreal: the folder holding Engine\ and the project (the project's own folder when Engine\ isn't beside it);
-    /// bin*\ or bin\x64*\: the folder above bin. Else the exe's folder. A folder up to two above with anti-cheat among its
-    /// own entries is the install, so the anti-cheat check sees the whole game whatever its layout.</summary>
+    /// <summary>The folder suggested as the game's (the user confirms or changes it): Unreal's, holding Engine\ and the project
+    /// (the project's own folder when Engine\ isn't beside it); bin*\ or bin\x64*\: the folder above bin. Else the exe's
+    /// folder. Nothing above it is read: the folders beside it may be other games.</summary>
     static string InstallRoot(string exe)
     {
         var dir = Path.GetDirectoryName(exe)!;
@@ -128,11 +160,56 @@ public sealed class ManualSource(AppStore store) : IGameSource
                 root = game;
             else if (Path.GetFileName(dir).StartsWith("bin", StringComparison.OrdinalIgnoreCase)) root = parent;
         }
-        var up = Path.GetDirectoryName(root);
-        for (var i = 0; i < 2 && up != null && Path.GetPathRoot(up) != up; i++, up = Path.GetDirectoryName(up))
-            if (GameFiles.MarkerIn(up) != AntiCheat.None) root = up;
         return root;
     }
+
+    // stores' and launchers' folders of games, and Windows' own: never one game's folder
+    static readonly string[] Libraries = ["steamapps", "SteamLibrary", "XboxGames", "WindowsApps", "ModifiableWindowsApps", "Epic Games",
+        "EpicGames", "GOG Games", "GOG Galaxy", "EA Games", "Origin Games", "Ubisoft Game Launcher", "Battle.net", "Program Files", "Program Files (x86)",
+        "ProgramData", "Windows", "Users", "Desktop", "Downloads", "Documents", "OneDrive"];
+
+    /// <summary>Why <paramref name="root"/> can't be confirmed as the game's folder; null = it can. Refused: a missing folder, a
+    /// drive or share root, a store's or Windows' folder of many (<see cref="Libraries"/>, steamapps\common, the user's own
+    /// folder), a folder that holds another game SCSKiller lists (<paramref name="listed"/>), or one whose subfolders look like
+    /// several games (two or more with a program directly in them).</summary>
+    public static string? RootProblem(string root, string exe, IEnumerable<Game> listed)
+    {
+        string full;
+        try { full = GameFiles.DirKey(root); }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { return $"{root} isn't a folder."; }
+        if (!Directory.Exists(full)) return $"{full} doesn't exist.";
+        if (Path.GetPathRoot(full) is { } drive && GameFiles.DirKey(drive).Equals(full, StringComparison.OrdinalIgnoreCase))
+            return $"{full} is a whole drive: pick the game's own folder.";
+        if (IsLibrary(full)) return $"{full} holds many programs or games: pick the game's own folder.";
+        if (listed.FirstOrDefault(g => !Same(g.ExePath, exe) && (GameFiles.DirKey(g.InstallDir).Equals(full, StringComparison.OrdinalIgnoreCase)
+                || GameFiles.Inside(full, g.InstallDir))) is { } other)
+            return $"{full} holds {other.Name} too: pick this game's own folder.";
+        try
+        {
+            var games = Directory.EnumerateDirectories(full).Where(d => !NotAGame.Any(n => Path.GetFileName(d).Contains(n, StringComparison.OrdinalIgnoreCase))
+                && Directory.EnumerateFiles(d, "*.exe").Any()).Take(2).Count();
+            if (games >= 2) return $"{full} looks like a folder of several games: pick this game's own folder.";
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return $"Couldn't read {full}: {e.Message}"; }
+        return null;
+    }
+
+    // the user's AppData folders hold launchers' and anti-cheats' own folders (a BattlEye folder in Local): never one game's
+    static readonly Environment.SpecialFolder[] SpecialFolders = [Environment.SpecialFolder.UserProfile, Environment.SpecialFolder.Windows,
+        Environment.SpecialFolder.LocalApplicationData, Environment.SpecialFolder.ApplicationData];
+
+    /// <summary>A store's or Windows' folder of many (<see cref="Libraries"/>, steamapps\common, the user's own and AppData folders);
+    /// <paramref name="full"/> as <see cref="GameFiles.DirKey"/> gives it.</summary>
+    internal static bool IsLibrary(string full)
+    {
+        var name = Path.GetFileName(full);
+        return Libraries.Contains(name, StringComparer.OrdinalIgnoreCase)
+            || name.Equals("common", StringComparison.OrdinalIgnoreCase) && Path.GetFileName(Path.GetDirectoryName(full)).Equals("steamapps", StringComparison.OrdinalIgnoreCase)
+            || SpecialFolders.Select(Environment.GetFolderPath).Any(f => f.Length > 0 && GameFiles.DirKey(f).Equals(full, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // a game's own subfolders that hold programs of their own
+    static readonly string[] NotAGame = ["redist", "directx", "crash", "setup", "install", "support", "tools", "launcher", "anticheat", "battleye"];
 
     // Unreal's launcher stub, engine defaults and launchers name no game
     static readonly string[] Generic = ["UnrealGame", "UE4Game", "UE5Game", "Unity"];

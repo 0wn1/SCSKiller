@@ -193,7 +193,7 @@ public static class ShaderContainer
         if (stage == Stage.Pixel && sigs.TryGetValue("IS", out var ins) && InputInterpolation(c) is { Count: > 0 } modes) // DXIL only
             sigs["IS"] = ins.Select(e => modes.TryGetValue(e.Semantic.ToUpperInvariant() + e.Index, out var m) ? e with { Interpolation = m } : e).ToList();
         return new ShaderInfo(sha1, stage.Value, $"{prefix[kind]}_{(version >> 4) & 0xF}_{version & 0xF}", c.Length, counts, bindings,
-            sigs.GetValueOrDefault("IS") ?? [], sigs.GetValueOrDefault("OS") ?? [], stage == Stage.Geometry ? gsInput : 0);
+            sigs.GetValueOrDefault("IS") ?? [], sigs.GetValueOrDefault("OS") ?? [], stage == Stage.Geometry ? gsInput : 0, InlineRayTracing: Dxbc.InlineRayTracing(c));
     }
 
     /// <summary>A DXIL pixel shader's interpolation mode per named input (PSV0 signature elements: "SEMANTIC" + index,

@@ -15,7 +15,7 @@ using SCSKiller.Core.Warming;
 namespace SCSKiller.Core.App;
 
 /// <summary>The facade the GUI and CLI use: discovery, per-game state, the sequential compile queue, the recorder.</summary>
-public sealed class ScsKiller : IScsKiller
+public sealed partial class ScsKiller : IScsKiller
 {
     public const double DefaultBytesPerPso = 24 * 1024, DefaultPsoPerSecond = 450;
 
@@ -354,6 +354,7 @@ public sealed class ScsKiller : IScsKiller
     Task<IReadOnlyList<GameState>> Scan(bool force, bool userRequested, CancellationToken ct) => Task.Run<IReadOnlyList<GameState>>(() =>
     {
         var started = Interlocked.Increment(ref _scans);   // before discovery: a later scan's list is at least as new
+        CleanOfflineSessions();   // before any game is read or written
         RedetectGpu();   // a driver updated while the app runs: the states below compare against it
         AdoptDismissals(Snapshot());
         // An install folder listed by an earlier source isn't listed again by a later one (an EA game bought on Steam has
@@ -396,7 +397,7 @@ public sealed class ScsKiller : IScsKiller
         foreach (var s in states) GameChanged?.Invoke(s);
         if (CheckPlans)
             foreach (var s in states)
-                if (s.Engine != null && s.Status != GameStatus.Unsupported && NeedsPlanCheck(s.Game, Store.LoadGame(s.Game.Id))) CheckPlan(s.Game.Id);
+                if (s.Engine != null && s.Status != GameStatus.Unsupported && NeedsPlanCheck(s.Game, Store.LoadGame(s.Game.Id), s.Engine)) CheckPlan(s.Game.Id);
         if (detected) ReleaseMemory();   // engine detection mounts the game's archives
         if (ManageRecorders)
         {
@@ -482,10 +483,15 @@ public sealed class ScsKiller : IScsKiller
         var judge = cap != null && rec.FirstLaunch == null ? rec.WarmedAt : null;
         // the RayQuery floor is measured on NVIDIA only
         var rayQuery = Vendor.Vendor == GpuVendor.Nvidia ? SessionLog.ReadRayQueryKeys(RayQueryKeysPath(g.Id)) : null;
-        var frames = Frames(exeDir, Path.GetFileName(g.ExePath), rayQuery, rec.LastPlay);
-        var (session, marker, first) = SessionLog.Read(Path.Combine(exeDir, "scskiller_creates.csv"), out var framesMatch, Path.GetFileName(g.ExePath), judge, MinJudgedCreates, rayQuery, rec.LastPlay, frames);
+        // the game folder's, else the last offline session's, kept in the data folder when its files left the game's
+        var sessionDir = SessionFiles.Any(f => File.Exists(Path.Combine(exeDir, f))) ? exeDir : OfflineSessionDir(Store, g.Id);
+        var frames = Frames(sessionDir, Path.GetFileName(g.ExePath), rayQuery, rec.LastPlay);
+        var (session, marker, first) = SessionLog.Read(Path.Combine(sessionDir, "scskiller_creates.csv"), out var framesMatch, Path.GetFileName(g.ExePath), judge, MinJudgedCreates, rayQuery, rec.LastPlay, frames);
         if (session != null && !framesMatch) frames = null;   // another launch's frames: none shown next to this one's counts
         if (first != null) rec.FirstLaunch = first;
+        var (rtUnseenWas, longWas) = (rec.RtUnseen, rec.RecordedLong);
+        rec.RtUnseen = RtUnseen(session, rec.RtUnseen);
+        rec.RecordedLong |= session?.Duration >= EnoughRecording;
         if (first != null && AgsLaunchMissed(rec)) { rec.AgsMissed = true; Log?.Report($"{g.Name}: {AgsMissedReason(rec)}"); }
         var keysOf = rec.KeysIndexHash;
         var (imported, keysPending) = (false, rec.KeysPending);
@@ -500,7 +506,7 @@ public sealed class ScsKiller : IScsKiller
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidDataException) { Log?.Report($"{g.Name}: the recording's upkeep failed: {e.Message}"); }
         try
         {
-            if (imported | MergeLaunched(g, rec, marker) | AdoptDriverId(rec, gpuNow) | first != null | earlier | rec.KeysIndexHash != keysOf | rec.KeysPending != keysPending) Store.SaveGame(g.Id, rec);
+            if (imported | MergeLaunched(g, rec, marker) | AdoptDriverId(rec, gpuNow) | first != null | earlier | rec.KeysIndexHash != keysOf | rec.KeysPending != keysPending | rec.RtUnseen != rtUnseenWas | rec.RecordedLong != longWas) Store.SaveGame(g.Id, rec);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log?.Report($"{g.Name}: couldn't save its record: {e.Message}"); }
         long? psos = rec.Plan is { } p ? p.Stats.Recorded + p.Stats.Generated + p.Stats.D3D11Shaders + p.Stats.MiddlewareItems : null;
@@ -515,7 +521,11 @@ public sealed class ScsKiller : IScsKiller
         var manifest = LocalManifest();
         var entry = manifest != null ? DbEntry(manifest, g, rec) : null;
         bool? inDb = manifest != null ? entry != null : null;
-        var rt = NeedsRtRecording(rec.Plan?.Stats);
+        // a recording newer than the plan may have the ray tracing (inline, or state objects): its plan check tells
+        var rtToPlan = RtPlanCheck(rec, engine);
+        var rtUnseen = NeedsRtRecording(rec.Plan?.Stats) && !rtToPlan && rec.RtUnseen;
+        var rt = NeedsRtRecording(rec.Plan?.Stats) && !rtToPlan && !rec.RtUnseen;
+        var unseen = rtUnseen ? "; " + RtUnseenNote : RtInlineCovers(rec.Plan?.Stats) ? "; " + RtInlineNote : "";
         var shaderMod = antiCheat == AntiCheat.None ? ReShade.Detect(g)?.ShaderMod : null;   // no binary read in an anti-cheat install
         if (shaderMod is { Kind: AddonKind.LayoutInjecting } blocking)
         {
@@ -526,9 +536,11 @@ public sealed class ScsKiller : IScsKiller
         bool ours;
         try { ours = IsOurProxy(dll); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { ours = rec.RecorderFiles.ContainsKey("d3d12.dll"); }   // held by the game
-        // the recorder is never installed next to anti-cheat, nor in a game the user added (its install root is a guess)
+        // the recorder is never installed next to anti-cheat, nor in a game the user added before they confirm its folder
+        var unconfirmed = Unconfirmed(g);
         var noRecording = antiCheat != AntiCheat.None ? $"which {(antiCheat == AntiCheat.Other ? "its anti-cheat" : antiCheat)} blocks"
-            : g.Store == Core.Store.Manual ? ManualNoRecording : null;
+              + (OfflineEac.Of(g, antiCheat, engine) != null ? " unless you record an offline session (game page)" : "")
+            : unconfirmed ? ManualNoRecording : null;
         var (status, reason) = check.Readiness switch
         {
             _ when shaderMod is { Kind: AddonKind.LayoutInjecting } m => (GameStatus.Unsupported, ShaderModReason(m.Mod!)),
@@ -537,11 +549,11 @@ public sealed class ScsKiller : IScsKiller
             Readiness.NeedsRecording => (GameStatus.NeedsRecording, check.Reason + DbNote(inDb)),
             // the plan compiles the rest, but not the game's ray tracing: that needs a recording (compiling stays possible, partial)
             _ when rt && noRecording == null && (rec.WarmedAt == null || StaleReason(g, rec, pending, gpuNow) == null) => (GameStatus.NeedsRecording, RtNote(inDb)),
-            _ when rec.WarmedAt == null => (GameStatus.Ready, RtBlocked(rt, noRecording, PartialNote(rec.Plan?.Stats) ?? check.Reason)),
+            _ when rec.WarmedAt == null => (GameStatus.Ready, RtBlocked(rt, noRecording, PartialNote(rec.Plan?.Stats) ?? check.Reason) + unseen),
             _ when StaleReason(g, rec, pending, gpuNow) is { } why => (GameStatus.Stale, why),
             _ => (GameStatus.Warmed, RtBlocked(rt, noRecording, (cap is { } t && PartlyWarmedNote(rec, t, careful) is { } partly
                     ? $"partly warmed for driver {rec.WarmedDriverVersion}: {partly}" : $"warmed for driver {rec.WarmedDriverVersion}")
-                + (PartialNote(rec.Plan?.Stats) is { } partial ? "; " + partial : ""))),
+                + (PartialNote(rec.Plan?.Stats) is { } partial ? "; " + partial : "")) + unseen),
         };
         return WithRecorder(new GameState(g, engine, antiCheat, status, reason, rec.ShaderCount, rec.Plan?.Stats,
             psos * (long)(rec.BytesPerPso ?? DefaultBytesPerPso),
@@ -559,7 +571,7 @@ public sealed class ScsKiller : IScsKiller
             IsPlaying(g.Id)) with { LastWarmNeedsRecording = rec.LastWarmNeedsRecording, LastWarmCrashed = rec.LastWarmCrashed,
                 Careful = cap != null ? new CarefulCompile(rec.Careful, rec.FirstLaunch?.Compiled, careful, recorded) : null,
                 RecordedSinceWarm = pending.Recorded, CommunityDbPsos = entry?.Psos ?? 0, PsoPerSecond = rec.PsoPerSecond,
-                LastFrames = frames, ShaderMod = shaderMod?.Mod, ShaderModBlocks = shaderMod?.Kind == AddonKind.LayoutInjecting },
+                LastFrames = frames, ShaderMod = shaderMod?.Mod, ShaderModBlocks = shaderMod?.Kind == AddonKind.LayoutInjecting, RtUnseen = rtUnseen, RtToPlan = rtToPlan, RecordedEnough = rec.RecordedLong, RootUnconfirmed = unconfirmed },
             rec, ours, exeDir);
     }
 
@@ -572,13 +584,17 @@ public sealed class ScsKiller : IScsKiller
             RecorderNote = _recorderNotes.GetValueOrDefault(s.Game.Id), RecorderMod = ModName(exeDir, rec, ours),
             RecordAlongsideMod = rec.RecordAlongsideMod,
             RecordingBytes = RecordingFiles(s.Game).Where(f => Path.GetFileName(f) != FrameLog.FileName).Sum(Length),
-            RecordingPaused = ours && DbCap(s.Game) is { } cap && db >= cap };
+            RecordingPaused = ours && DbCap(s.Game) is { } cap && db >= cap,
+            OfflineEligible = OfflineEac.Of(s.Game, s.AntiCheat, s.Engine) != null, OfflineRecord = rec.OfflineRecord,
+            OfflineRunning = OfflineLive(s.Game.Id) || rec.OfflineSession != null };
     }
 
     static long Length(string path) => new FileInfo(path) is { Exists: true } f ? f.Length : 0;
 
-    /// <summary>What <see cref="ClearRecording"/> deletes: the recorder's output in the game folder and SCSKiller's copy of it.</summary>
+    /// <summary>What <see cref="ClearRecording"/> deletes: the recorder's output in the game folder and SCSKiller's copy of it
+    /// (an offline session's report too).</summary>
     IEnumerable<string> RecordingFiles(Game g) => [.. RecorderDataFiles.Select(f => Path.Combine(Path.GetDirectoryName(g.ExePath)!, f)), RecordingPath(g.Id),
+        .. SessionFiles.Select(f => Path.Combine(OfflineSessionDir(Store, g.Id), f)),
         .. new[] { "recording.all.db", "recording.all.db.key" }.Select(f => Path.Combine(Store.GameDir(g.Id), f))];   // until migrated
 
     static readonly string[] RecorderDataFiles = ["scskiller.db", "scskiller_creates.csv", "scskiller.log", FrameLog.FileName];
@@ -620,7 +636,43 @@ public sealed class ScsKiller : IScsKiller
     /// driver caches only the exact objects a game builds), or an engine whose collection layout SCSKiller can't rebuild from
     /// its files (Unreal 5). A recording with ray tracing in it already is one: what it left uncovered shows as a count only.
     /// Known only after a build, like <see cref="IsPartial"/>.</summary>
-    public static bool NeedsRtRecording(PlanStats? p) => p is { RtUncovered: > 0, RtStateObjects: 0 } && p.RtUncovered > 0.1 * p.RtLibraries;
+    public static bool NeedsRtRecording(PlanStats? p) => RtLeft(p) && p!.RtInline is not > 0;
+
+    /// <summary>More than 10% of the libraries uncovered and no recorded state object, whatever the inline ray tracing.</summary>
+    static bool RtLeft(PlanStats? p) => p is { RtUncovered: > 0, RtStateObjects: 0 } && p.RtUncovered > 0.1 * p.RtLibraries;
+
+    /// <summary>Unreal 5 whose ray tracing is inline (<see cref="PlanStats.RtInline"/>, compiled from the game files): its
+    /// uncovered DXIL libraries don't need a recording, and the status says what only one would add (<see cref="RtInlineNote"/>).</summary>
+    public static bool RtInlineCovers(PlanStats? p) => RtLeft(p) && p!.RtInline > 0;
+
+    public const string RtInlineNote = "ray tracing that uses separate pipelines (such as path tracing) is compiled only from a recording";
+
+    /// <summary>The same for a game's state: not while a newer recording waits for its plan (<see cref="GameState.RtToPlan"/>),
+    /// nor once it was recorded long enough without ray tracing (<see cref="GameState.RtUnseen"/>).</summary>
+    public static bool NeedsRtRecording(GameState s) => NeedsRtRecording(s.Plan) && !s.RtUnseen && !s.RtToPlan;
+
+    /// <summary>The plan asks for a ray tracing recording and a recording was imported after it was built, or (Unreal 5) it
+    /// was built before inline ray tracing was counted: the plan check (<see cref="CheckPlans"/>) or the next compile plans it again.</summary>
+    static bool RtPlanCheck(GameRecord r, EngineInfo? e) => NeedsRtRecording(r.Plan?.Stats)
+        && (r.RecordingImportedAt > r.PlanBuiltAt || r.Plan!.Stats.RtInline == null && e is { Family: "Unreal" } && e.Version.StartsWith('5'));
+
+    /// <summary>A recorded launch this long shows what the player's setup uses (the "about 5 minutes" the app asks for).</summary>
+    public static readonly TimeSpan EnoughRecording = TimeSpan.FromMinutes(5);
+
+    /// <summary>A recorded launch was <see cref="EnoughRecording"/> or longer since the recording was last cleared: asking for "5 minutes" again says nothing.</summary>
+    public static bool RecordedEnough(GameState s) => s.RecordedEnough;
+
+    /// <summary><see cref="GameRecord.RtUnseen"/> after the last recorded launch: a ray tracing state object in it clears it, a
+    /// launch of <see cref="EnoughRecording"/> without one sets it (ray tracing off in the game: no recording will ever have one).</summary>
+    internal static bool RtUnseen(SessionStats? last, bool before) => last switch
+    {
+        null => before,
+        { StateObjectsReady: > 0 } or { StateObjectsCompiled: > 0 } or { StateObjectsStartupCompiled: > 0 } => false,
+        _ => before || last.Duration >= EnoughRecording,
+    };
+
+    /// <summary>The end of a Ready or Warmed reason when <see cref="GameState.RtUnseen"/> keeps a plan's uncovered ray tracing from being asked for.</summary>
+    public const string RtUnseenNote = "no ray tracing seen while recording: turn it on in the game and play to cover it";
 
     /// <summary>The status reason of a game whose ray tracing needs a recording (<see cref="NeedsRtRecording"/>).</summary>
     public static string RtNote(bool? inCommunityDb) => RtNeedsRecording + (inCommunityDb == null ? ", or a community recording for this version" : DbNote(inCommunityDb));
@@ -646,8 +698,8 @@ public sealed class ScsKiller : IScsKiller
     static string RtBlocked(bool rt, string? noRecording, string reason) =>
         rt && noRecording != null ? $"{reason}; ray-traced effects aren't compiled: they need a recording, {noRecording}" : reason;
 
-    /// <summary>Why a game the user added never gets the recorder, after "needs a recording, ".</summary>
-    public const string ManualNoRecording = "which isn't available for games added by hand yet";
+    /// <summary>Why a game the user added has no recorder yet, after "needs a recording, ".</summary>
+    public const string ManualNoRecording = "once you confirm its game folder";
 
     /// <summary>The last community manifest fetched (community\manifest.bin), re-read when the file changes; null when there is none.</summary>
     CommunityManifest? LocalManifest()
@@ -797,7 +849,7 @@ public sealed class ScsKiller : IScsKiller
     /// the exe or the build is caught at the next refresh.</summary>
     Evaluation Evaluated(Game g, GameRecord rec, bool force, out bool fresh)
     {
-        var key = string.Join('|', ExeStamp(g), g.Version, Vendor.Caps.Profile, rec.RecordingImportedAt?.UtcTicks, CoreBuild, CommunityInUse(g.Id)?.Object);
+        var key = string.Join('|', ExeStamp(g), GameFiles.DirKey(g.InstallDir), g.Version, Vendor.Caps.Profile, rec.RecordingImportedAt?.UtcTicks, CoreBuild, CommunityInUse(g.Id)?.Object);
         Evaluation? hit = null;
         long started;
         lock (_scanLock)
@@ -897,9 +949,10 @@ public sealed class ScsKiller : IScsKiller
         : r.WarmedExeStamp != ExeStamp(g) ? "game updated since the warm"   // no store version (older state, other stores): the exe
         : IndexChanged(r);
 
-    /// <summary>Warmed, stale only because an older planner built its plan, and not rebuilt since (<see cref="CheckPlans"/>).</summary>
-    bool NeedsPlanCheck(Game g, GameRecord r) =>
-        r.WarmedAt != null && r.WarmedPlanVersion != Planner.Version && r.PlanVersion != Planner.Version && WarmChanged(g, r) == null;
+    /// <summary>Warmed, stale only because an older planner built its plan, and not rebuilt since (<see cref="CheckPlans"/>);
+    /// or a recording waits for the plan to tell its ray tracing (<see cref="RtPlanCheck"/>).</summary>
+    bool NeedsPlanCheck(Game g, GameRecord r, EngineInfo? e) =>
+        r.WarmedAt != null && r.WarmedPlanVersion != Planner.Version && r.PlanVersion != Planner.Version && WarmChanged(g, r) == null || RtPlanCheck(r, e);
 
     /// <summary>A "when idle" plan rebuild without a warm, unless the game is in the queue already (a failed or stopped
     /// item too: not retried on every scan).</summary>
@@ -1262,13 +1315,15 @@ public sealed class ScsKiller : IScsKiller
         var s = Evaluate(g, false, out _, out var driverStale, ct);
         lock (_lock)
         {
-            if (_evaluatedAt.GetValueOrDefault(g.Id) > ticket || _removed.Contains(g.Id)) return;   // an evaluation started later is in place
+            if (_evaluatedAt.GetValueOrDefault(g.Id) > ticket || _removed.Contains(g.Id) || StaleCopy(g)) return;   // an evaluation started later is in place
             (_evaluatedAt[g.Id], _driverStale[g.Id]) = (ticket, driverStale);
             s = WithVerdict(s);
             var i = _games.FindIndex(x => x.Game.Id == g.Id);
             if (i >= 0) _games[i] = s; else _games.Add(s);
         }
         GameChanged?.Invoke(s);
+        // a game's exit imports its recording: its plan check runs without waiting for a scan
+        if (CheckPlans && s is { Engine: not null, Status: not GameStatus.Unsupported, RtToPlan: true }) CheckPlan(g.Id);
     }
 
     // game id -> the last anti-cheat verdict AntiCheatFound recorded, until a full evaluation finds none
@@ -1309,6 +1364,11 @@ public sealed class ScsKiller : IScsKiller
         {
             var id = states[i].Game.Id;
             if (_removed.Contains(id)) continue;
+            if (StaleCopy(states[i].Game))   // read before its folder changed: the state already listed (the new folder's) stays
+            {
+                if (_games.Find(x => x.Game.Id == id) is { } listed) now.Add(listed);
+                continue;
+            }
             if (_evaluatedAt.GetValueOrDefault(id) > tickets[i] && _games.Find(x => x.Game.Id == id) is { } newer) states[i] = newer;
             else (_evaluatedAt[id], _driverStale[id]) = (tickets[i], driverStale[i]);
             now.Add(WithVerdict(states[i]));
@@ -1846,7 +1906,7 @@ public sealed class ScsKiller : IScsKiller
         SkipVulkanMod = "vkd3d-proton runs the game on Vulkan, whose pipelines a D3D12 warm doesn't compile",
         SkipNeedsAdmin = "the game folder needs administrator", SkipNotDx12 = "not DirectX 12", SkipUnsupported = "not supported yet",
         SkipShaderMod = "an HDR mod changes every pipeline the game creates",
-        SkipManual = "added by hand";
+        SkipManual = "game folder not confirmed";
 
     /// <summary>Why a game whose ReShade add-on adds to every root signature (<see cref="GameState.ShaderModBlocks"/>) isn't compiled.</summary>
     public static string ShaderModReason(string mod) =>
@@ -1865,7 +1925,7 @@ public sealed class ScsKiller : IScsKiller
     public static string? RecorderSkip(GameState s, string? modSkip) =>
         s.AntiCheat != AntiCheat.None ? SkipAntiCheat   // any value but None, "Other" included
         : s.ShaderModBlocks ? SkipShaderMod
-        : s.Game.Store == Core.Store.Manual ? SkipManual
+        : s.RootUnconfirmed ? SkipManual
         : s.Engine == null || s.Status == GameStatus.Unsupported ? SkipUnsupported
         : !s.Engine.GraphicsApi.Contains("D3D12") ? SkipNotDx12   // the proxy is d3d12.dll; "D3D11 or D3D12" may run on it
         : modSkip != null ? modSkip   // ReShade, OptiScaler, another wrapper: never replaced, chained only when the user asks
@@ -1931,7 +1991,7 @@ public sealed class ScsKiller : IScsKiller
         lock (_recorderLock)
         {
             var s = Find(gameId);
-            if (s.Game.Store == Core.Store.Manual && on) return;   // never recorded: nothing of the recorder is saved for it
+            if (Unconfirmed(s.Game) && on) return;   // not recorded before its folder is confirmed: nothing of the recorder is saved for it
             var rec = Store.LoadGame(gameId);
             rec.RecordAlongsideMod = on;
             Store.SaveGame(gameId, rec);
@@ -1969,7 +2029,7 @@ public sealed class ScsKiller : IScsKiller
             AppCacheFiles.DeleteAll(files);   // all or none; throws "files in use by <process>"
             var rec = Store.LoadGame(gameId);
             // a changed recording: the next compile re-plans, and the scan's planner check runs again without it
-            (rec.RecordingImportedAt, rec.RecordingInbox, rec.RecordingIndexHash) = (DateTimeOffset.Now, null, null);
+            (rec.RecordingImportedAt, rec.RecordingInbox, rec.RecordingIndexHash, rec.RecordedLong) = (DateTimeOffset.Now, null, null, false);
             WriteKeys(s.Game, rec);   // it named the deleted copy's blobs and records
             Store.SaveGame(gameId, rec);
             RecorderLog($"{s.Game.Name}: recording cleared ({string.Join(", ", files.Select(f => f.FullName))})");
@@ -1991,19 +2051,78 @@ public sealed class ScsKiller : IScsKiller
     // games the user removed: a scan or refresh that read them before the removal doesn't list them again (under _lock)
     readonly HashSet<string> _removed = [];
 
-    public ManualAdd AddManualGame(string exePath)
+    /// <summary>A game the user added whose folder isn't the one they confirmed, or that has none confirmed yet.</summary>
+    bool Unconfirmed(Game g) => g.Store == Core.Store.Manual && Manual?.Confirmed(g) != true;
+
+    /// <summary>Tests: runs during a folder change, after the old attestation is revoked and before the new folder is saved.</summary>
+    internal Action? FolderChanging { get; set; }
+
+    /// <summary>A game added by hand as discovered before the user changed its folder.</summary>
+    bool StaleCopy(Game g) => g.Store == Core.Store.Manual && Manual?.Stale(g) == true;
+
+    /// <summary>A store's game the exe belongs to: its own exe, or one inside its install.</summary>
+    GameState? Listed(string exe) => Games.FirstOrDefault(s => s.Game.Store != Core.Store.Manual
+        && (string.Equals(s.Game.ExePath, exe, StringComparison.OrdinalIgnoreCase) || GameFiles.Inside(s.Game.InstallDir, exe)));
+
+    public ManualAdd PreviewManualGame(string exePath)
     {
-        var manual = Manual ?? throw new InvalidOperationException("adding games isn't available here");
+        if (Manual == null) throw new InvalidOperationException("adding games isn't available here");
         // a store's game first: its launcher may be what Resolve can't tell apart
-        GameState? Listed(string exe) => Games.FirstOrDefault(s => s.Game.Store != Core.Store.Manual
-            && (string.Equals(s.Game.ExePath, exe, StringComparison.OrdinalIgnoreCase) || GameFiles.Inside(s.Game.InstallDir, exe)));
         if (Listed(Path.GetFullPath(exePath)) is { } owner) return new(owner.Game, true);
         var entry = ManualSource.Resolve(exePath);
         if (Listed(entry.Exe) is { } listed) return new(listed.Game, true);
-        var (game, existed) = manual.Add(entry);
-        lock (_lock) _removed.Remove(game.Id);
-        if (!existed) Log?.Report($"{game.Name}: added to the library ({game.ExePath}, install {game.InstallDir})");
-        return new(game, existed);
+        return Manual.Entries().FirstOrDefault(e => ManualSource.IdOf(e.Exe) == ManualSource.IdOf(entry.Exe)) is { } had
+            ? new(ManualSource.ToGame(had), true) : new(ManualSource.ToGame(entry), false);
+    }
+
+    public string? ManualFolderProblem(string exePath, string installDir) =>
+        ManualSource.RootProblem(installDir, exePath, Games.Select(s => s.Game));
+
+    public ManualAdd AddManualGame(string exePath, string? installDir = null)
+    {
+        var manual = Manual ?? throw new InvalidOperationException("adding games isn't available here");
+        if (Listed(Path.GetFullPath(exePath)) is { } owner) return new(owner.Game, true);
+        // an added game's own exe keeps its entry: resolved again, a patch's bigger exe would make another game
+        var entry = manual.Entries().FirstOrDefault(e => string.Equals(e.Exe, Path.GetFullPath(exePath), StringComparison.OrdinalIgnoreCase))
+            ?? ManualSource.Resolve(exePath);
+        if (Listed(entry.Exe) is { } listed) return new(listed.Game, true);
+        if (installDir != null)
+        {
+            if (ManualFolderProblem(entry.Exe, installDir) is { } why) throw new ArgumentException(why);
+            entry = entry with { InstallDir = GameFiles.DirKey(installDir), Confirmed = true };
+        }
+        ManualAdd added;
+        lock (_recorderLock)
+        {
+            // another folder than the one checked: no arming from the first step until the new folder is saved and published
+            // (a check that starts meanwhile still sees the old one), a change counted (one under way is refused), the old
+            // attestation revoked, then the new folder saved
+            var id = ManualSource.IdOf(entry.Exe);
+            var had = installDir != null ? manual.Entries().FirstOrDefault(e => ManualSource.IdOf(e.Exe) == id) : null;
+            var changing = had != null && !GameFiles.DirKey(had.InstallDir).Equals(entry.InstallDir, StringComparison.OrdinalIgnoreCase);
+            if (changing) _disarmWork.AddOrUpdate(id, 1, (_, n) => n + 1);
+            try
+            {
+                if (changing)
+                {
+                    CountChange(id);
+                    Disarm(ManualSource.ToGame(had!));
+                    FolderChanging?.Invoke();
+                }
+                var (game, existed) = manual.Add(entry);
+                added = new(game, existed);
+            }
+            finally { if (changing) _disarmWork.AddOrUpdate(id, 0, (_, n) => n - 1); }
+        }
+        lock (_lock) _removed.Remove(added.Game.Id);
+        Log?.Report($"{added.Game.Name}: {(added.Existed ? "game folder set" : "added to the library")} ({added.Game.ExePath}, "
+            + $"{(entry.Confirmed ? "confirmed" : "suggested")} folder {added.Game.InstallDir})");
+        if (added.Existed && entry.Confirmed && Games.Any(s => s.Game.Id == added.Game.Id))
+        {
+            Refresh(added.Game);   // a new evaluation (its folder is in the scan's key): the full check covers the confirmed folder
+            if (ManageRecorders) ReconcileRecorders(added.Game.Id);
+        }
+        return added;
     }
 
     /// <summary>Under the game's compile.lock, so no compile of it runs in this process or another meanwhile. A game the user
@@ -2057,7 +2176,7 @@ public sealed class ScsKiller : IScsKiller
         lock (_recorderLock)
         {
             var s = Find(gameId);
-            if (s.Game.Store == Core.Store.Manual && value == RecorderOverride.On) return;   // never recorded; Off takes out one a development build left
+            if (Unconfirmed(s.Game) && value == RecorderOverride.On) return;   // not before its folder is confirmed; Off takes one out
             var rec = Store.LoadGame(gameId);
             rec.Recorder = value;
             Store.SaveGame(gameId, rec);
@@ -2076,6 +2195,7 @@ public sealed class ScsKiller : IScsKiller
     bool Reconcile(GameState s)
     {
         var (g, id) = (s.Game, s.Game.Id);
+        if (OfflineLive(id)) return false;   // its own end takes it out
         var dir = Path.GetDirectoryName(g.ExePath)!;
         var dll = Path.Combine(dir, "d3d12.dll");
         var rec = Store.LoadGame(id);
@@ -2403,8 +2523,8 @@ public sealed class ScsKiller : IScsKiller
     /// <summary>A process runs named like an exe in one of <paramref name="dirs"/> (a game a launcher started under another
     /// exe name too). No process is opened, so another program with the same name counts as well: that only delays
     /// SCSKiller's writes. <paramref name="fresh"/>: a snapshot taken now, as every check before a write takes; else one
-    /// up to a second old.</summary>
-    static bool RunsFrom(bool fresh, string?[] dirs, bool notWarms = false)
+    /// up to a second old. <paramref name="notPid"/>: that process doesn't count (one that exited, still held open).</summary>
+    static bool RunsFrom(bool fresh, string?[] dirs, bool notWarms = false, int notPid = 0)
     {
         HashSet<string> names;
         try
@@ -2416,7 +2536,7 @@ public sealed class ScsKiller : IScsKiller
         if (names.Count == 0) return false;
         var all = fresh ? ProcessTree.Snapshot() : ProcessTree.RecentSnapshot();
         var warms = notWarms ? all.Where(p => p.Exe.Equals("scskiller_warm.exe", StringComparison.OrdinalIgnoreCase)).Select(p => p.Pid).ToHashSet() : [];
-        return all.Any(p => names.Contains(p.Exe) && !warms.Contains(p.Parent));
+        return all.Any(p => names.Contains(p.Exe) && !warms.Contains(p.Parent) && (notPid == 0 || p.Pid != notPid));
     }
 
     /// <summary>Takes out what a failed install placed or an anti-cheat game holds: our proxy (by its marker, whether the
@@ -2499,6 +2619,7 @@ public sealed class ScsKiller : IScsKiller
     /// failure, the check of what's ours included (a dll locked against reading), leaves the removal pending.</summary>
     void TakeOutNow(Game g, string why, GameRecord? installing = null)
     {
+        if (OfflineLive(g.Id)) return;   // its own end takes it out
         Disarm(g);   // first: whatever the removal does, a launch from now on is a pass-through
         lock (_recorderLock)
         {
@@ -2650,9 +2771,10 @@ public sealed class ScsKiller : IScsKiller
             try
             {
                 var rec = store.LoadGame(id);
-                if ((rec.RecorderExe ?? rec.RecorderMoveFrom) is not { } exe) continue;   // a move's old folder may still hold the data files
+                // a move's old folder, or an offline session's whose files went first, may still hold the data files
+                if ((rec.RecorderExe ?? rec.RecorderMoveFrom ?? rec.OfflineSession?.Exe) is not { } exe) continue;
                 var dir = Path.GetDirectoryName(exe)!;
-                var installDir = rec.RecorderInstallDir;
+                var installDir = rec.RecorderInstallDir ?? rec.OfflineSession?.InstallDir;
                 var moveTo = rec.RecorderMoveTo;   // a move pending: the game may run from its new folder
                 // the record's folders may be stale (the game's exe moved since): any exe of the install counts, its
                 // names read once; null: not read whole (in time), as if it runs
@@ -2799,12 +2921,31 @@ public sealed class ScsKiller : IScsKiller
             var stopped = _queue.Where(q => q.Stage == QueueStage.Stopped).Select(q => q with { Stage = QueueStage.Waiting, Error = null, Note = null }).ToList();
             _queue.RemoveAll(q => Finished(q.Stage));
             _queue.InsertRange(WaitingStart(), stopped);
-            if (_current != null) _whenIdle.Remove(_current);
-            _running = _queue.Any(q => q.Stage == QueueStage.Waiting && !_whenIdle.Contains(q.GameId));
-            if (_running) _worker ??= Task.Run(Work);
+            RunWaiting();
             changed.AddRange(_queue);
         }
         foreach (var q in changed) QueueChanged?.Invoke(q);   // removed ones too, so a list view refreshes
+    }
+
+    public void Compile(string gameId)
+    {
+        Enqueue(gameId);
+        QueueItem? item;
+        lock (_lock)
+        {
+            if (_running) return;
+            RunWaiting();
+            item = _queue.FirstOrDefault(q => q.GameId == gameId);
+        }
+        if (item != null) QueueChanged?.Invoke(item);   // QueueRunning changed
+    }
+
+    /// <summary>Runs the waiting items (under _lock); a running "when idle" item goes on in the foreground.</summary>
+    void RunWaiting()
+    {
+        if (_current != null) _whenIdle.Remove(_current);
+        _running = _queue.Any(q => q.Stage == QueueStage.Waiting && !_whenIdle.Contains(q.GameId));
+        if (_running) _worker ??= Task.Run(Work);
     }
 
     /// <summary>Moves a waiting item to position <paramref name="index"/> among the listed waiting items, plan checks left
@@ -3026,7 +3167,7 @@ public sealed class ScsKiller : IScsKiller
         string? NotReady() => state == null || installed == null ? "unknown game (scan first)"
             : now?.Engine == null || now.Check.Readiness != Readiness.Ready ? $"not ready: {now?.Check.Reason}"
             : InjectingMod(installed) is { } mod ? $"not ready: {ShaderModReason(mod.Mod!)}"
-            : state.Status is GameStatus.Unsupported || state.Status == GameStatus.NeedsRecording && !NeedsRtRecording(state.Plan) ? $"not ready: {state.StatusReason}"
+            : state.Status is GameStatus.Unsupported || state.Status == GameStatus.NeedsRecording && !NeedsRtRecording(state) ? $"not ready: {state.StatusReason}"
             : null;
         if (NotReady() != null && now?.Check.Readiness == Readiness.Ready)   // the state may be older than the check (another process imported a recording)
         {
@@ -3081,7 +3222,7 @@ public sealed class ScsKiller : IScsKiller
             bool current = false;   // this rebuild found the warm still current: nothing to warm
             var shared = packs?.SharedFingerprint(game);   // before the build: a download during it must still re-plan
             var maps = MapsFingerprint(index);
-            if (PlanIsStale(id, rec) || rec.PlanMaps != maps || (packs != null && packs.PackFingerprint(game, shared) != (rec.PlanMiddleware ?? "")))
+            if (PlanIsStale(id, rec, engine) || rec.PlanMaps != maps || (packs != null && packs.PackFingerprint(game, shared) != (rec.PlanMiddleware ?? "")))
             {
                 Stage(QueueStage.Planning);
                 await Gate(id, ct);
@@ -3276,9 +3417,9 @@ public sealed class ScsKiller : IScsKiller
         return $" (log: {kept})";
     }
 
-    bool PlanIsStale(string id, GameRecord r) => r.Plan is not { } p || !File.Exists(p.FilePath) || p.IndexContentHash != r.IndexContentHash
+    bool PlanIsStale(string id, GameRecord r, EngineInfo? e) => r.Plan is not { } p || !File.Exists(p.FilePath) || p.IndexContentHash != r.IndexContentHash
                                       || p.VendorProfile != Vendor.Caps.Profile || r.RecordingImportedAt > r.PlanBuiltAt
-                                      || r.PlanVersion != Planner.Version || r.PlanPerStage != PerStagePlans || r.PlanCommunity != CommunityInUse(id)?.Object;
+                                      || r.PlanVersion != Planner.Version || r.PlanPerStage != PerStagePlans || r.PlanCommunity != CommunityInUse(id)?.Object || RtPlanCheck(r, e);
 
     /// <summary>Plans have each stage unit once: the vendor caches per stage and Maximum mode is off. A pairing plan warmed
     /// earlier already holds every unit, so going per-stage rebuilds the plan but needs no re-warm (see StaleReason).</summary>
@@ -3451,6 +3592,7 @@ public sealed class ScsKiller : IScsKiller
     /// whose armed file couldn't be revoked at all, first in every pass.</summary>
     public async Task CheckRecorderGames(bool all)
     {
+        CleanOfflineSessions();
         // the watchers of games no longer with the recorder (or whose recorder moved) end; not while a reconcile or install
         // holds the recorders (its game's state may not show the recorder yet): the next pass
         foreach (var g in _revocationPending.Values)   // a held armed file: revoked again, before anything is armed, and its recorder taken out
@@ -3653,6 +3795,7 @@ public sealed class ScsKiller : IScsKiller
     /// Only a ledger entry that can't be revoked leaves the game revocation-pending: without it the proxy admits nothing.</summary>
     void Disarm(Game g)
     {
+        if (OfflineLive(g.Id)) return;   // bound to the process an offline session started: it admits no other
         CountChange(g.Id);   // before the lock: an Arm writing now sees it and takes its file back
         var done = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var left = RevokeAt(g, [g.ExePath], done);   // the location the caller knows at once: the game's record may be held, and loads slowly then
@@ -3742,10 +3885,10 @@ public sealed class ScsKiller : IScsKiller
 
     /// <summary>After a clean full check that started at <paramref name="gen"/>: armed, unless no watcher runs for the game's
     /// recorder location, the install changed (or anti-cheat was found) since, or our proxy isn't there. A game added by hand
-    /// is never armed, a recorder in it or not.</summary>
+    /// is armed only for the folder the user confirmed: the one the check covered.</summary>
     void Arm(Game g, long gen)
     {
-        if (g.Store == Core.Store.Manual)
+        if (Unconfirmed(g))
         {
             Disarm(g);
             return;
@@ -3754,6 +3897,7 @@ public sealed class ScsKiller : IScsKiller
         lock (_armLock)
         {
             if (InstallGen(g) != gen || _revocationPending.ContainsKey(g.Id) || DisarmQueued(g)) return;
+            if (g.Store == Core.Store.Manual && Manual?.ConfirmedNow(g) != true) return;   // the folder checked is still the one confirmed
             try
             {
                 if (!IsOurProxy(Path.Combine(Path.GetDirectoryName(g.ExePath)!, "d3d12.dll")) || InjectingMod(g) != null) return;   // a blocking HDR mod: never recorded
@@ -3777,13 +3921,15 @@ public sealed class ScsKiller : IScsKiller
         return Path.Combine(LedgerDir, Convert.ToHexStringLower(SHA1.HashData(System.Text.Encoding.Unicode.GetBytes(lowered))));
     }
 
-    /// <summary>Arms the exe: a fresh nonce in its ledger entry first, then in <see cref="ArmedFile"/> next to it.</summary>
-    internal static void WriteAttestation(string exe)
+    /// <summary>Arms the exe: a fresh nonce in its ledger entry first, then in <see cref="ArmedFile"/> next to it.
+    /// <paramref name="process"/>: for that process alone (its pid and creation FILETIME), an offline session's.</summary>
+    internal static void WriteAttestation(string exe, (int Pid, long Created)? process = null)
     {
         var nonce = RandomNumberGenerator.GetHexString(32, lowercase: true);
+        var bound = process is { } p ? $"pid={p.Pid}\r\npid_time={p.Created}\r\n" : "";
         Directory.CreateDirectory(LedgerDir);
-        File.WriteAllText(LedgerFile(exe), $"[scskiller]\r\nnonce={nonce}\r\nexe={exe}\r\n");
-        File.WriteAllText(ArmedFileOf(exe), ArmedText(exe, nonce));
+        File.WriteAllText(LedgerFile(exe), $"[scskiller]\r\nnonce={nonce}\r\nexe={exe}\r\n{bound}");
+        File.WriteAllText(ArmedFileOf(exe), ArmedText(exe, nonce) + bound);
     }
 
     /// <summary><see cref="ArmedFile"/>'s text for the install as it is now: the ledger's nonce, and the exe's size and write

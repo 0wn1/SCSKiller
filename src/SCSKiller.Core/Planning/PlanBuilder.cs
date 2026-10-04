@@ -38,7 +38,7 @@ sealed class PlanBuilder
     readonly HashSet<string> have = [];
     readonly Dictionary<string, int> plats = [];
     byte[]? samplers;
-    int builtOk, builtN;
+    int builtOk, builtN, ownOk, ownN; // own: recorded PSOs whose shaders carry a root signature, and those created with it
 
     // decided from the recording and the caps
     bool verified, build, synth, dx12;
@@ -192,6 +192,11 @@ sealed class PlanBuilder
             var pso = Parse(r);
             if (!pso.Stages.Values.All(bc.ContainsKey)) { have.Add(pso.Tuple); continue; } // not a library shader (e.g. an overlay's): no template
             var st = Infos(pso.Stages);
+            if (pso.Stages.Values.Select(h => bc[h].RootSignature).FirstOrDefault(h => h != null) is { } own)
+            {
+                ownN++;
+                if (own == pso.Rs) ownOk++;
+            }
             if (recBlobs.TryGetValue(pso.Rs, out var rsBlob))
             {
                 // the rule's rebuild with these samplers the runtime won't serialize (its ranges overlap them): the rule
@@ -258,9 +263,10 @@ sealed class PlanBuilder
         embeddedRs = bc.Values.Count(s => s.RootSignature != null);
         rasterNv = RasterNv(caps, rule, recs, nvRecs);
         if (rasterNv is { } nvs) log?.Report($"NVAPI: synthesized PSOs get shader-extension slot {nvs.Slot} space {nvs.Space} (options {nvs.Options})");
-        if (dx12) log?.Report($"recorded: {recs.Count} PSOs{(stateObjects.Count > 0 ? $" + {stateObjects.Count} ray tracing state objects (replayed as recorded)" : "")}, platform {plat}; root sigs rebuilt from shader counts: {builtOk}/{builtN} exact -> "
-            + (build ? "building" : "learned lookup") + (maxSrvs > 0 ? $" (SRV tables of {maxSrvs}, not Unreal {engine.Version}'s {RootSig.MaxSrvs(rule)}: {(maxSrvs == 128 ? "the bindless fork's" : "its shaders bind more")})" : "")
-            + (embeddedRs > 0 ? $"; {embeddedRs} shaders carry their own" : "") + (synth ? ", synthesized templates allowed" : ""));
+        var ownOnly = embeddedRs > 0 && ownN == builtN; // every recorded PSO the rule was checked on carries its own: the rule plans nothing
+        if (dx12) log?.Report($"recorded: {recs.Count} PSOs{(stateObjects.Count > 0 ? $" + {stateObjects.Count} ray tracing state objects (replayed as recorded)" : "")}, platform {plat}; "
+            + (ownOnly ? "" : $"root sigs rebuilt from shader counts: {builtOk}/{builtN} exact -> " + (build ? "building" : "learned lookup")) + (maxSrvs > 0 ? $" (SRV tables of {maxSrvs}, not Unreal {engine.Version}'s {RootSig.MaxSrvs(rule)}: {(maxSrvs == 128 ? "the bindless fork's" : "its shaders bind more")})" : "")
+            + (embeddedRs > 0 ? $"{(ownOnly ? "" : "; ")}{embeddedRs} shaders carry their own root signature{(ownN > 0 ? $", {ownOk}/{ownN} recorded PSOs created with it" : "")}" : "") + (synth ? ", synthesized templates allowed" : ""));
 
         // D3D11: every shader of the game's SM5 platform once (Unreal PCD3D_SM5; the carver's DXBC containers), no pairing;
         // hull and domain shaders as HS+DS pairs of one map (the warm needs both to draw), every one in at least one pair
@@ -669,8 +675,9 @@ sealed class PlanBuilder
     /// state object has. The rule comes from the recording's collections when it has some (checked: each one whose library
     /// is recorded is rebuilt byte for byte, names included), else (no recording, or one without state objects: ray tracing
     /// off as played) for Unreal 4.26/4.27 from UE 4.26's source as Jedi: Survivor confirms it, or Avalanche's 4.27 fork's
-    /// when its libraries carry the fork's bindless marker (<see cref="RtCollections.GlobalFor"/>), and for Unreal 5.1
-    /// <see cref="RtCollections.Ue51Global"/>. An engine in
+    /// when its libraries carry the fork's bindless marker (<see cref="RtCollections.GlobalFor"/>), and for Unreal 5.0-5.4
+    /// <see cref="RtCollections.Ue51Global"/> (5.4: <see cref="RtCollections.Ue54Global"/>) when the libraries have 5.1's
+    /// binding shape (<see cref="RtCollections.Ue5ShapeMismatch"/>; verified on 5.1 only). An engine in
     /// <see cref="RtCollections.GuessedFamilies"/> (Elden Ring: no recording possible) gets a guess from its libraries'
     /// bindings (<see cref="RtCollections.GuessedGlobal"/>), unverified in game. A library declaring a
     /// resource neither root signature gives it is left out ("rt_uncovered").</summary>
@@ -678,6 +685,11 @@ sealed class PlanBuilder
     {
         var libs = maps.Where(m => m.Platform == plat).SelectMany(m => m.Shas).Distinct().Where(h => bc.TryGetValue(h, out var s) && s.Stage == Stage.Library).ToList();
         if (libs.Count == 0) return;
+        if (engine.NoRtPipelines)
+        {
+            log?.Report($"ray tracing: {libs.Count} DXIL libraries; the game's Windows device profile sets r.RayTracing.AllowPipeline=0: none synthesized");
+            return;
+        }
         if (this.rule == RootSig.Rule.Red3) { Red3HitGroups(libs.Count); return; }
         var learned = stateObjects.Select(RtCollections.Read).OfType<RtCollections.Recorded>().ToList();
         RtCollections.Rule rule;
@@ -720,12 +732,19 @@ sealed class PlanBuilder
             how = fork ? "Avalanche's UE 4.27 fork (its bindless spaces; Hogwarts Legacy's recording: 981/981 collections rebuilt from its files)"
                 : "UE 4.26's (its source, as Jedi: Survivor's recording confirms it; unverified for this game)";
         }
-        else if (engine.Family == "Unreal" && engine.Version == "5.1")
+        else if (engine.Family == "Unreal" && engine.Version is "5.0" or "5.1" or "5.2" or "5.3" or "5.4")
         {
-            var (h, b) = RtCollections.Serialize(RtCollections.Ue51Global, RootSig.Ue426Samplers);
+            if (RtCollections.Ue5ShapeMismatch([.. libs.Select(l => bc[l])]) is { } why)
+            {
+                log?.Report($"ray tracing: {libs.Count} DXIL libraries; not stock UE 5.0-5.4's binding shape ({why}): no collection rule without a recording, none synthesized");
+                return;
+            }
+            var (h, b) = RtCollections.Serialize(engine.Version == "5.4" ? RtCollections.Ue54Global : RtCollections.Ue51Global, RootSig.Ue426Samplers);
             rsBlobs[h] = b;
             rule = new(h, 4, 1, 0, 8, false); // payload 0: each library's own
-            how = $"UE 5.1's (Oblivion Remastered's recording: 589/589 collections rebuilt from its files{(engine.Fork != null ? "; unverified for this fork" : "")})";
+            how = engine.Version == "5.1"
+                ? $"UE 5.1's (Oblivion Remastered's recording: 589/589 collections rebuilt from its files{(engine.Fork != null ? "; unverified for this fork" : "")})"
+                : $"UE 5.1's{(engine.Version == "5.4" ? " with 5.4's 32 samplers" : "")}, for the libraries' 5.1 binding shape; unverified for {engine.Version}";
         }
         else if (RtCollections.GuessedFamilies.Contains(engine.Family))
         {
@@ -814,7 +833,7 @@ sealed class PlanBuilder
     /// the runtime won't serialize it (that library is left out).</summary>
     string? LocalRs(ShaderInfo lib, bool rayGen)
     {
-        // UE 5 hit groups: 6 system root constants (other 5.x than 5.1 only through a recording's check)
+        // UE 5 hit groups: 6 system root constants (HitGroupSystemRootConstants is 24 bytes in 5.1's and 5.4's libraries)
         var d = RtCollections.LocalRs(lib.Counts, rayGen, lib.Bindings, engine.Family == "Unreal" && engine.Version.StartsWith("5.") ? 6u : 4u);
         if (!rsCache.TryGetValue(d.Key, out var h))
         {
@@ -871,12 +890,16 @@ sealed class PlanBuilder
         // traced rays inline (RayQuery) and built no state object: the game's ray tracing is in its PSOs, a recording adds nothing
         var inlineOnly = rtLibs > 0 && stateObjects.Count == 0 && recBlobs.Values.Any(b => Carved.Dxbc.InlineRayTracing(b));
         if (inlineOnly) log?.Report($"ray tracing: the recording traces rays inline and builds no state object: the {rtLibs} DXIL libraries aren't used as played");
+        // Unreal 5's hardware Lumen traces inline, compiled with the rest from the game files; its DXIL libraries serve passes
+        // a game may never run (path tracing). Townfall's community recordings: 1,193 inline PSOs, no state object, 10,278 libraries
+        var rtInline = engine.Family == "Unreal" && engine.Version.StartsWith('5') && rtLibs > 0
+            ? maps.Where(m => m.Platform == plat).SelectMany(m => m.Shas).Distinct().Count(h => bc.TryGetValue(h, out var s) && s.InlineRayTracing) : 0;
         var plan = new Plan(game.Id, index.ContentHash, string.Join(" + ", new[] { plat, n11 > 0 ? $"D3D11 {plat11 ?? "DXBC"}" : "" }.Where(p => p != "")), caps.Profile,
             new PlanStats(recs.Count + stateObjects.Count, items.Count + synthesized.Count + rtItems.Count + hitGroupItems.Count, synthesized.Count, usedRs.Count, dx12 && (verified || embeddedRs > 0),
                 unitsBy[(int)Provenance.Exact], unitsBy[(int)Provenance.Inferred], unitsBy[(int)Provenance.Guessed], layoutCoverage, n11, packNew,
-                stats.GetValueOrDefault("rs_uncovered"), rtLibs, inlineOnly ? 0 : rtLibs - rtCovered,
+                stats.GetValueOrDefault("rs_uncovered"), rtLibs, inlineOnly || engine.NoRtPipelines ? 0 : rtLibs - rtCovered,
                 StageSets: seen.Count, LeftOut: new[] { "no_rs", "no_template", "no_gs_template", "rs_uncovered", "stream_output" }.Sum(stats.GetValueOrDefault),
-                MiddlewareSharedItems: packShared, RtStateObjects: replayable.Count),
+                MiddlewareSharedItems: packShared, RtStateObjects: replayable.Count, RtInline: rtInline),
             Path.Combine(outDir, "plan.bin"));
         PlanFile.Write(plan, body);
         log?.Report($"plan: {items.Count + synthesized.Count} PSOs{(rtItems.Count > 0 ? $" + {rtItems.Count} ray tracing collections" : "")} ({string.Join(", ", stats.Select(s => $"{s.Key} {s.Value}"))}), "

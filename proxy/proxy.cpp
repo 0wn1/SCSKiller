@@ -160,7 +160,11 @@ void logf(const char* fmt, ...) {  // also used by warm11.cpp
 //    anti-cheat check of the install and deletes it on any change there (GameFiles.DetectAntiCheat walks the install;
 //    this dll doesn't);
 //  - no anti-cheat marker in this folder: the built-in list, plus scskiller.ini markers= (it only adds; malformed: no);
+//    an attestation bound to this process (pid= and pid_time=, below) drops EasyAntiCheat's names from that list;
 //  - no anti-cheat client module loaded.
+// pid= and pid_time= (its creation FILETIME, UTC) bind the attestation to the one process the app started suspended
+// itself, without EasyAntiCheat, for an offline session: in both files, equal, and this process's. Any other launch
+// with the same files there (Steam's start_protected_game.exe, then EasyAntiCheat, then the game) is a pass-through.
 // scskiller.armed is read again after the rest: changed or gone (the app disarmed it meanwhile) is a pass-through.
 // Accepted limits: a client that loads later in an admitted run isn't caught here (the app removes the recorder and the
 // next launch isn't armed); the app arms after its check and its install watcher's events arrive milliseconds after the
@@ -170,8 +174,13 @@ void logf(const char* fmt, ...) {  // also used by warm11.cpp
 // together with the game-folder file (the app's <entry>.revoked mark beside it still refuses, when it can be made).
 static const wchar_t* const kAntiCheatMarkers[] = {  // GameFiles.Markers; "*x": a name ending in x
     L"EasyAntiCheat", L"EasyAntiCheat_EOS", L"start_protected_game.exe", L"EasyAntiCheat_EOS_Setup.exe", L"EasyAntiCheat_Setup.exe",
-    L"BattlEye", L"BEService.exe", L"BEService_x64.exe", L"BELauncher.exe", L"EAAntiCheat.Installer.exe", L"GameGuard",
-    L"XIGNCODE", L"nProtect", L"randgrid.sys", L"*_BE.exe"};
+    L"BattlEye", L"BEService.exe", L"BEService_x64.exe", L"BELauncher.exe", L"BEClient_x64.dll", L"BEClient.dll",
+    L"EAAntiCheat.Installer.exe", L"GameGuard", L"XIGNCODE", L"nProtect", L"randgrid.sys", L"NCGuardSDK", L"NCGuard", L"AntiCheatExpert",
+    L"AceAntibotClient", L"TP3Helper.exe", L"HoYoKProtect.sys", L"mhypbase.dll", L"NeacClient.exe", L"NeacSafe64.sys", L"NeacSafe64_ex.sys",
+    L"BlackCall.aes", L"BlackCall64.aes", L"BlackCat64.sys", L"HShield", L"PunkBuster", L"PnkBstrA.exe", L"pbsvc.exe", L"pbsv.dll",
+    L"equ8_conf.json", L"gameguard.des", L"DenuvoAC", L"denuvo-anti-cheat.sys", L"denuvo-anti-cheat-runtime.dll",
+    L"denuvo-anti-cheat-update-service.exe", L"Denuvo Anti-Cheat Installer.exe", L"*.xem", L"*_BE.exe"};
+static const size_t kEasyAntiCheatMarkers = 5;  // the list's first entries
 static std::atomic<int> g_admission;  // 0 undecided, 1 records, -1 pass-through
 static bool anti_cheat_loaded() {
     for (auto m : {L"EasyAntiCheat_x64.dll", L"EasyAntiCheat_EOS.dll", L"BEClient_x64.dll", L"BEClient.dll"})
@@ -251,8 +260,9 @@ static std::string armed_text() {
 }
 // armed=1, checked= present, and the install the app checked is the one running: exe_size= and exe_time= (FILETIME, UTC)
 // are this process's exe as it was then (the app closed while the game updated has no watcher to disarm; an update that
-// adds anti-cheat ships a changed exe).
-static bool armed() {
+// adds anti-cheat ships a changed exe). bound: pid= and pid_time= name this process.
+static bool armed(bool& bound) {
+    bound = false;
     const std::wstring file = g_dir + L"scskiller.armed";
     wchar_t v[32];
     GetPrivateProfileStringW(L"scskiller", L"armed", L"", v, 32, file.c_str());
@@ -280,7 +290,21 @@ static bool armed() {
     wchar_t nonce[64], kept[64];
     DWORD a1 = GetPrivateProfileStringW(L"scskiller", L"nonce", L"", nonce, 64, file.c_str());
     DWORD a2 = ledger.empty() ? 0 : GetPrivateProfileStringW(L"scskiller", L"nonce", L"", kept, 64, ledger.c_str());
-    return a1 == 32 && a2 == 32 && !wcscmp(nonce, kept);
+    if (a1 != 32 || a2 != 32 || wcscmp(nonce, kept)) return false;
+    // the process binding: the same in both files (none in both: unbound), and this process
+    for (auto key : {L"pid", L"pid_time"}) {
+        wchar_t here[32], there[32];
+        DWORD n1 = GetPrivateProfileStringW(L"scskiller", key, L"", here, 32, file.c_str());
+        DWORD n2 = GetPrivateProfileStringW(L"scskiller", key, L"", there, 32, ledger.c_str());
+        if (n1 != n2 || wcscmp(here, there)) return false;
+    }
+    if (!GetPrivateProfileStringW(L"scskiller", L"pid", L"", v, 32, file.c_str())) return true;
+    FILETIME created, x1, x2, x3;
+    uint64_t pid, at;
+    if (!number(L"pid", pid) || !number(L"pid_time", at) || pid != GetCurrentProcessId() || !GetProcessTimes(GetCurrentProcess(), &created, &x1, &x2, &x3)
+        || at != ((uint64_t)created.dwHighDateTime << 32 | created.dwLowDateTime))
+        return false;
+    return bound = true;
 }
 static bool admitted() {
     if (g_warm) return true;  // scskiller_warm's staged child replays; it is never a game
@@ -288,8 +312,10 @@ static bool admitted() {
     std::call_once(once, [] {
         std::vector<std::wstring> markers;
         const std::string attested = armed_text();
-        const char* why = !armed() ? "not armed" : !anti_cheat_markers(markers) ? "markers= malformed"
-                          : anti_cheat_beside(markers) ? "anti-cheat next to the exe" : anti_cheat_loaded() ? "anti-cheat client loaded" : nullptr;
+        bool bound;
+        const char* why = !armed(bound) ? "not armed" : !anti_cheat_markers(markers) ? "markers= malformed" : nullptr;
+        if (!why && bound) markers.erase(markers.begin(), markers.begin() + kEasyAntiCheatMarkers);  // the app started this process without EasyAntiCheat
+        if (!why) why = anti_cheat_beside(markers) ? "anti-cheat next to the exe" : anti_cheat_loaded() ? "anti-cheat client loaded" : nullptr;
         if (wchar_t ms[16]; !why && GetEnvironmentVariableW(L"SCSKILLER_TEST_ADMIT_PAUSE_MS", ms, 16)) Sleep(_wtoi(ms));  // tests: a change in between
         if (!why && armed_text() != attested) why = "disarmed while deciding";  // the app disarmed it meanwhile (an install change)
         std::lock_guard l(g_early_mx);

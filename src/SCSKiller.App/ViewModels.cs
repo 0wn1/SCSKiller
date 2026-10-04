@@ -265,7 +265,7 @@ public sealed class GameRow(GameState s, bool queued = false, bool compiling = f
         GameStatus.Warmed when Partly => "Partly warmed",
         GameStatus.Warmed => "Warmed",
         GameStatus.Ready => "Ready to compile",
-        GameStatus.NeedsRecording => "Needs a 5-min recording",
+        GameStatus.NeedsRecording => ScsKiller.RecordedEnough(s) ? "Needs a recording" : "Needs a 5-min recording",
         GameStatus.Stale => "Needs rebuilding",
         _ => s.ShaderModBlocks ? "Not compiled" : s.Engine?.Encrypted == true ? "Encrypted game files" : "Not supported yet",
     };
@@ -276,7 +276,7 @@ public sealed class GameRow(GameState s, bool queued = false, bool compiling = f
         GameStatus.Warmed => $"driver {s.WarmedDriverVersion}" + (ScsKiller.IsPartial(s.Plan) ? " · a recording compiles the rest" : ""),
         GameStatus.NeedsRecording when s.AntiCheat != AntiCheat.None => $"{Fmt.AntiCheatName(s.AntiCheat)} blocks recording",
         GameStatus.NeedsRecording when s.RecordingPaused => ScsKiller.PausedNote(App.Core.Settings),
-        GameStatus.NeedsRecording when s.RecorderInstalled => "recorder on: play for about 5 minutes",
+        GameStatus.NeedsRecording when s.RecorderInstalled && !ScsKiller.RecordedEnough(s) => "recorder on: play for about 5 minutes",
         _ => s.StatusReason,
     } + ModNote(s);
     /// <summary>A shader mod that doesn't block the game: "; RenoDX replaces some shaders: ...".</summary>
@@ -556,10 +556,10 @@ public sealed class DetailVm(string id) : Bindable
     static string Sentence(string t) => t.Length > 0 ? char.ToUpperInvariant(t[0]) + t[1..] : t;
     bool Partial => ScsKiller.IsPartial(s.Plan);
     /// <summary>Needs a recording for its ray tracing only: the rest compiles (a partial compile, offered but not the primary action).</summary>
-    bool RtPartial => s.Status == GameStatus.NeedsRecording && ScsKiller.NeedsRtRecording(s.Plan);
+    bool RtPartial => s.Status == GameStatus.NeedsRecording && ScsKiller.NeedsRtRecording(s);
     public bool NoAntiCheat => s.AntiCheat == AntiCheat.None;
-    /// <summary>The recorder may go next to the game: no anti-cheat, and not a game the user added.</summary>
-    bool CanRecord => NoAntiCheat && !IsManual;
+    /// <summary>The recorder may go next to the game: no anti-cheat, and not a game added by hand whose folder isn't confirmed.</summary>
+    bool CanRecord => NoAntiCheat && !s.RootUnconfirmed;
 
     public string Name => s.Game.Name;
     public string Sub => $"{Path.GetFileName(s.Game.ExePath)} · {Fmt.StoreName(s.Game)}";   // engine and API are tags
@@ -603,7 +603,7 @@ public sealed class DetailVm(string id) : Bindable
         Error = Fmt.Play(s.Game);
         Changed();
     }
-    public string AddText => Queued ? "In queue" : OffersCareful ? "Compile carefully" : RtPartial ? "Compile without ray tracing (partial)" : "Add to queue";
+    public string AddText => Queued ? "In queue" : OffersCareful ? "Compile carefully" : RtPartial ? "Compile without ray tracing (partial)" : "Compile";
     /// <summary>Partly warmed by a fast compile: the compile button turns the careful compile on first.</summary>
     public bool OffersCareful => ScsKiller.IsPartlyWarmed(s) && s.Careful is { On: false };
 
@@ -657,9 +657,11 @@ public sealed class DetailVm(string id) : Bindable
     // The one tip left: a game that can't compile before a recording, or not its ray tracing (a plan's other gaps are the
     // coverage card's "what's left").
     public bool HasRecordTip => CanRecord && s.Status == GameStatus.NeedsRecording && !RecordOn;
-    public string RecordTipTitle => "Record 5 minutes of play";
-    public string RecordTip => RtPartial ? "Turn on recording and play with ray tracing on for about 5 minutes. " + ScsKiller.RtWhy(App.Core.Vendor.Caps, s.Engine)
+    bool Enough => ScsKiller.RecordedEnough(s);
+    public string RecordTipTitle => Enough ? "Record more play" : "Record 5 minutes of play";
+    public string RecordTip => RtPartial ? $"Turn on recording and play with ray tracing on{(Enough ? "" : " for about 5 minutes")}. " + ScsKiller.RtWhy(App.Core.Vendor.Caps, s.Engine)
             + " Everything else compiles from the game files already."
+        : Enough ? Sentence(s.StatusReason) + "."
         : "Turn on recording and play as usual for about 5 minutes. SCSKiller learns this game's shader layout from it, then it can compile.";
     public bool ShowRecordAction => !RecordOn && CanToggleRecord;
 
@@ -678,7 +680,9 @@ public sealed class DetailVm(string id) : Bindable
         : Pct is not { } pct ? "Measured again on the next compile"
         : (s.Status == GameStatus.Stale ? s.NewPipelines > 0 ? "Its new plan covers" : "Its last plan covered" : Compiled ? "Covers" : "Will cover")
           + (pct == 100 ? " all the shader combinations found in this game" : $" about {pct}% of the shader combinations found in this game");
-    bool Rt => ScsKiller.NeedsRtRecording(P);
+    bool Rt => ScsKiller.NeedsRtRecording(s);
+    bool RtUnseen => s.RtUnseen;
+    bool RtInline => ScsKiller.RtInlineCovers(P);
     bool Compiled => s.WarmedAt != null && s.Status != GameStatus.Stale;   // Warmed, or compiled without its ray tracing (NeedsRecording)
 
     /// <summary>Where the plan's pipelines come from, in a player's words; the recording's row carries the community note,
@@ -696,7 +700,7 @@ public sealed class DetailVm(string id) : Bindable
         p.MiddlewareItems > 0 ? new(p.MiddlewareSharedItems == 0 ? "Its upscalers, learned from recordings"
             : p.MiddlewareSharedItems == p.MiddlewareItems ? "Its upscalers, from shared packs" : "Its upscalers, from recordings and shared packs", Fmt.N(p.MiddlewareItems)) : null,
         p.D3D11Shaders > 0 ? new("DirectX 11 shaders", Fmt.N(p.D3D11Shaders)) : null,
-        p.RtLibraries > 0 ? new("Ray-traced effects", p.RtUncovered == 0 ? "covered" : !Rt ? "mostly covered" : CanRecord ? "need a recording" : "not compiled") : null,
+        p.RtLibraries > 0 ? new("Ray-traced effects", s.Engine?.NoRtPipelines == true ? "inline, from the game files" : p.RtUncovered == 0 ? "covered" : s.RtToPlan ? "being checked" : RtUnseen ? "not seen while recording" : RtInline ? "inline ones covered" : !Rt ? "mostly covered" : CanRecord ? "need a recording" : "not compiled") : null,
     }.OfType<DetailRow>().ToList();
     public bool HasSources => Sources.Count > 0;
     /// <summary>The community database's line under the recording row; null = nothing to say.</summary>
@@ -719,18 +723,18 @@ public sealed class DetailVm(string id) : Bindable
     /// <summary>tipAsks: the record tip already gives the ray tracing note and the recording advice.</summary>
     string LeftSentences(bool tipAsks) => string.Join(" ", new string?[]
     {
-        !Rt || tipAsks ? null : CanRecord ? (HasDbTeaser ? ScsKiller.RtNeedsRecording : ScsKiller.RtNote(s.InCommunityDb)) + "."
+        RtUnseen ? Sentence(ScsKiller.RtUnseenNote) + "." : RtInline ? Sentence(ScsKiller.RtInlineNote) + "." : !Rt || tipAsks ? null : CanRecord ? (HasDbTeaser ? ScsKiller.RtNeedsRecording : ScsKiller.RtNote(s.InCommunityDb)) + "."
             : $"Ray-traced effects aren't compiled: they need a recording, {(NoAntiCheat ? ScsKiller.ManualNoRecording : $"which {Fmt.AntiCheatName(s.AntiCheat)} blocks")}.",
         LeftCase switch
         {
-            Left.AntiCheat => NoAntiCheat ? "Anything else compiles while you play: recording, which would find it, isn't available for games added by hand yet."
+            Left.AntiCheat => NoAntiCheat ? "Anything else compiles while you play: confirm the game's folder (Game folder… above) to record what's missing."
                 : $"Anything else compiles while you play: {Fmt.AntiCheatName(s.AntiCheat)} blocks the recording that would find it.",
             Left.EngineSlots => "The rest use shader slots this game's engine adds." + (tipAsks ? "" : " A 5-minute recording lets SCSKiller rebuild them."),
             Left.UnknownSlots => "The rest use shader slots SCSKiller can't rebuild yet, so they still compile while you play.",
             Left.NotSeen => "SCSKiller hasn't seen how the game sets the rest up yet." + (tipAsks ? "" : " Playing longer with recording on teaches it."),
             Left.Recording => "Recording is on: anything new you play is added the next time it compiles.",
             Left.PlayedCompiles => $"Last time you played, {PlayCompiles(L!):N0} still had to compile." + (tipAsks ? "" : " Recording picks them up."),
-            _ when Rt => null,   // ray tracing is what's left
+            _ when Rt || RtUnseen || RtInline => null,   // ray tracing is what's left
             Left.PlayedClean => "Nothing was missing last time you played.",
             Left.NothingKnown => "Nothing SCSKiller knows of is missing.",
             _ => "A few effects are only put together while you play." + (tipAsks ? "" : " A short recording picks them up."),
@@ -740,9 +744,9 @@ public sealed class DetailVm(string id) : Bindable
     // per-stage plans (AMD): the planner warns that a wrong guess costs a compile in game
     bool Guessed => P is { } g && g.GuessedUnits > 0.1 * (g.ExactUnits + g.InferredUnits + g.GuessedUnits);
     // not twice: a game that needs a recording has the button in its tip
-    public bool ShowLeftRecord => ShowRecordAction && !HasRecordTip && (LeftCase is Left.EngineSlots or Left.NotSeen or Left.PlayedCompiles or Left.PlayOnly || Guessed || Rt);
+    public bool ShowLeftRecord => ShowRecordAction && !HasRecordTip && (LeftCase is Left.EngineSlots or Left.NotSeen or Left.PlayedCompiles or Left.PlayOnly || Guessed || Rt || RtUnseen || RtInline);
     public bool ShowLeftCallout => HasPlan && ShowLeftRecord;   // before the first compile there's nothing left yet
-    public string LeftTitle => Rt ? "Ray-traced effects aren't compiled yet" : "Some shaders still compile while you play";
+    public string LeftTitle => Rt || RtUnseen ? "Ray-traced effects aren't compiled yet" : "Some shaders still compile while you play";
 
     public string CoverageValue => Pct is { } pct ? $"{pct}%" : Dx11Only ? "All" : Format.Dash;
     public string CoverageLabel => Pct != null || Dx11Only ? "covered" : "not yet";
@@ -788,7 +792,8 @@ public sealed class DetailVm(string id) : Bindable
         P != null ? new("Built from the game files", Fmt.N(P.Generated)) : null,
         P is { MiddlewareItems: > 0 } ? new("Upscaler pipelines", Fmt.N(P.MiddlewareItems)) : null,
         P is { D3D11Shaders: > 0 } ? new("DirectX 11 shaders", Fmt.N(P.D3D11Shaders)) : null,
-        P is { RtLibraries: > 0 } ? new("Ray tracing shader libraries", $"{P.RtLibraries:N0}" + (P.RtUncovered > 0 ? $" ({P.RtUncovered:N0} not compiled)" : "")) : null,
+        P is { RtLibraries: > 0 } ? new("Ray tracing shader libraries", $"{P.RtLibraries:N0}" + (s.Engine?.NoRtPipelines == true ? " (not used by the game)" : P.RtUncovered > 0 ? $" ({P.RtUncovered:N0} not compiled)" : "")) : null,
+        P is { RtInline: > 0 } ? new("Shaders that trace rays inline", Fmt.N(P.RtInline)) : null,
         s.InCommunityDb is { } db && !HasDbTeaser ? new("In the community database", db ? $"{s.CommunityDbPsos:N0} pipelines" : "not yet") : null,
         s.Community is { } c ? new("Community recording", $"{c.Psos:N0} pipelines") : null,
         P != null ? new("Synthesized pipeline templates", Fmt.N(P.SynthesizedTemplates)) : null,
@@ -918,13 +923,16 @@ public sealed class DetailVm(string id) : Bindable
         : "";
 
     public bool? RecordPending { get; set; }   // the state a recorder change that is running (off the UI thread) asked for
-    public bool RecordOn => RecordPending ?? s.RecorderEffective;
-    public bool CanToggleRecord => RecordPending == null && AlongsidePending == null && NoAntiCheat && s.RecorderSkip == null;
+    public bool RecordOn => ShowOffline ? OfflineOn : RecordPending ?? s.RecorderEffective;
+    public bool CanToggleRecord => ShowOffline ? OfflinePending == null && !s.OfflineRunning
+        : RecordPending == null && AlongsidePending == null && NoAntiCheat && s.RecorderSkip == null;
     public bool ShowUseDefault => RecordPending == null && s.RecorderOverride != RecorderOverride.Default && s.RecorderSkip == null;
     public string UseDefaultText => $"Use default ({(App.Core.Settings.RecordAllGames ? "on" : "off")})";
-    public string RecordNote => !NoAntiCheat
+    public string RecordNote => ShowOffline
+        ? $"{Fmt.AntiCheatName(s.AntiCheat)} treats an extra d3d12.dll as tampering, so this game is compiled from its files only."
+        : !NoAntiCheat
         ? $"Not available: {Fmt.AntiCheatName(s.AntiCheat)} treats an extra d3d12.dll as tampering, so this game is compiled from its files only."
-        : s.RecorderSkip == ScsKiller.SkipManual ? "Not available: recording isn't available for games added by hand yet, so this game is compiled from its files only."
+        : s.RecorderSkip == ScsKiller.SkipManual ? "Not available until you confirm the game's folder (Game folder… above): SCSKiller checks all of it for anti-cheat before it records."
         : s.RecorderSkip is { } skip ? $"Not available: {skip}."
         : "Adds a small d3d12.dll next to the game to catch anything the plan missed and time each frame, so this page shows what stuttered. Remove any time."
           + (s.RecorderNote is { } note ? $" ({Sentence(note)})" : "");
@@ -936,6 +944,18 @@ public sealed class DetailVm(string id) : Bindable
     public bool? AlongsidePending { get; set; }
     public bool AlongsideOn => AlongsidePending ?? s.RecordAlongsideMod;
     public bool CanToggleAlongside => AlongsidePending == null && RecordPending == null;
+
+    // An eligible EasyAntiCheat game (Games.OfflineEac): the card's switch allows offline sessions, each confirmed before it starts
+    public bool ShowOffline => s.OfflineEligible;
+    public bool? OfflinePending { get; set; }
+    public bool OfflineOn => OfflinePending ?? s.OfflineRecord;
+    public bool ShowOfflineOn => ShowOffline && OfflineOn;
+    public bool OfflineStarting { get; set; }
+    public bool CanStartOffline => s.OfflineRecord && OfflinePending == null && !s.OfflineRunning && !s.Playing && !OfflineStarting;
+    public string OfflineButtonText => s.OfflineRunning ? "Offline session running…" : "Record offline without EasyAntiCheat (at your own risk)";
+    public string OfflineRiskText => OfflineRisk;
+    public const string OfflineRisk = "Starts the game offline without EasyAntiCheat. SCSKiller removes its files when the game exits (after a crash: "
+        + "at the next logon). If any are left when you play online, you could be banned. Steam must be running; don't uninstall SCSKiller mid-session.";
 
     public bool HasRecording => s.RecordingBytes > 0;
     public string RecordingSize => $"The recording uses {Format.Bytes(s.RecordingBytes)} (in the game folder and SCSKiller's copy)";

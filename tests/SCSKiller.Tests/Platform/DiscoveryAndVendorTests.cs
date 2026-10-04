@@ -595,6 +595,55 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void NCGuard_in_a_plugin_folder_and_suffix_markers_are_found()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-anticheat-test-").FullName;
+        try
+        {
+            Game Install(string name, params string[] files)
+            {
+                var dir = Path.Combine(root, name);
+                foreach (var f in files.Append(@"Game\Binaries\Win64\Game.exe"))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(dir, f))!);
+                    File.WriteAllBytes(Path.Combine(dir, f), [0]);
+                }
+                return new Game($"test:{name}", name, Store.Other, dir, Path.Combine(dir, @"Game\Binaries\Win64\Game.exe"));
+            }
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(Install("ncguard", @"Game\Plugins\NCGuardSDK\Libraries\Win64\bb64.dll")));
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(Install("xigncode3", @"Game\Binaries\Win64\x3.xem")));
+            Assert.Equal(AntiCheat.BattlEye, GameFiles.DetectAntiCheat(Install("battleye", "Game_BE.exe")));
+            Assert.Equal(AntiCheat.None, GameFiles.DetectAntiCheat(Install("clean", @"Game\Plugins\NCGuardSDKTools\readme.txt", "notes.xem.txt")));
+            Assert.Equal(AntiCheat.BattlEye, GameFiles.DetectAntiCheat(Install("beclient", @"Game\Binaries\Win64\BEClient_x64.dll")));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    /// <summary>War Thunder's standalone layout: BattlEye sits in the root, the exe in win64, which is the folder suggested.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void A_hand_added_game_sees_anti_cheat_in_the_folders_above_its_own(bool marked)
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-anticheat-test-").FullName;
+        try
+        {
+            var game = Path.Combine(root, "Games", "WarThunder");
+            foreach (var f in marked ? new[] { @"BattlEye\BEService_x64.dll.txt", "aces_BE.exe", @"win64\aces.exe" } : [@"win32\aces.exe", @"win64\aces.exe"])
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(game, f))!);
+                File.WriteAllBytes(Path.Combine(game, f), [0]);
+            }
+            var exe = Path.Combine(game, "win64", "aces.exe");
+            var manual = new Game(ManualSource.IdOf(exe), "War Thunder", Store.Manual, Path.Combine(game, "win64"), exe);
+            Assert.Equal(marked ? AntiCheat.BattlEye : AntiCheat.None, GameFiles.DetectAntiCheat(manual));
+            Assert.Equal(marked ? AntiCheat.BattlEye : AntiCheat.None, GameFiles.DetectAntiCheat(manual, quick: true));
+            Assert.Equal(AntiCheat.None, GameFiles.DetectAntiCheat(manual with { Store = Store.Other }));   // a store's install folder is its root
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
     public void An_install_folder_that_cannot_be_listed_is_not_known_to_be_clean()
     {
         var root = Directory.CreateTempSubdirectory("scskiller-anticheat-acl-test-").FullName;

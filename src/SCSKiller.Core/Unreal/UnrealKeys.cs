@@ -44,6 +44,9 @@ public sealed class UnrealKeys(string dataDir)
         return key;
     }
 
+    /// <summary>The stored key file's write time, "" if none: a key added or changed re-runs detection.</summary>
+    public string KeyStamp(Game game) => File.Exists(KeyFile(game)) ? File.GetLastWriteTimeUtc(KeyFile(game)).Ticks.ToString() : "";
+
     /// <summary>The stored key, unchecked (a full mount checks it: SubmitKey mounts only what it opens).</summary>
     public FAesKey? Stored(Game game) => File.Exists(KeyFile(game)) ? Parse(File.ReadAllText(KeyFile(game))) : null;
 

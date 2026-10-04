@@ -1,4 +1,4 @@
-using System.Buffers.Binary;
+﻿using System.Buffers.Binary;
 using SCSKiller.Core;
 using SCSKiller.Core.App;
 using SCSKiller.Core.Games;
@@ -63,21 +63,45 @@ public sealed class ManualGamesTests : IDisposable
     }
 
     [Fact]
-    public void Anti_cheat_above_the_exe_makes_that_folder_the_install()
+    public void A_suggested_folder_sees_anti_cheat_in_the_folders_above_it_and_a_confirmed_folder_is_checked_whole()
     {
         var game = Directory.CreateDirectory(Path.Combine(_root, "Shooter")).FullName;
         Directory.CreateDirectory(Path.Combine(game, "EasyAntiCheat"));
-        var exe = Path.Combine(Directory.CreateDirectory(Path.Combine(game, "bin64", "retail")).FullName, "shooter.exe");
+        var retail = Directory.CreateDirectory(Path.Combine(game, "bin64", "retail")).FullName;
+        var exe = Path.Combine(retail, "shooter.exe");
         File.WriteAllBytes(exe, Exe("d3d12.dll"));
         var e = ManualSource.Resolve(exe);
-        Assert.Equal((exe, game), (e.Exe, e.InstallDir));
-        Assert.Equal(AntiCheat.EasyAntiCheat, GameFiles.DetectAntiCheat(ManualSource.ToGame(e)));
+        Assert.Equal((exe, retail), (e.Exe, e.InstallDir));   // a suggestion: the user confirms or changes it
+        Assert.Equal(AntiCheat.EasyAntiCheat, GameFiles.DetectAntiCheat(ManualSource.ToGame(e)));   // in the folder above
+        Assert.Equal(AntiCheat.EasyAntiCheat, GameFiles.DetectAntiCheat(ManualSource.ToGame(e with { InstallDir = game })));
+        Assert.Null(ManualSource.RootProblem(game, exe, []));
+    }
 
-        // anti-cheat beside the exe: found where it is, the install doesn't widen to the library folder
-        var souls = Directory.CreateDirectory(Path.Combine(_root, "Souls", "Game")).FullName;
-        Directory.CreateDirectory(Path.Combine(souls, "EasyAntiCheat"));
-        File.WriteAllBytes(Path.Combine(souls, "souls.exe"), Exe("d3d12.dll"));
-        Assert.Equal(souls, ManualSource.Resolve(Path.Combine(souls, "souls.exe")).InstallDir);
+    [Fact]
+    public void A_folder_of_many_games_or_a_drive_is_never_a_game_folder()
+    {
+        string Dir(params string[] parts) => Directory.CreateDirectory(Path.Combine([_root, .. parts])).FullName;
+        var exe = Path.Combine(_root, "x.exe");
+        Assert.Contains("whole drive", ManualSource.RootProblem(Path.GetPathRoot(_root)!, exe, []));
+        Assert.Contains("doesn't exist", ManualSource.RootProblem(Path.Combine(_root, "gone"), exe, []));
+        Assert.Contains("many programs", ManualSource.RootProblem(Dir("SteamLibrary", "steamapps", "common"), exe, []));
+        Assert.Contains("many programs", ManualSource.RootProblem(Dir("XboxGames"), exe, []));
+        Assert.Contains("many programs", ManualSource.RootProblem(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), exe, []));
+        var library = Dir("Library");
+        foreach (var g in new[] { "One", "Two" }) File.WriteAllBytes(Path.Combine(Dir("Library", g), g + ".exe"), Exe());
+        Assert.Contains("several games", ManualSource.RootProblem(library, exe, []));
+        var listed = new Game("steam:1", "Listed Game", Store.Steam, Dir("Shelf", "Listed"), Path.Combine(_root, "Shelf", "Listed", "l.exe"));
+        Assert.Contains("Listed Game", ManualSource.RootProblem(Path.Combine(_root, "Shelf"), exe, [listed]));
+
+        var (unreal, _, shipping) = UnrealLayout(Path.Combine(_root, "Unreal Game"));
+        File.WriteAllBytes(Path.Combine(Dir("Unreal Game", "Engine", "Binaries", "ThirdParty"), "helper.exe"), Exe());
+        Assert.Null(ManualSource.RootProblem(unreal, shipping, [listed]));
+        var red = Dir("Red Game");
+        File.WriteAllBytes(Path.Combine(Dir("Red Game", "bin", "x64"), "game.exe"), Exe("d3d12.dll"));
+        File.WriteAllBytes(Path.Combine(Dir("Red Game", "_CommonRedist"), "vcredist.exe"), Exe());
+        Dir("Red Game", "content");
+        Assert.Null(ManualSource.RootProblem(red, Path.Combine(red, "bin", "x64", "game.exe"), []));
+        Assert.Equal(red, ManualSource.Resolve(Path.Combine(red, "bin", "x64", "game.exe")).InstallDir);
     }
 
     [Fact]

@@ -62,6 +62,8 @@ public sealed class GameRecord
     public bool RecordAlongsideMod { get; set; }             // opt-in: install the recorder where a mod's d3d12.dll is, chained to it
     public ChainedDll? RecorderChained { get; set; }         // that mod's d3d12.dll, renamed for the chain: put back when the recorder goes
     public bool RecorderRollback { get; set; }               // a failed install couldn't take the proxy out: the next reconcile does
+    public bool OfflineRecord { get; set; }                  // opt-in: offline sessions without EasyAntiCheat may be started (Games.OfflineEac)
+    public OfflineSession? OfflineSession { get; set; }      // one was started and its folder isn't back to how it was yet
     public bool KeysPending { get; set; }                    // the keys file wasn't rewritten while the game ran: the next refresh or reconcile does
     public HashSet<string> CacheKeys { get; set; } = [];     // driver-cache application keys seen open by this game's warms or the game (IAppCache)
     public HashSet<string> GameKeys { get; set; } = [];      // ...of them, the ones the game's own process held open
@@ -79,6 +81,8 @@ public sealed class GameRecord
     public bool WarmedCareful { get; set; }                 // the last complete warm was careful
     public LaunchCheck? FirstLaunch { get; set; }           // the game's first launch after the last complete warm (AMD); null = not yet
     public PlayWindow? LastPlay { get; set; }               // the last run of the game the app watched from start to exit
+    public bool RecordedLong { get; set; }                   // a recorded launch of ScsKiller.EnoughRecording or more since the recording was last cleared
+    public bool RtUnseen { get; set; }                       // a recorded launch of ScsKiller.EnoughRecording built no ray tracing state object, and none since did
 }
 
 /// <summary>A run of the game as the app's watcher saw it: not running at <paramref name="From"/>, last seen running at
@@ -94,6 +98,13 @@ public sealed record LaunchCheck(DateTimeOffset At, long Hits, long Compiles)
 
 /// <summary>A mod's d3d12.dll renamed to <paramref name="Name"/> in the exe folder, with the SHA-256 of its bytes.</summary>
 public sealed record ChainedDll(string Name, string Sha256);
+
+/// <summary>An offline session SCSKiller started without EasyAntiCheat: the game, its exe and install, the names in the exe's
+/// folder before anything was added (what its cleanup checks the folder against), every name in it the session may create
+/// (temp names included; none existed before it; each leaves once confirmed gone), and the process it started (its pid and
+/// creation FILETIME; 0 = none yet), and whether it was resumed (else it is still suspended, or was).</summary>
+public sealed record OfflineSession(string GameId, string Exe, string InstallDir, string[] Original, string[] Created, int Pid = 0, long Started = 0,
+    bool Resumed = false);
 
 /// <summary>The expensive part of a scan (engine detection, planner check, anti-cheat), reused while <see cref="Key"/>
 /// (exe stamp, store version, vendor profile, recording, SCSKiller build) is unchanged.</summary>

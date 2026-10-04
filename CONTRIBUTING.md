@@ -6,7 +6,9 @@ never a public issue.
 ## Anti-cheat games
 
 SCSKiller never touches a game with anti-cheat beyond reading its files: no recorder, no injection, no opening its
-processes. Changes that work around this aren't accepted.
+processes. The one exception is the offline session (ARCHITECTURE.md, Recorder): EasyAntiCheat games on the list in
+`src/SCSKiller.Core/Games/offline-eac.json` only, opted into per game, confirmed per launch, started by SCSKiller itself
+and recorded in that process alone. Changes that widen it or work around the rule otherwise aren't accepted.
 
 ## How pull requests are merged
 

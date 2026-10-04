@@ -15,7 +15,7 @@ namespace SCSKiller.Core.Unreal;
 ///      the user's saved Engine.ini); _Default or unset = the engine default: UE4 DX11, UE5 DX12.
 /// Values: "D3D12" / "D3D11" / "Vulkan", suffixed " (launch option)", " (user setting)" or " (last run)" when that decided
 /// it rather than the project default; "D3D11 or D3D12" when it can't be decided: the project defaults to DX11 but ships
-/// DX12-only (SM6) shaders (DX12 is then a launch-menu or in-game choice we can't see), the Steam launch menu offers
+/// DX12-only (SM6) shaders or ray tracing (DX12 is then a launch or in-game choice we can't see), the Steam launch menu offers
 /// several and the game's last log doesn't say, or the config is unreadable (encrypted) and the log doesn't say. SM6-only
 /// shader libraries mean D3D12 whatever the config says.</summary>
 public static class UnrealRhi
@@ -26,8 +26,39 @@ public static class UnrealRhi
     static readonly string[] EngineIni = ["Engine/Config/Windows/BaseWindowsEngine.ini", "{P}/Config/DefaultEngine.ini", "Engine/Config/Windows/WindowsEngine.ini", "{P}/Config/Windows/WindowsEngine.ini"];
     static readonly string[] UserSettingsIni = ["{P}/Config/DefaultGameUserSettings.ini", "{P}/Config/Windows/WindowsGameUserSettings.ini"];
 
-    /// <summary>Whether a pak file path is one of the config files <see cref="Resolve"/> reads.</summary>
-    public static bool IsConfig(string path, string project) => EngineIni.Concat(UserSettingsIni).Any(p => Same(p, path, project));
+    static readonly string[] DeviceProfilesIni = ["Engine/Config/BaseDeviceProfiles.ini", "Engine/Config/Windows/WindowsDeviceProfiles.ini",
+        "Engine/Platforms/Windows/Config/WindowsDeviceProfiles.ini", "{P}/Config/DefaultDeviceProfiles.ini", "{P}/Config/Windows/WindowsDeviceProfiles.ini",
+        "{P}/Platforms/Windows/Config/WindowsDeviceProfiles.ini"];
+
+    /// <summary>Whether a pak file path is one of the config files <see cref="Resolve"/> or <see cref="RtPipelinesOff"/> reads.</summary>
+    public static bool IsConfig(string path, string project) => EngineIni.Concat(UserSettingsIni).Concat(DeviceProfilesIni).Any(p => Same(p, path, project));
+
+    /// <summary>The Windows device profile sets r.RayTracing.AllowPipeline=0: the game never builds a ray tracing state
+    /// object, only inline ray tracing (SILENT HILL: Townfall). CVars array entries: "+"/"." add, "-" removes the same
+    /// entry, "!" clears; the last file wins. The Windows profile is the root of the PC profiles: no base to follow.</summary>
+    public static bool RtPipelinesOff(IReadOnlyDictionary<string, string> configs, string project)
+    {
+        string? v = null;
+        foreach (var text in Ordered(DeviceProfilesIni, configs, project))
+        {
+            var inWindows = false;
+            foreach (var raw in text.Split('\n'))
+            {
+                var line = raw.Trim();
+                if (line.StartsWith('[')) { inWindows = line.Equals("[Windows DeviceProfile]", StringComparison.OrdinalIgnoreCase); continue; }
+                var eq = line.IndexOf('=');
+                if (!inWindows || eq <= 0 || !line[..eq].TrimStart('+', '.', '-', '!').Trim().Equals("CVars", StringComparison.OrdinalIgnoreCase)) continue;
+                if (line[0] == '!') { v = null; continue; }
+                var cvar = line[(eq + 1)..].Trim().Trim('"');
+                var ceq = cvar.IndexOf('=');
+                if (ceq <= 0 || !cvar[..ceq].Trim().Equals("r.RayTracing.AllowPipeline", StringComparison.OrdinalIgnoreCase)) continue;
+                var value = cvar[(ceq + 1)..].Trim();
+                if (line[0] != '-') v = value;
+                else if (v == value) v = null;
+            }
+        }
+        return v == "0";
+    }
 
     static bool Same(string pattern, string path, string project) => string.Equals(pattern.Replace("{P}", project), path, StringComparison.OrdinalIgnoreCase);
 
@@ -87,6 +118,9 @@ public static class UnrealRhi
                 : (Ambiguous, $"project config unreadable, no log (UE{engineMajor} default would be {byProject})");
         }
         if (byProject == "D3D11" && sm6) return (Ambiguous, $"{why}, but DX12-only (SM6) shaders ship: DX12 is a launch or in-game option");
+        // a UE4 DX12 game may ship SM5 libraries only; ray tracing runs on DX12 only, so a project that ships it offers DX12
+        if (byProject == "D3D11" && Last(Ordered(EngineIni, configs, project), "/Script/Engine.RendererSettings", "r.RayTracing") is { } rt && (rt is "1" || rt.Equals("true", StringComparison.OrdinalIgnoreCase)))
+            return (Ambiguous, $"{why}, but the project ships ray tracing (r.RayTracing={rt}), which runs on DX12 only: DX12 is a launch or in-game option");
         return (byProject, why + (pref.Item1 != null ? $"; user {pref.Item2} agrees or is ignored" : ""));
     }
 

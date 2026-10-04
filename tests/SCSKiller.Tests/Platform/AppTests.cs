@@ -14,7 +14,7 @@ namespace SCSKiller.Tests.Platform;
 
 // Everything here runs on a fake game under %TEMP%; no real game folder is touched.
 [Collection(TimingCollection.Name)]
-public class AppTests : IDisposable
+public partial class AppTests : IDisposable
 {
     readonly string _root = Path.Combine(Path.GetTempPath(), "scskiller-app-test-" + Guid.NewGuid().ToString("N")[..8]);
     readonly Game _game;
@@ -2640,6 +2640,7 @@ public class AppTests : IDisposable
     [InlineData(NoChecked, "", null, 0)]                                    // no checked=
     [InlineData("[scskiller]\r\narmed=1\r\nexe_size=1\r\nexe_time=1\r\n", "", null, 0)]   // another exe's
     [InlineData(Armed, "", "BEService_x64.exe", 0)]                         // a built-in marker beside the exe
+    [InlineData(Armed, "", "start_protected_game.exe", 0)]                  // EasyAntiCheat's: only an offline session's attestation overrides it
     [InlineData(Armed, "markers=Other.exe\r\n", "BEService_x64.exe", 0)]    // markers= can't drop it
     [InlineData(Armed, "markers=Custom.exe\r\n", "Custom.exe", 0)]          // ... but adds
     [InlineData(Armed, "markers=a/b|\r\n", null, 0)]                        // malformed markers=
@@ -3895,7 +3896,7 @@ public class AppTests : IDisposable
     [Fact]
     public async Task Ray_tracing_the_plan_cannot_compile_makes_the_game_need_a_recording()
     {
-        var rt = new PlanStats(0, 40_000, 40_000, 100, true, RtLibraries: 12_000, RtUncovered: 12_000);
+        var rt = new PlanStats(0, 40_000, 40_000, 100, true, RtLibraries: 12_000, RtUncovered: 12_000, RtInline: 0);
         var k = Killer(new FakeReader(Unreal), new FakePlanner(stats: rt));
         await k.ScanAsync(default);
         Assert.Equal(GameStatus.Ready, k.Games.Single().Status);   // before a build nothing is known
@@ -3914,6 +3915,124 @@ public class AppTests : IDisposable
         Assert.False(ScsKiller.NeedsRtRecording(rt with { RtUncovered = 1_200 }));   // 10%: not above
         Assert.True(ScsKiller.NeedsRtRecording(rt with { RtUncovered = 1_201 }));
         Assert.False(ScsKiller.NeedsRtRecording(rt with { RtLibraries = 0, RtUncovered = 0 }));   // no ray tracing shaders
+    }
+
+    /// <summary>Unreal 5 whose shaders trace rays inline: its DXIL libraries don't make it need a recording, compiled or
+    /// not, and the reason says what only a recording adds. A plan from before inline ray tracing was counted is planned
+    /// again by the plan check, asking for nothing meanwhile.</summary>
+    [Fact]
+    public async Task Unreal_5_inline_ray_tracing_needs_no_recording_for_its_libraries()
+    {
+        var rt = new PlanStats(0, 40_000, 40_000, 100, true, RtLibraries: 10_278, RtUncovered: 10_278, RtInline: 1_193);
+        var stats = rt;
+        var reader = new FakeReader(Unreal with { Version = "5.6" });
+        var k = Killer(reader, new FakePlanner(statsFor: _ => stats));
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);
+        var s = k.Games.Single();
+        Assert.Equal(GameStatus.Warmed, s.Status);
+        Assert.EndsWith("; " + ScsKiller.RtInlineNote, s.StatusReason);
+        Assert.Equal((false, true), (ScsKiller.NeedsRtRecording(s), ScsKiller.RtInlineCovers(s.Plan)));
+
+        var rec = k.Store.LoadGame(_game.Id);   // built before RtInline was counted
+        rec.Plan = rec.Plan! with { Stats = rt with { RtInline = null } };
+        rec.WarmedAt = null;
+        k.Store.SaveGame(_game.Id, rec);
+        k.CheckPlans = true;
+        k.IdleTime = () => TimeSpan.FromHours(1);   // the plan check runs while the PC is idle
+        await k.ScanAsync(default);
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        s = k.Games.Single();
+        Assert.True(k.Queue.Single().PlanCheck);
+        Assert.Equal((GameStatus.Ready, (long?)1_193), (s.Status, s.Plan!.RtInline));
+        Assert.EndsWith("; " + ScsKiller.RtInlineNote, s.StatusReason);
+        Assert.Equal("Path tracing needs a recording", Format.ShortNote(s));
+    }
+
+    /// <summary>Unreal 4 (any engine but Unreal 5) with a plan from before inline ray tracing was counted: as before, no plan check.</summary>
+    [Fact]
+    public async Task An_older_plan_of_another_engine_keeps_asking_for_a_ray_tracing_recording()
+    {
+        var rt = new PlanStats(0, 40_000, 40_000, 100, true, RtLibraries: 10_278, RtUncovered: 10_278);
+        var ue4 = Killer(new FakeReader(Unreal), new FakePlanner(stats: rt));
+        ue4.IdleTime = () => TimeSpan.FromHours(1);
+        await ue4.ScanAsync(default);
+        await WarmOnce(ue4, _game.Id);
+        ue4.CheckPlans = true;
+        await ue4.ScanAsync(default);
+        var s = ue4.Games.Single();
+        Assert.Null(s.Plan!.RtInline);
+        Assert.Equal((GameStatus.NeedsRecording, false), (s.Status, s.RtToPlan));
+        Assert.DoesNotContain(ue4.Queue, q => q.PlanCheck);
+    }
+
+    /// <summary>Unreal 5's Lumen: hardware ray tracing traces rays inline (RayQuery PSOs, no state object), software Lumen
+    /// none at all. A recorded launch's import plans the recording without a compile (the app's plan check): inline ray
+    /// tracing then covers it; a launch of 5 minutes without any makes the game Ready with a note. Until then the status
+    /// asks for nothing, a shorter launch still asks, and a later one with a state object brings the ask back until a
+    /// compile plans it.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_recorded_launch_ends_the_ray_tracing_ask_without_a_compile(bool hardwareLumen)
+    {
+        var rt = new PlanStats(0, 40_000, 40_000, 100, true, RtLibraries: 12_000, RtUncovered: 12_000, RtInline: 0);
+        var planner = new FakePlanner(statsFor: r => r != null && hardwareLumen ? rt with { RtUncovered = 0 } : rt);   // PlanBuilder's inlineOnly
+        var k = Killer(new FakeReader(Unreal), planner);
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);
+        var rec = k.Store.LoadGame(_game.Id);   // planned, not warmed: what a compile stopped after its plan leaves
+        rec.WarmedAt = null;
+        k.Store.SaveGame(_game.Id, rec);
+        var csv = Path.Combine(_exeDir, "scskiller_creates.csv");
+        const long at = 1_700_000_000_000;
+        void Launch(double minutes, params string[] creates) => File.AppendAllLines(csv,
+            [$"#session,{at},Fake-Win64-Shipping.exe", "#clock,0.0", .. creates, $"#end,{at + (long)(minutes * 60_000)},{minutes * 60_000:0.0}"]);
+
+        Launch(2, "20.0,G,0,0,1.0");
+        await k.ScanAsync(default);
+        var s = k.Games.Single();
+        Assert.Equal((GameStatus.NeedsRecording, ScsKiller.RtNeedsRecording), (s.Status, s.StatusReason[..ScsKiller.RtNeedsRecording.Length]));
+        Assert.False(ScsKiller.RecordedEnough(s));
+
+        k.CheckPlans = true;
+        k.IdleTime = () => TimeSpan.Zero;   // the user is at the PC: the plan check waits
+        Launch(12, "20.0,G,0,0,1.0", "600000.0,C,0,0,9.0");
+        using (var f = File.Create(Path.Combine(_exeDir, "scskiller.db")))   // the launch's recording, imported by the evaluation
+            PsoDb.Write(f, 'C', new PsoDb.Rec('C', PsoDb.Compute(PsoDb.Zero, new string('a', 40))).Payload);
+        await k.ScanAsync(default);
+        s = k.Games.Single();
+        Assert.NotNull(k.Store.LoadGame(_game.Id).RecordingImportedAt);
+        Assert.Equal((GameStatus.Ready, true, false), (s.Status, s.RtToPlan, ScsKiller.NeedsRtRecording(s)));   // nothing asked while its plan waits
+        Assert.True(k.Queue.Single().PlanCheck);
+        Assert.True(ScsKiller.RecordedEnough(s));
+        Assert.Equal("X", Format.ShortNote(s with { Status = GameStatus.NeedsRecording, RecorderInstalled = true, StatusReason = "x" }));   // what's missing, not 5 minutes again
+
+        k.IdleTime = () => TimeSpan.FromHours(1);
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        s = k.Games.Single();
+        Assert.Equal((GameStatus.Ready, false, false), (s.Status, s.RtToPlan, ScsKiller.NeedsRtRecording(s)));
+        if (hardwareLumen)
+        {
+            Assert.Equal((0L, false), (s.Plan!.RtUncovered, s.RtUnseen));   // covered by the recording
+            Assert.DoesNotContain(ScsKiller.RtUnseenNote, s.StatusReason);
+            return;
+        }
+        Assert.Equal((12_000L, true), (s.Plan!.RtUncovered, s.RtUnseen));   // the page's count stays honest
+        Assert.EndsWith("; " + ScsKiller.RtUnseenNote, s.StatusReason);
+        Assert.Equal("No ray tracing seen while recording", Format.ShortNote(s));
+
+        Launch(1, "20.0,G,0,0,1.0");   // a later short launch: 5 minutes were recorded already
+        await k.ScanAsync(default);
+        Assert.True(ScsKiller.RecordedEnough(k.Games.Single()));
+
+        File.Delete(csv);   // the recorder taken out with its session files: still known
+        await k.ScanAsync(default);
+        Assert.Equal(GameStatus.Ready, k.Games.Single().Status);
+
+        Launch(1, "20.0,R,0,0,40.0");   // a state object: the plan has none of it yet
+        await k.ScanAsync(default);
+        Assert.Equal((GameStatus.NeedsRecording, ScsKiller.RtNeedsRecording), (k.Games.Single().Status, k.Games.Single().StatusReason[..ScsKiller.RtNeedsRecording.Length]));
     }
 
     /// <summary>Coverage: the stage sets found minus the ones left out, as the detail page shows it (floored, 100 only when
@@ -4814,6 +4933,42 @@ public class AppTests : IDisposable
         Assert.True(k.Store.LoadGame(_game.Id).PlanBuiltAt > rebuilt);
     }
 
+    /// <summary>The game page's compile button: with the queue stopped it adds the game and runs the waiting items, leaving
+    /// a stopped item stopped and finished ones listed; with the queue running it only adds. The Library's "Add to queue"
+    /// only adds.</summary>
+    [Fact]
+    public async Task The_game_pages_compile_button_runs_the_queue_without_restarting_a_stopped_item()
+    {
+        var warmer = new ControlledWarmer();
+        var k = Killer(new FakeReader(Unreal), warmer: warmer, games: Three());
+        await k.ScanAsync(default);
+        k.Enqueue("test:fake");   // the Library's "Add to queue"
+        await Task.Delay(200);
+        Assert.False(k.QueueRunning);
+        Assert.Empty(warmer.Started);
+
+        k.StartQueue();
+        await Until(() => warmer.Run != null);
+        k.StopQueue();
+        await Until(() => k.Queue.Any(q => q is { GameId: "test:fake", Stage: QueueStage.Stopped }));
+        Assert.False(k.QueueRunning);
+
+        k.Compile("test:b");   // the queue isn't running: it runs test:b, not the stopped item
+        Assert.True(k.QueueRunning);
+        await Until(() => warmer.Started.Count == 2);
+        Assert.Equal(["test:fake", "test:b"], warmer.Started);
+
+        k.Compile("test:c");   // the queue runs: only added
+        Assert.Equal(QueueStage.Stopped, k.Queue.Single(q => q.GameId == "test:fake").Stage);
+        warmer.Run!.Finish();
+        await Until(() => warmer.Started.Count == 3);
+        warmer.Run!.Finish();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(["test:fake", "test:b", "test:c"], warmer.Started);
+        Assert.Equal(QueueStage.Stopped, k.Queue.Single(q => q.GameId == "test:fake").Stage);
+        Assert.All(k.Queue.Where(q => q.GameId != "test:fake"), q => Assert.Equal(QueueStage.Done, q.Stage));
+    }
+
     [Fact]
     public async Task A_newer_planner_with_the_same_plan_is_not_stale_and_is_not_rewarmed()
     {
@@ -4840,6 +4995,34 @@ public class AppTests : IDisposable
         Assert.Equal("already compiled: the new plan adds nothing", k.Queue.Single().Note);
         Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
         Assert.Single(warmer.Started);
+    }
+
+    /// <summary>FromSoftware plans before version 26 used the 1.1 root signatures the shaders carry, which the game never
+    /// creates: a game warmed by one gets its plan rebuilt when idle and counts what the new plan adds.</summary>
+    [Fact]
+    public async Task A_FromSoftware_game_warmed_before_its_root_signature_fix_is_replanned()
+    {
+        Assert.True(Planner.Version > 25);
+        List<PsoDb.Rec> records = [new('S', [1]), new('S', [2])];
+        var warmer = new FakeWarmer();
+        var k = Killer(new FakeReader(new("FromSoftware", "DXIL+RTS0", "Elden Ring", "D3D12", false, null)), new FakePlanner(records: records), warmer);
+        k.IdleTime = () => TimeSpan.FromHours(1);
+        await k.ScanAsync(default);
+        await Compile(k);
+        Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
+        var rec = k.Store.LoadGame(_game.Id);
+        (rec.PlanVersion, rec.WarmedPlanVersion) = (25, 25);
+        k.Store.SaveGame(_game.Id, rec);
+
+        records.Clear();
+        records.AddRange([new('S', [3]), new('S', [4]), new('S', [5])]);   // the same stage sets under the game's root signatures
+        k.CheckPlans = true;
+        await k.ScanAsync(default);
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(k.Queue.Single().PlanCheck);
+        var s = k.Games.Single();
+        Assert.Equal((GameStatus.Stale, 3L), (s.Status, s.NewPipelines));
+        Assert.Single(warmer.Started);   // the plan check doesn't warm
     }
 
     [Fact]
@@ -7199,7 +7382,7 @@ public class AppTests : IDisposable
     public async Task A_partial_ray_tracing_plan_doesnt_let_a_compile_through_that_the_planner_says_needs_a_recording()
     {
         var source = new FakeSource([_game with { Version = "1" }]);
-        var rt = new PlanStats(0, 40_000, 40_000, 100, true, RtLibraries: 12_000, RtUncovered: 12_000);
+        var rt = new PlanStats(0, 40_000, 40_000, 100, true, RtLibraries: 12_000, RtUncovered: 12_000, RtInline: 0);
         var k = new ScsKiller([source], new FakeVendor(Gpu), new UpdatedReader(), new UpdatedPlanner(rt), new FakeWarmer(), Path.Combine(_root, "data"), _proxy) { LocalAppData = _root };
         await k.ScanAsync(default);
         await WarmOnce(k, _game.Id);   // everything but the ray tracing
@@ -7954,6 +8137,224 @@ public class AppTests : IDisposable
         }
         public ShaderIndex Index(Game game, EngineInfo e, IProgress<string>? log, CancellationToken ct) => new("content-1", ["PCD3D_SM6"], new Dictionary<string, ShaderInfo>(), []);
         public void ReadShaders(Game game, EngineInfo e, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct) { }
+    }
+
+    /// <summary>A game added by hand with its folder confirmed, in a fresh killer whose data folder has it; scanned.</summary>
+    async Task<(ScsKiller K, Game Game, string Dir)> Confirmed(string root, bool manage = false)
+    {
+        var (_, stub, shipping) = ManualGamesTests.UnrealLayout(root);
+        var k = Killer(new FakeReader(Unreal), sources: [new FakeSource([_game]), Manual()]);
+        k.ProcessNames = () => new HashSet<string>();
+        k.ManageRecorders = manage;
+        await k.ScanAsync(default);
+        var game = k.AddManualGame(stub, root).Game;
+        Assert.Equal((shipping, root), (game.ExePath, game.InstallDir));
+        await k.ScanAsync(default);
+        return (k, game, Path.GetDirectoryName(shipping)!);
+    }
+
+    [Fact]
+    public async Task A_game_added_with_its_folder_confirmed_is_recorded_and_armed_like_a_store_game()
+    {
+        var (k, game, dir) = await Confirmed(Path.Combine(_root, "Games", "Added"), manage: true);   // "record all games" installs it
+        var s = k.Games.Single(x => x.Game.Id == game.Id);
+        Assert.Equal((false, null), (s.RootUnconfirmed, s.RecorderSkip));
+        Assert.True(ScsKiller.IsOurProxy(Path.Combine(dir, "d3d12.dll")));
+        Assert.Contains("armed=1", File.ReadAllText(Path.Combine(dir, ScsKiller.ArmedFile)));
+        Assert.True(File.Exists(ScsKiller.LedgerFile(game.ExePath)));
+    }
+
+    [Fact]
+    public async Task A_game_saved_without_a_confirmed_folder_is_recorded_once_it_is_confirmed()
+    {
+        var (root, stub, shipping) = ManualGamesTests.UnrealLayout(Path.Combine(_root, "Added 113"));
+        var dir = Path.GetDirectoryName(shipping)!;
+        var k = Killer(new FakeReader(Unreal), sources: [Manual()]);
+        k.ProcessNames = () => new HashSet<string>();
+        var id = k.AddManualGame(stub).Game.Id;   // saved without a confirmed folder: a suggested one only
+        await k.ScanAsync(default);
+        Assert.Equal((true, ScsKiller.SkipManual), (k.Games.Single().RootUnconfirmed, k.Games.Single().RecorderSkip));
+        Assert.Contains(ScsKiller.SkipManual, Assert.Throws<InvalidOperationException>(() => k.InstallRecorder(id)).Message);
+        Assert.False(File.Exists(Path.Combine(dir, "d3d12.dll")));
+
+        Assert.True(k.AddManualGame(stub, root).Existed);   // the folder confirmed: the same game
+        Assert.Single(Manual().Entries());
+        Assert.Null(k.Games.Single().RecorderSkip);
+        k.InstallRecorder(id);
+        Assert.Contains("armed=1", File.ReadAllText(Path.Combine(dir, ScsKiller.ArmedFile)));
+    }
+
+    [Fact]
+    public async Task Anti_cheat_in_a_sibling_game_doesnt_block_and_anti_cheat_inside_the_confirmed_folder_does()
+    {
+        var games = Path.Combine(_root, "Games");
+        Directory.CreateDirectory(Path.Combine(games, "Other Game", "EasyAntiCheat"));   // another game beside it
+        var (k, game, dir) = await Confirmed(Path.Combine(games, "Added"));
+        Assert.Equal(AntiCheat.None, k.Games.Single(x => x.Game.Id == game.Id).AntiCheat);
+        k.InstallRecorder(game.Id);
+        Assert.Contains("armed=1", File.ReadAllText(Path.Combine(dir, ScsKiller.ArmedFile)));
+
+        Directory.CreateDirectory(Path.Combine(game.InstallDir, "Game", "Content", "EasyAntiCheat"));   // deep inside the confirmed folder
+        await k.ScanAsync(default);
+        Assert.Equal(AntiCheat.EasyAntiCheat, k.Games.Single(x => x.Game.Id == game.Id).AntiCheat);
+        Assert.False(File.Exists(Path.Combine(dir, "d3d12.dll")));
+        Assert.False(File.Exists(Path.Combine(dir, ScsKiller.ArmedFile)));
+        Assert.False(File.Exists(ScsKiller.LedgerFile(game.ExePath)));
+    }
+
+    [Fact]
+    public async Task Changing_the_confirmed_folder_disarms_at_once_and_a_refused_folder_changes_nothing()
+    {
+        var (k, game, dir) = await Confirmed(Path.Combine(_root, "Games", "Added"));
+        k.InstallRecorder(game.Id);
+        var armed = Path.Combine(dir, ScsKiller.ArmedFile);
+        Assert.True(File.Exists(armed));
+
+        Assert.Contains("whole drive", Assert.Throws<ArgumentException>(() => k.AddManualGame(game.ExePath, Path.GetPathRoot(_root)!)).Message);
+        Assert.Equal(game.InstallDir, Manual().Entries().Single().InstallDir);
+        Assert.True(File.Exists(armed));
+
+        var project = Path.Combine(game.InstallDir, "Game");   // a narrower folder, the user's choice
+        File.WriteAllBytes(Path.Combine(game.InstallDir, "Game", "Binaries", "Win64", "Game-Win64-Shipping-DX11.exe"), ManualGamesTests.Exe(padding: 90_000));   // a patch's bigger exe
+        k.AddManualGame(game.ExePath, project);
+        Assert.False(File.Exists(armed));
+        Assert.False(File.Exists(ScsKiller.LedgerFile(game.ExePath)));
+        var entry = Manual().Entries().Single();
+        Assert.Equal((game.ExePath, project, true), (entry.Exe, entry.InstallDir, entry.Confirmed));   // the same game, its exe kept
+        Assert.Equal(project, k.Games.Single(x => x.Game.Id == game.Id).Game.InstallDir);
+        k.ReconcileRecorders(game.Id);   // kept: a full check of the new folder, armed again
+        Assert.Contains("armed=1", File.ReadAllText(armed));
+    }
+
+    [Fact]
+    public async Task A_confirmed_game_gets_the_hdr_mod_block_records_alongside_a_mod_and_loses_its_recorder_at_uninstall()
+    {
+        var (k, game, dir) = await Confirmed(Path.Combine(_root, "Games", "Added"));
+        var dll = Path.Combine(dir, "d3d12.dll");
+        var mod = Planning.MiddlewarePackTests.Pe("d3d12.dll", Guid.NewGuid().ToByteArray());
+        File.WriteAllBytes(dll, mod);
+        await k.ScanAsync(default);
+        k.SetRecordAlongsideMod(game.Id, true);   // installs, alongside the mod
+        Assert.True(ScsKiller.IsOurProxy(dll));
+        Assert.Equal(mod, File.ReadAllBytes(Path.Combine(dir, ScsKiller.ChainName)));
+        Assert.NotNull(k.Store.LoadGame(game.Id).RecorderChained);
+
+        ScsKiller.RemoveAllRecorders(k.Store, new HashSet<string>());   // SCSKiller's own uninstall
+        Assert.Equal(mod, File.ReadAllBytes(dll));
+        Assert.False(File.Exists(Path.Combine(dir, ScsKiller.ChainName)));
+        Assert.False(File.Exists(Path.Combine(dir, ScsKiller.ArmedFile)));
+        Assert.False(File.Exists(ScsKiller.LedgerFile(game.ExePath)));
+
+        File.Delete(dll);
+        await k.ScanAsync(default);
+        k.InstallRecorder(game.Id);
+        Assert.True(ScsKiller.IsOurProxy(dll));
+        File.WriteAllBytes(Path.Combine(dir, "dxgi.dll"), ReShadeDll);
+        File.WriteAllBytes(Path.Combine(dir, "renodx-ff7rebirth.addon64"), RenoDxAddon);   // listed: changes every pipeline
+        await k.ScanAsync(default);
+        var s = k.Games.Single(x => x.Game.Id == game.Id);
+        Assert.Equal((GameStatus.Unsupported, ScsKiller.SkipShaderMod), (s.Status, s.RecorderSkip));
+        Assert.False(File.Exists(dll));
+        Assert.False(File.Exists(ScsKiller.LedgerFile(game.ExePath)));
+    }
+
+    [Fact]
+    public async Task Previewing_an_exe_shows_the_resolved_exe_and_suggested_folder_and_saves_nothing()
+    {
+        var (root, stub, shipping) = ManualGamesTests.UnrealLayout(Path.Combine(_root, "Games", "Added"));
+        var k = Killer(new FakeReader(Unreal), sources: [new FakeSource([_game]), Manual()]);
+        await k.ScanAsync(default);
+        var p = k.PreviewManualGame(stub);
+        Assert.Equal((false, shipping, root), (p.Existed, p.Game.ExePath, p.Game.InstallDir));
+        Assert.Empty(Manual().Entries());
+        Assert.Null(k.ManualFolderProblem(shipping, root));
+        Assert.Contains(_game.Name, k.ManualFolderProblem(shipping, _root));   // holds a listed game
+        Assert.Equal((_game.Id, true), (k.PreviewManualGame(Path.Combine(_game.InstallDir, "Fake.exe")) is var x ? (x.Game.Id, x.Existed) : default));   // a store's game
+    }
+
+    /// <summary>A scan's discovery reads the list with folder A and holds before publishing it; the user changes the folder
+    /// to B, where anti-cheat is; then the discovery goes on. A is never armed, and the listed state is B's.</summary>
+    [Fact]
+    public async Task A_discovery_that_read_the_old_folder_doesnt_arm_it_after_the_folder_changed()
+    {
+        var root = Path.Combine(_root, "Games", "Added");
+        var (_, stub, shipping) = ManualGamesTests.UnrealLayout(root);
+        var a = Path.Combine(root, "Game");   // the project folder: clean
+        Directory.CreateDirectory(Path.Combine(root, "Security", "EasyAntiCheat"));   // only in B, the whole game
+        var manual = Manual();
+        var k = Killer(new FakeReader(Unreal), sources: [manual]);
+        k.ProcessNames = () => new HashSet<string>();
+        var id = k.AddManualGame(stub, a).Game.Id;
+        await k.ScanAsync(default);
+        k.InstallRecorder(id);
+        var dir = Path.GetDirectoryName(shipping)!;
+        var armed = Path.Combine(dir, ScsKiller.ArmedFile);
+        Assert.Contains("armed=1", File.ReadAllText(armed));
+
+        k.ManageRecorders = true;   // as the app: the scan reconciles, and the reconcile arms what it keeps
+        using var reading = new ManualResetEventSlim();
+        using var go = new ManualResetEventSlim();
+        var once = 0;
+        manual.Read = () => { if (Interlocked.Exchange(ref once, 1) == 0) { reading.Set(); go.Wait(TimeSpan.FromSeconds(10)); } };
+        var scan = k.ScanAsync(default);   // its discovery reads folder A, then holds
+        Assert.True(reading.Wait(TimeSpan.FromSeconds(10)));
+        var change = Task.Run(() => k.AddManualGame(shipping, root));   // folder B
+        await Task.Delay(300);
+        go.Set();
+        await change;
+        await scan;
+        await k.CheckRecorderGames(true);
+
+        var s = k.Games.Single();
+        Assert.Equal((GameFiles.DirKey(root), AntiCheat.EasyAntiCheat), (s.Game.InstallDir, s.AntiCheat));
+        Assert.False(manual.Confirmed(s.Game with { InstallDir = a }));
+        Assert.False(File.Exists(armed));
+        Assert.False(File.Exists(ScsKiller.LedgerFile(shipping)));
+        Assert.False(File.Exists(Path.Combine(dir, "d3d12.dll")));
+    }
+
+    /// <summary>A watcher pass that starts during a folder change, after the old attestation is revoked and before the new
+    /// folder is saved, still sees the old folder (clean) and would arm it: nothing is armed at any point of the change.</summary>
+    [Fact]
+    public async Task A_check_that_starts_during_a_folder_change_never_arms_the_old_folder()
+    {
+        var root = Path.Combine(_root, "Games", "Added");
+        var (_, stub, shipping) = ManualGamesTests.UnrealLayout(root);
+        var k = Killer(new FakeReader(Unreal), sources: [Manual()]);
+        k.ProcessNames = () => new HashSet<string>();
+        var id = k.AddManualGame(stub, Path.Combine(root, "Game")).Game.Id;
+        await k.ScanAsync(default);
+        k.InstallRecorder(id);
+        var armed = Path.Combine(Path.GetDirectoryName(shipping)!, ScsKiller.ArmedFile);
+        var ledger = ScsKiller.LedgerFile(shipping);
+        Assert.True(File.Exists(armed) && File.Exists(ledger));
+
+        var seen = new List<string>();
+        using var stop = new CancellationTokenSource();
+        Task? watch = null;
+        var checkedDuring = false;
+        k.FolderChanging = () =>
+        {
+            watch = Task.Run(async () =>   // from the revocation on, every millisecond until the change returns
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    foreach (var f in new[] { armed, ledger }) if (File.Exists(f)) lock (seen) seen.Add(f);
+                    await Task.Delay(1);
+                }
+            });
+            checkedDuring = k.CheckRecorderGames(true).Wait(TimeSpan.FromSeconds(20));   // the old folder is still the listed one
+            foreach (var f in new[] { armed, ledger }) if (File.Exists(f)) lock (seen) seen.Add(f);
+        };
+        k.AddManualGame(shipping, root);
+        stop.Cancel();
+        await watch!;
+        Assert.True(checkedDuring);
+        Assert.Empty(seen);
+
+        k.FolderChanging = null;
+        await k.CheckRecorderGames(true);   // after the change: the new folder's check arms it
+        Assert.Contains("armed=1", File.ReadAllText(armed));
     }
 
     sealed class FakeSource(Game[] games) : IGameSource
@@ -9103,14 +9504,15 @@ public class AppTests : IDisposable
     }
 
     /// <summary><paramref name="records"/>: a real plan.bin with these records (read at each build); else a stand-in file.</summary>
-    sealed class FakePlanner(byte[]? genDb = null, long skipped = 0, PlanStats? stats = null, List<PsoDb.Rec>? records = null, byte[]? mainDb = null) : IPlanner
+    sealed class FakePlanner(byte[]? genDb = null, long skipped = 0, PlanStats? stats = null, List<PsoDb.Rec>? records = null, byte[]? mainDb = null,
+        Func<Recording?, PlanStats>? statsFor = null) : IPlanner
     {
         public PlanCheck Check(Game game, EngineInfo engine, Recording? recording, VendorCaps caps) => new(Readiness.Ready, "synthesized templates");
         public Plan Build(Game game, EngineInfo engine, ShaderIndex index, Recording? recording, VendorCaps caps, string outDir, IProgress<string>? log, CancellationToken ct, bool maximum = false)
         {
             var file = Path.Combine(outDir, "plan.bin");
             Directory.CreateDirectory(outDir);
-            var plan = new Plan(game.Id, index.ContentHash, "PCD3D_SM6", caps.Profile, stats ?? new PlanStats(0, 10000, 5, 7, true), file);
+            var plan = new Plan(game.Id, index.ContentHash, "PCD3D_SM6", caps.Profile, statsFor?.Invoke(recording) ?? stats ?? new PlanStats(0, 10000, 5, 7, true), file);
             if (records != null) PlanFile.Write(plan, records);
             else File.WriteAllText(file, "plan");
             return plan;
