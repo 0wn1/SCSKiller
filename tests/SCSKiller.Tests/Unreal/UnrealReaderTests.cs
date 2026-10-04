@@ -271,7 +271,7 @@ public class UnrealReaderTests(ITestOutputHelper output)
     }
 
     /// <summary>Fortnite (anti-cheat: its exe isn't read) writes .utoc version 10 and 8-byte shader library hashes: detected as
-    /// 5.8 from its containers, its libraries read, planned with the newest UE5 rule, unconfirmed.</summary>
+    /// 5.8 from its containers, its libraries read, planned with the 5.8 rule, unconfirmed.</summary>
     [Trait("Needs", "Game")]
     [Fact]
     public void FortniteDetectsAs58FromItsContainers()
@@ -280,7 +280,7 @@ public class UnrealReaderTests(ITestOutputHelper output)
         var r = new UnrealReader(Ff7.TempDir("fortnite"));
         var e = r.Detect(game)!;
         Assert.Equal("5.8", e.Version);
-        Assert.Equal(SCSKiller.Core.Planning.RootSig.Rule.Ue55, SCSKiller.Core.Planning.RootSig.RuleFor(e));
+        Assert.Equal(SCSKiller.Core.Planning.RootSig.Rule.Ue58, SCSKiller.Core.Planning.RootSig.RuleFor(e));
         Assert.False(SCSKiller.Core.Planning.RootSig.Verified(e));
         var index = r.Index(game, e, new Progress<string>(output.WriteLine), CancellationToken.None);
         Assert.NotEmpty(index.Shaders);

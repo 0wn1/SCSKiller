@@ -185,8 +185,9 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
     ShaderIndex IndexCore(Game game, EngineInfo engine, IProgress<string>? log, CancellationToken ct)
     {
         using var provider = Mount(PaksDir(game.InstallDir) ?? throw new DirectoryNotFoundException($"no Content/Paks under {game.InstallDir}"), GameOf(engine), keys.Stored(game));
-        var ue5 = engine.Version.StartsWith('5');
-        if (!Libraries(provider).Any()) return IndexInline(provider, game, log, ct, ue5);
+        var ue5 = engine.Version.StartsWith('5') || engine.Version.StartsWith('6');
+        var ue58 = Version.TryParse(engine.Version, out var v) && v >= new Version(5, 8); // RootSig.Rule.Ue58
+        if (!Libraries(provider).Any()) return IndexInline(provider, game, log, ct, ue5, ue58);
         var shaders = new ConcurrentDictionary<string, ShaderInfo>();
         var wide = new ShaderContainer.WideCounts();
         var maps = new List<ShaderMap>();
@@ -216,7 +217,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
                     if (shaders.ContainsKey(h)) continue;
                     try
                     {
-                        if (ShaderContainer.Parse(container.Span, h, ShaderContainer.UeCounts(code, ue5)) is { } info && shaders.TryAdd(h, info) && !ue5) wide.See(code, info);
+                        if (ShaderContainer.Parse(container.Span, h, ShaderContainer.UeCounts(code, ue5, ue58)) is { } info && shaders.TryAdd(h, info) && !ue5) wide.See(code, info);
                         if (LaneSuffix(Dxbc.WaveLanes(container.Span)) is { } l) lanes[h] = l;
                     }
                     catch (ArgumentOutOfRangeException) { Interlocked.Increment(ref bad); } // malformed container: not usable anyway
@@ -323,7 +324,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
     /// else PCD3D_SM5). ContentHash: every carved package's
     /// path and location (container, offset, size) in the paks, so a patch that touches one changes it. Where each shader
     /// was found goes to games\&lt;id&gt;\inline.idx for <see cref="ReadShaders"/>.</summary>
-    ShaderIndex IndexInline(DefaultFileProvider provider, Game game, IProgress<string>? log, CancellationToken ct, bool ue5 = false)
+    ShaderIndex IndexInline(DefaultFileProvider provider, Game game, IProgress<string>? log, CancellationToken ct, bool ue5 = false, bool ue58 = false)
     {
         var sw = Stopwatch.StartNew();
         provider.MappingsContainer = new NoMappings(); // headers of unversioned packages parse without property types
@@ -359,7 +360,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
                     list.Add(h);
                     where.TryAdd(h, $"{e.Format} {e.Offset} {f.Path}");
                     if (shaders.ContainsKey(h)) continue;
-                    try { if (ShaderContainer.Parse(container.Span, h, ShaderContainer.UeCounts(e.Code, ue5)) is { } info && shaders.TryAdd(h, info) && !ue5) wide.See(e.Code, info); }
+                    try { if (ShaderContainer.Parse(container.Span, h, ShaderContainer.UeCounts(e.Code, ue5, ue58)) is { } info && shaders.TryAdd(h, info) && !ue5) wide.See(e.Code, info); }
                     catch (ArgumentOutOfRangeException) { Interlocked.Increment(ref bad); } // malformed container: not usable anyway
                 }
                 maps.Add(new ShaderMap($"{f.Path}#{m.Key}", global ? "Global" : f.Path, "", list.Distinct().ToList()));

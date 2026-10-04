@@ -29,7 +29,8 @@ public static unsafe class RootSig
         Ue50,   // 5.0: no hull/domain, mesh/amplification stages, AGS/diagnostic root UAVs, bindless heap flags
         Ue51,   // 5.1-5.3: a stage's table only when it uses that resource type
         Ue54,   // 5.4: MAX_SAMPLERS 32, root constants
-        Ue55,   // 5.5+: vertex shaders get UAVs (5.6 confirmed; 5.7 and later have no rule of their own)
+        Ue55,   // 5.5-5.7: vertex shaders get UAVs
+        Ue58,   // 5.8+: mesh/amplification shaders get UAVs; NVIDIA shader extensions get a u0 space 1001 table
         Red3,   // REDengine 3 (The Witcher 3, DX12): three fixed root signatures, see BuildRed3
         Northlight, // Northlight (Control, DX12): one graphics and one compute root signature, see BuildNorthlight
         Dagor,  // Dagor Engine (DX12): built from each shader's header, constant buffers as root CBVs, see DagorRootSig
@@ -55,7 +56,8 @@ public static unsafe class RootSig
             (5, 0) => Rule.Ue50,
             (5, <= 3) => Rule.Ue51,
             (5, 4) => Rule.Ue54,
-            (5, _) => Rule.Ue55, // a newer 5.x than any rule: the newest, unconfirmed (Planner.Untested)
+            (5, <= 7) => Rule.Ue55,
+            (5, _) or (6, 0) => Rule.Ue58, // 6.0: Fortnite's internal line, which its containers tell as 5.8
             _ => null,
         };
     }
@@ -197,6 +199,7 @@ public static unsafe class RootSig
         {
             if ((used & UeFlags.AmdIntrinsics) != 0) rows.Add([4, 0, 0, 0x7FFF0ADE, 2]);            // u0, AGS_DX12_SHADER_INSTRINSICS_SPACE_ID
             if (r >= Rule.Ue54 && (used & UeFlags.RootConstants) != 0) rows.Add([1, 0, 0, 3, 4]); // b0 space 3 (UE_HLSL_SPACE_SHADER_ROOT_CONSTANTS), 4 values
+            if (r >= Rule.Ue58 && (used & UeFlags.NvIntrinsics) != 0) rows.Add([0, 0, 1, 1, 0, 1001, 0, 0]);  // u0 space 1001 (UE_HLSL_SPACE_NV_SHADER_EXTN), offset 0
             if ((used & UeFlags.DiagnosticBuffer) != 0) rows.Add([4, 0, 0, 999, 2]);              // u0 space 999 (UE_HLSL_SPACE_DIAGNOSTIC)
             if ((used & UeFlags.BindlessResources) != 0) flags |= 0x400;                          // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
             if ((used & UeFlags.BindlessSamplers) != 0) flags |= 0x800;                           // SAMPLER_HEAP_DIRECTLY_INDEXED
@@ -246,11 +249,11 @@ public static unsafe class RootSig
     }
 
     /// <summary>InitShaderRegisterCounts at tier 3: tables at their maximum size (until 5.0 even when the stage binds none of
-    /// that type; from 5.1 only when it binds some); UAVs only for pixel/compute (5.5: vertex too); CBs as root CBVs, all of
+    /// that type; from 5.1 only when it binds some); UAVs only for pixel/compute (5.5: vertex too; 5.8: mesh, amplification too); CBs as root CBVs, all of
     /// them (MAX_ROOT_CBVS = MAX_CBS = 16, so the excess-CBV table never appears).</summary>
     static (uint Srv, uint Sampler, uint Uav, uint Cb) Quantize(Rule r, Stage s, ResourceCounts c, uint maxSrvs)
     {
-        var uavs = s is Stage.Pixel or Stage.Compute || (s == Stage.Vertex && r >= Rule.Ue55);
+        var uavs = s is Stage.Pixel or Stage.Compute || (s == Stage.Vertex && r >= Rule.Ue55) || (s is Stage.Mesh or Stage.Amplification && r >= Rule.Ue58);
         uint srv = maxSrvs > 0 ? maxSrvs : MaxSrvs(r), sampler = r >= Rule.Ue54 ? 32u : 16, cb = (uint)Math.Min(c.Cb, 16);
         return r <= Rule.Ue50
             ? (srv, sampler, uavs ? 16u : 0, cb)

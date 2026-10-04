@@ -48,8 +48,8 @@ public class RootSigRulesTests
     [InlineData("4.26", "GAME_FinalFantasy7Rebirth", Rule.Ff7)] [InlineData("4.26", "GAME_StellarBlade", Rule.Ue426)]
     [InlineData("5.0", null, Rule.Ue50)] [InlineData("5.1", "GAME_Palworld", Rule.Ue51)] [InlineData("5.2", null, Rule.Ue51)]
     [InlineData("5.3", null, Rule.Ue51)] [InlineData("5.4", null, Rule.Ue54)] [InlineData("5.5", null, Rule.Ue55)]
-    [InlineData("5.6", null, Rule.Ue55)] [InlineData("5.7", null, Rule.Ue55)] [InlineData("5.8", null, Rule.Ue55)] [InlineData("5.12", null, Rule.Ue55)]
-    [InlineData("4.20", null, Rule.Ue420)] [InlineData("4.21", null, Rule.Ue421)] [InlineData("4.19", null, null)] [InlineData("6.0", null, null)] [InlineData("GAME_Something", null, null)]
+    [InlineData("5.6", null, Rule.Ue55)] [InlineData("5.7", null, Rule.Ue55)] [InlineData("5.8", null, Rule.Ue58)] [InlineData("5.12", null, Rule.Ue58)] [InlineData("6.0", null, Rule.Ue58)]
+    [InlineData("4.20", null, Rule.Ue420)] [InlineData("4.21", null, Rule.Ue421)] [InlineData("4.19", null, null)] [InlineData("6.1", null, null)] [InlineData("GAME_Something", null, null)]
     public void RuleForMapsVersions(string version, string? fork, Rule? expected)
     {
         Assert.Equal(expected, RuleFor(new EngineInfo("Unreal", version, fork, "D3D12", false, null)));
@@ -123,6 +123,30 @@ public class RootSigRulesTests
         Check(Rule.Ue55, P(Ms, Ps), true, 0x112, // no input layout without a vertex shader; deny VS, GS, amplification
             T(Px, Srv, 64), T(Px, Smp, 32), T(Px, Uav, 16), T(Mx, Srv, 64), T(Mx, Smp, 32),
             Cbv(Px, 0), Cbv(Px, 1), Cbv(Mx, 0), Cbv(Mx, 1), Cbv(Mx, 2), Cbv(Mx, 3), RootConstants);
+    }
+
+    /// <summary>5.8 (D3D12RootSignature.cpp, D3D12Util.cpp at 5.8.3): mesh and amplification shaders get UAV tables, and any
+    /// stage with an NVIDIA vendor extension adds one table of u0 space 1001 (offset 0, no range flags, visible to all) after
+    /// the root constants and before the diagnostic UAV, whatever the GPU: the extension is optional. 5.5-5.7 have neither.</summary>
+    [Fact]
+    public void Ue58MeshUavsAndNvExtensionTable()
+    {
+        var msUav = S(Stage.Mesh, 1, 2, 3, 1);
+        var asUav = S(Stage.Amplification, 1, 0, 2, 0);
+        const uint Ax = 6;
+        Check(Rule.Ue58, P(asUav, msUav, Ps), true, 0x12, // deny VS, GS
+            T(Px, Srv, 64), T(Px, Smp, 32), T(Px, Uav, 16), T(Mx, Srv, 64), T(Mx, Smp, 32), T(Mx, Uav, 16), T(Ax, Uav, 16),
+            Cbv(Px, 0), Cbv(Px, 1), Cbv(Mx, 0), Cbv(Ax, 0));
+        Check(Rule.Ue55, P(msUav, Ps), true, 0x112,
+            T(Px, Srv, 64), T(Px, Smp, 32), T(Px, Uav, 16), T(Mx, Srv, 64), T(Mx, Smp, 32), Cbv(Px, 0), Cbv(Px, 1), Cbv(Mx, 0));
+        uint[] nv = [0, All, Uav, 1, 0, 1001, 0, 0];
+        var all = UeFlags.AmdIntrinsics | UeFlags.RootConstants | UeFlags.NvIntrinsics | UeFlags.DiagnosticBuffer;
+        Check(Rule.Ue58, P(S(Stage.Compute, 0, 0, 1, 0, all)), false, 0x32, T(All, Uav, 16), Ags, RootConstants, nv, Diagnostic);
+        Check(Rule.Ue55, P(S(Stage.Compute, 0, 0, 1, 0, all)), false, 0x32, T(All, Uav, 16), Ags, RootConstants, Diagnostic);
+        Check(Rule.Ue58, P(Vs, S(Stage.Pixel, 2, 4, 4, 1, UeFlags.NvIntrinsics)), false, 0x11,
+            T(Px, Srv, 64), T(Px, Smp, 32), T(Px, Uav, 16), Cbv(Px, 0), Cbv(Px, 1), Cbv(Vx, 0), nv);
+        var blob = Serialize(Build(Rule.Ue58, P(S(Stage.Compute, 0, 0, 0, 0, UeFlags.NvIntrinsics)), false), StaticSamplers(Rule.Ue58));
+        Assert.Contains((0u, 1u, 0u, 1u, 1001u, true), Parse(blob).Slots);
     }
 
     /// <summary>The extras UE 5 appends after the CBVs, in its order (AGS, root constants, diagnostic buffer), and the
@@ -201,7 +225,7 @@ public class RootSigRulesTests
         }
     }
 
-    /// <summary>The optional-data trailer: 'p' usage flags, 'x' code features (uint16), 'v' vendor extensions (AMD).</summary>
+    /// <summary>The optional-data trailer: 'p' usage flags, 'x' code features (uint16), 'v' vendor extensions (AMD, NVIDIA).</summary>
     [Fact]
     public void ReaderExposesUe5Flags()
     {
@@ -211,6 +235,17 @@ public class RootSigRulesTests
         byte[] code = [9, 9, 9, .. trailer, .. BitConverter.GetBytes(trailer.Length + 4)];
         Assert.Equal(new ResourceCounts(3, 2, 4, 1, 31), ShaderContainer.UeCounts(code, ue5: true)); // RC | diagnostic | bindless x2 | AMD
         Assert.Equal(new ResourceCounts(3, 2, 4, 1), ShaderContainer.UeCounts(code));                  // UE 4: none of these exist
+        byte[] both = [.. BitConverter.GetBytes(2), .. BitConverter.GetBytes(0x10DEu), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2, .. BitConverter.GetBytes(0x1002u), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2];
+        byte[] nv = [.. Entry('p', [0x00, 1, 2, 3, 4]), .. Entry('v', both)];
+        byte[] nvCode = [9, .. nv, .. BitConverter.GetBytes(nv.Length + 4)];
+        Assert.Equal(UeFlags.NvIntrinsics | UeFlags.AmdIntrinsics, ShaderContainer.UeCounts(nvCode, ue5: true, nvExtension: true).Flags);
+        // before 5.8 the NVIDIA bit changes no root signature: it's left out, so an NVIDIA variant has the same learned-lookup
+        // key as the AMD-only variant a recording covered
+        byte[] amd = [.. Entry('p', [0x00, 1, 2, 3, 4]), .. Entry('v', vendor)];
+        byte[] amdCode = [9, .. amd, .. BitConverter.GetBytes(amd.Length + 4)];
+        SortedDictionary<Stage, ShaderInfo> Set(byte[] c, bool ue58) => new() { [Stage.Pixel] = S(Stage.Pixel, 0, 0, 0, 0) with { Counts = ShaderContainer.UeCounts(c, ue5: true, nvExtension: ue58) } };
+        Assert.Equal(Planner.CountsKey(Set(amdCode, false)), Planner.CountsKey(Set(nvCode, false)));
+        Assert.NotEqual(Planner.CountsKey(Set(amdCode, true)), Planner.CountsKey(Set(nvCode, true)));
         byte[] plain = [.. Entry('p', [0x01, 1, 2, 3, 4])];
         Assert.Equal(new ResourceCounts(3, 2, 4, 1), ShaderContainer.UeCounts([.. plain, .. BitConverter.GetBytes(plain.Length + 4)], ue5: true));
     }

@@ -41,12 +41,14 @@ public static class ShaderContainer
 
     /// <summary>FShaderCodePackedResourceCounts ('p'): UsageFlags, NumSamplers, NumSRVs, NumCBs, NumUAVs. Zeros if absent.
     /// <paramref name="ue5"/>: also the <see cref="UeFlags"/> the UE5 root signature depends on (UE4 has none: its byte 0 is
-    /// bGlobalUniformBufferUsed and its 'x' is bUsesWaveOps).</summary>
-    public static ResourceCounts UeCounts(byte[] code, bool ue5 = false)
+    /// bGlobalUniformBufferUsed and its 'x' is bUsesWaveOps). <paramref name="nvExtension"/> (5.8+): also
+    /// <see cref="UeFlags.NvIntrinsics"/>, which only 5.8's raster/compute root signatures depend on; before, it would split
+    /// the planner's learned lookup (keyed by the counts) into NVIDIA and other variants.</summary>
+    public static ResourceCounts UeCounts(byte[] code, bool ue5 = false, bool nvExtension = false)
     {
         var d = OptionalData(code);
         if (!d.TryGetValue('p', out var pc) || pc.Length < 5) return new(0, 0, 0, 0);
-        return new(pc[3], pc[2], pc[4], pc[1], ue5 ? UeFlags.Of(pc[0], d) : 0);
+        return new(pc[3], pc[2], pc[4], pc[1], ue5 ? UeFlags.Of(pc[0], d) & (nvExtension ? ~0 : ~UeFlags.NvIntrinsics) : 0);
     }
 
     /// <summary>UE 4 forks with a 10-byte 'p' (stock 4.23: 5 bytes, 4.26/4.27: 8). Two layouts are known: Hogwarts Legacy's 4.27
@@ -83,7 +85,7 @@ public static class ShaderContainer
     /// both places from the same condition where both exist, so the union is right for every 5.x.</summary>
     public static class UeFlags
     {
-        public const int BindlessResources = 1, BindlessSamplers = 2, RootConstants = 4, DiagnosticBuffer = 8, AmdIntrinsics = 16;
+        public const int BindlessResources = 1, BindlessSamplers = 2, RootConstants = 4, DiagnosticBuffer = 8, AmdIntrinsics = 16, NvIntrinsics = 32;
 
         /// <param name="usage">EShaderResourceUsageFlags (5.1+): 1 bindless resources, 2 bindless samplers, 3 root constants
         /// (5.4+), 6 diagnostic buffer (5.5+)</param>
@@ -99,7 +101,7 @@ public static class ShaderContainer
             // 'v' TArray<FShaderCodeVendorExtension>: int32 count, then {uint32 vendor, uint16 x3, bool (4 bytes), uint8 type}
             if (d.TryGetValue('v', out var v) && v.Length >= 8)
                 for (var o = 4; o + 4 <= v.Length && o < 4 + 15 * BitConverter.ToInt32(v, 0); o += 15)
-                    if (BitConverter.ToUInt32(v, o) == 0x1002) { f |= AmdIntrinsics; break; }
+                    f |= BitConverter.ToUInt32(v, o) switch { 0x1002 => AmdIntrinsics, 0x10DE => NvIntrinsics, _ => 0 };
             return f;
         }
     }

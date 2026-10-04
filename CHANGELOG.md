@@ -75,9 +75,11 @@ All notable changes to the SCSKiller app and command line. The format follows
   in an overflow". When SCSKiller can't read a game's exe (anti-cheat, Xbox app), it now recognizes 5.8 from the game's
   containers instead of taking it for 5.6. 5.8 shader libraries store shorter shader hashes, and SCSKiller reads either
   layout whichever version it detected. A shader library that still can't be read fails with its file name. Unreal
-  Engine 5.7, 5.8 and later compile without a recording, with the newest root-signature rule SCSKiller has (the one a
-  5.6 game's recording confirmed), marked "not tested on this engine version yet". Pipelines whose shaders bind
-  something that rule doesn't cover are left out, as for any untested engine.
+  Engine 5.7 and later compile without a recording, marked "not tested on this engine version yet": 5.7 with the rule a
+  5.6 game's recording confirmed, 5.8 and later with a 5.8 rule built from Epic's 5.8 source. It gives mesh and
+  amplification shaders their UAVs, and shaders that use an NVIDIA shader extension the extra slot 5.8 adds for it.
+  Pipelines whose shaders bind something the rule doesn't cover are left out, as for any untested engine. Fortnite:
+  46,468 pipelines planned, none left out.
 - Recording did nothing since 1.2.0: the recorder was installed but never armed, so games stayed on "Needs a recording"
   however long they were played. On a PC where SCSKiller had never armed a recorder before, arming failed every time;
   and an install or update that wrote the keys file disarmed the recorder it had just installed. A recorder is now armed
