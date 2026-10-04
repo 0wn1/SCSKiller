@@ -8,8 +8,8 @@ using SCSKiller.Core.Planning;
 
 namespace SCSKiller.Core.App;
 
-/// <summary>The upload's X-SCSK-Upload header (docs/db-contract.md "Anonymous uploads"; the server's copy is UploadMeta in
-/// server/Shared), sent as base64url of snake_case JSON.</summary>
+/// <summary>The upload's X-SCSK-Upload header (docs/db-contract.md "Anonymous uploads"), sent as base64url of snake_case
+/// JSON.</summary>
 public sealed record UploadMeta(string StoreBuildKey, string ContentHash, string? Engine = null, string? Vendor = null, string? AppVersion = null,
     UploadDll[]? Middleware = null);
 
@@ -54,6 +54,10 @@ public sealed class Sharing
     /// <summary>The last failure, in plain words; null after a success.</summary>
     public string? Problem { get; private set; }
 
+    /// <summary>Why the last share waited without a problem: a recording whose layer records aren't whole yet
+    /// (<see cref="Recordings.IncompleteLayerList"/>); null = it didn't. The caller logs it once a pass.</summary>
+    public string? Waiting { get; set; }
+
     /// <summary>The upload device's id (for the admin's trust-device), null before the first registration.</summary>
     public string? DeviceId => Load()?.Id;
 
@@ -68,7 +72,7 @@ public sealed class Sharing
     /// <paramref name="meta"/> is built only for an actual upload (it may hash middleware DLLs). Returns the new
     /// <see cref="SharedRecording"/> after an upload, else null.</summary>
     public async Task<SharedRecording?> ShareAsync(string gameDir, string contentHash, Func<UploadMeta> meta,
-        Func<IEnumerable<string>>? middlewareShaders = null, CancellationToken ct = default)
+        Func<IEnumerable<string>>? middlewareShaders = null, Func<IReadOnlySet<string>>? layerMade = null, CancellationToken ct = default)
     {
         var db = new FileInfo(Path.Combine(gameDir, "recording.db"));
         if (!enabled() || !db.Exists || clock.GetUtcNow() < backoffUntil) return null;
@@ -80,7 +84,10 @@ public sealed class Sharing
         if (last.Stamp == stamp) return null;
         var shared = Path.Combine(gameDir, "shared.json");
         List<PsoDb.Rec> records;
-        try { records = HashOnly.Canonical(PsoDb.Read(db.FullName), local: true, out _, HashOnly.MaxEntryStateObjectRefs); }   // shader and DXIL library blobs dropped (state objects kept)
+        IReadOnlySet<string>? excluded;
+        try { excluded = layerMade?.Invoke(); }   // read now, right before the payload; one that can't be read throws: nothing shared
+        catch (Recordings.IncompleteLayerList e) { Waiting = e.Message; return null; }
+        try { records = HashOnly.Canonical(PsoDb.Read(db.FullName), local: true, out _, HashOnly.MaxEntryStateObjectRefs, excluded); }   // shader and DXIL library blobs dropped (state objects kept)
         catch (InvalidDataException e)   // e.g. no PSOs yet: not again until the recording changes
         {
             Community.Write(shared, last with { Stamp = stamp });
@@ -98,8 +105,16 @@ public sealed class Sharing
         var (uploadId, psos, fresh) = ((string?)null, 0, 0);
         var chunks = HashOnly.Chunks(records, ChunkRecords, ChunkRaw, out var tooLarge);
         if (tooLarge > 0) Problem = $"{tooLarge} ray tracing records are more than an upload may carry with what they build on ({ChunkRecords} records, {ChunkRaw >> 20} MB, {HashOnly.MaxStateObjectRefs} references): shared without them.";
-        foreach (var chunk in chunks)
+        foreach (var whole in chunks)
         {
+            // what a layer made, read again right before each payload: one learned during an earlier upload is left out too
+            IReadOnlySet<string>? excludedNow;
+            try { excludedNow = layerMade?.Invoke(); }
+            catch (Recordings.IncompleteLayerList e) { Waiting = e.Message; return Stop(null); }
+            catch (Exception e) { return Stop($"What a layer made can't be read ({e.Message}): sharing waits."); }   // any failure: nothing more goes
+            List<PsoDb.Rec> chunk;
+            try { chunk = excludedNow == null ? whole : HashOnly.Canonical(whole, local: true, out _, layerMade: excludedNow); }
+            catch (InvalidDataException) { continue; }   // nothing left of it but root signatures
             var id = Id(chunk, contentHash);   // the same records for another build are new there
             if (last.Sent?.Contains(id) == true || chunk.All(r => r.Tag == 'B' || have.Contains(r.Key)))
             {
@@ -164,7 +179,10 @@ public sealed class Sharing
     /// (this PC's own, filled from its recordings on the GPU vendor <paramref name="gpu"/>: <see cref="MiddlewarePack.PackHeader.Gpu"/>)
     /// that changed since its last upload, under its pack key for that vendor (docs/db-contract.md "Middleware packs"), when sharing is on. Stamped per pack file in
     /// packs-shared.json, so a pack goes again only once it gains records. Returns the DLL name and PSO count of each upload.</summary>
-    public async Task<List<(string Dll, int Psos)>> SharePacksAsync(string packsDir, string gpu, string appVersion, CancellationToken ct = default)
+    /// <paramref name="layered"/>: the records a layer made (<see cref="MiddlewarePacks.LayerMade"/>), read again before each
+    /// pack's payload and never in an upload whatever a pack holds; one that can't be read ends the pass.
+    public async Task<List<(string Dll, int Psos)>> SharePacksAsync(string packsDir, string gpu, string appVersion, Func<IReadOnlySet<string>>? layered = null,
+        CancellationToken ct = default)
     {
         var done = new List<(string, int)>();
         if (!enabled() || clock.GetUtcNow() < backoffUntil) return done;
@@ -182,7 +200,10 @@ public sealed class Sharing
                 if (stamps.GetValueOrDefault(name) == stamp) continue;
                 List<PsoDb.Rec> records;
                 MiddlewarePack pack;
-                try { records = MiddlewarePacks.Records(pack = MiddlewarePack.Read(path)); }
+                IReadOnlySet<string>? excluded;
+                try { excluded = layered?.Invoke(); }
+                catch (Recordings.IncompleteLayerList e) { Waiting = e.Message; break; }
+                try { records = MiddlewarePacks.Records(pack = MiddlewarePack.Read(path), excluded); }
                 catch (Exception e) when (e is InvalidDataException or IOException or JsonException)
                 {
                     stamps[name] = stamp;   // nothing to share until it changes

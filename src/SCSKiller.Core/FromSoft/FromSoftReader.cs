@@ -96,7 +96,7 @@ public sealed class FromSoftReader(string dataDir, Func<string, string?>? downlo
     }
 
     /// <summary>Bump when the same files index differently (e.g. <see cref="ShaderFiles"/> grows): plans on the old index go stale.</summary>
-    const int IndexVersion = 1;
+    const int IndexVersion = 2;
     const string D3D11 = "D3D11";
 
     /// <summary>Where each shader was found (SHA-1 -> its top-level shader file), per game id, from the last Index:
@@ -148,6 +148,8 @@ public sealed class FromSoftReader(string dataDir, Func<string, string?>? downlo
                 }
                 if (!shaders.ContainsKey(sha)) return;
                 var pool = Pool(at);
+                if (shaders[sha].Stage == Stage.Library && pool.EndsWith(SoulsRayTracing.Bundle, StringComparison.OrdinalIgnoreCase))
+                    pool += $"|p{RtCollections.OwnPayload(c)}"; // a material's closest hit and any hit pair per ray payload: one map each
                 if (!pools.TryGetValue(pool, out var list)) pools[pool] = list = [];
                 list.Add(sha);
             }, ct);

@@ -129,7 +129,7 @@ public class RootSignatureValidTests
         var samplers = RootSig.Samplers(b);
         Assert.Equal([.. Sampler(), .. Sampler((0, 0x14), (40, 1), (48, 5))], samplers);
         RootSig.Serialize(new RootSig.Desc(0, []), samplers);
-        Assert.Contains((5u, 3u, 1u, 1u, 0u), RootSig.Parse(b).Slots);
+        Assert.Contains((5u, 3u, 1u, 1u, 0u, false), RootSig.Parse(b).Slots);
         BinaryPrimitives.WriteUInt32LittleEndian(b.AsSpan(24 + 56 + 52), 4);   // no such flag
         Assert.False(Dxbc.RootSignatureValid(b));
     }

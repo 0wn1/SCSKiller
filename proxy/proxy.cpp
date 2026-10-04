@@ -25,6 +25,8 @@
 // body and the replay rules are at write_so and in ARCHITECTURE.md ("Ray tracing state objects").
 // 'N' NVAPI state of a record's create = the record's key[20] + u32 extension slot (~0u none), u32 space, u32 scope
 // (1 device, 2 thread, 3 PSO extension), u32 pipeline creation flags (NvExt); the warm creates that record with it.
+// 'W' a create a layer changed (hook_below) = the key[20] of the record the driver got + the key[20] of the record the
+// game asked for (zero: the layer's own create, e.g. an add-on's or a bind-time clone). Written only when the two differ.
 #define NOMINMAX
 #include <windows.h>
 #include <shlobj.h>
@@ -94,6 +96,7 @@ static const auto g_t0 = std::chrono::steady_clock::now();
 static std::mutex g_mx;                                      // ponytail: one lock for db/csv/stats, PSO creation dwarfs it
 static HashSet g_blobs_on_disk, g_known /*keys in db at start*/, g_keys /*all keys written*/;
 static std::unordered_map<void*, Hash> g_rs_of;              // live root signature object -> blob hash
+static std::unordered_map<void*, Hash> g_rs_below_of;        // the same, as created on the device under a layer (hook_below)
 static std::unordered_map<Hash, std::string, HashH> g_rs_bytes;   // root sig blobs seen this session
 static std::unordered_map<void*, Hash> g_so_key;             // live state object (its ID3D12StateObject pointer) -> record key
 struct Rec { char tag; std::string payload; };
@@ -176,9 +179,10 @@ static const wchar_t* const kAntiCheatMarkers[] = {  // GameFiles.Markers; "*x":
     L"EasyAntiCheat", L"EasyAntiCheat_EOS", L"start_protected_game.exe", L"EasyAntiCheat_EOS_Setup.exe", L"EasyAntiCheat_Setup.exe",
     L"BattlEye", L"BEService.exe", L"BEService_x64.exe", L"BELauncher.exe", L"BEClient_x64.dll", L"BEClient.dll",
     L"EAAntiCheat.Installer.exe", L"GameGuard", L"XIGNCODE", L"nProtect", L"randgrid.sys", L"NCGuardSDK", L"NCGuard", L"AntiCheatExpert",
-    L"AceAntibotClient", L"TP3Helper.exe", L"HoYoKProtect.sys", L"mhypbase.dll", L"NeacClient.exe", L"NeacSafe64.sys", L"NeacSafe64_ex.sys",
+    L"AceAntibotClient", L"TP3Helper.exe", L"HoYoKProtect.sys", L"mhypbase.dll", L"mhyprot2.sys", L"mhyprot3.sys",
+    L"ACE-BASE.sys", L"NeacClient.exe", L"NeacSafe64.sys", L"NeacSafe64_ex.sys",
     L"BlackCall.aes", L"BlackCall64.aes", L"BlackCat64.sys", L"HShield", L"PunkBuster", L"PnkBstrA.exe", L"pbsvc.exe", L"pbsv.dll",
-    L"equ8_conf.json", L"gameguard.des", L"DenuvoAC", L"denuvo-anti-cheat.sys", L"denuvo-anti-cheat-runtime.dll",
+    L"equ8_conf.json", L"Warframe.x64.exe", L"gameguard.des", L"DenuvoAC", L"denuvo-anti-cheat.sys", L"denuvo-anti-cheat-runtime.dll",
     L"denuvo-anti-cheat-update-service.exe", L"Denuvo Anti-Cheat Installer.exe", L"*.xem", L"*_BE.exe"};
 static const size_t kEasyAntiCheatMarkers = 5;  // the list's first entries
 static std::atomic<int> g_admission;  // 0 undecided, 1 records, -1 pass-through
@@ -393,6 +397,7 @@ struct Writer {
     Hash rsh{};
     Tuple tup;
     NvExt nv = nv_now();  // at the hook's entry, on the creating thread
+    bool below = false;   // a create under a layer: its root signatures are the ones the layer gave the device
 
     void raw(const void* p, size_t n) { s.append((const char*)p, n); }
     template <class T> void pod(T& v) { raw(&v, sizeof v); }
@@ -409,11 +414,15 @@ struct Writer {
     void rs(ID3D12RootSignature*& p) {
         if (!p) return hash(kZero);
         std::lock_guard l(g_mx);
-        auto it = g_rs_of.find(p);
-        if (it == g_rs_of.end()) { ok = false, why = "root signature was not created through a hooked device"; return; }
-        rsigs.push_back(it->second);
-        rsh = it->second;
-        hash(it->second);
+        // a layer that rewrites root signatures returns the object it created from its own blob, which the game's hook
+        // then maps to the game's blob: under the layer that object is its own
+        const Hash* h = nullptr;
+        if (auto it = g_rs_below_of.find(p); below && it != g_rs_below_of.end()) h = &it->second;
+        if (auto it = g_rs_of.find(p); !h && it != g_rs_of.end()) h = &it->second;
+        if (!h) { ok = false, why = "root signature was not created through a hooked device"; return; }
+        rsigs.push_back(*h);
+        rsh = *h;
+        hash(*h);
     }
     // Stream output, only when it declares entries (NumEntries 0 = no SO, written as nothing: older records keep their
     // keys): u32 n, n x (u32 stream, str8 semantic, u32 index, start component, component count, output slot),
@@ -884,6 +893,12 @@ static void put(char tag, const void* a, size_t an, const void* b = nullptr, siz
 
 static ID3D12Device* g_warm_dev;
 static ID3D12Device2* g_warm_dev2;
+// A warm run with the game's layer (scskiller_warm --layer): the device under it, for what the layer made ('W'), which
+// is replayed there as recorded (build)
+static ID3D12Device* g_warm_real;
+static ID3D12Device2* g_warm_real2;
+static HashSet g_layer_made;
+static thread_local bool t_real;
 static ID3D12Device5* g_warm_dev5;
 static ID3D12Device7* g_warm_dev7;
 
@@ -948,6 +963,11 @@ static std::atomic<uint64_t> g_roundtrip_ok, g_roundtrip_bad;
 
 // Decode a record (with an optional plan override) into its desc; create the PSO when pso is given.
 static HRESULT build(const Rec& rec, Reader& r, ID3D12PipelineState** pso, const NvExt* nv = nullptr) {
+    // what a layer made goes to the device under the layer in the warm too: through it, it would be changed again
+    struct Real {
+        Real(bool on) { t_real = on; }
+        ~Real() { t_real = false; }
+    } real(g_warm_real && !r.ovr && g_layer_made.count(key_of(rec.tag, rec.payload)));
     std::vector<uint64_t> buf;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC g{};
     D3D12_COMPUTE_PIPELINE_STATE_DESC c{};
@@ -968,6 +988,11 @@ static HRESULT build(const Rec& rec, Reader& r, ID3D12PipelineState** pso, const
     }
     NvScope scope(nv);
     if (scope.why) return r.fail(scope.why), E_INVALIDARG;
+    if (t_real) {
+        if (rec.tag == 'G') return g_warm_real->CreateGraphicsPipelineState(&g, IID_PPV_ARGS(pso));
+        if (rec.tag == 'C') return g_warm_real->CreateComputePipelineState(&c, IID_PPV_ARGS(pso));
+        return g_warm_real2 ? g_warm_real2->CreatePipelineState(&sd, IID_PPV_ARGS(pso)) : E_NOINTERFACE;
+    }
     if (rec.tag == 'G') return o_gfx(g_warm_dev, &g, IID_PPV_ARGS(pso));
     if (rec.tag == 'C') return o_cs(g_warm_dev, &c, IID_PPV_ARGS(pso));
     return g_warm_dev2 ? o_stream(g_warm_dev2, &sd, IID_PPV_ARGS(pso)) : E_NOINTERFACE;
@@ -1036,6 +1061,9 @@ static void load_file(const std::wstring& path, bool main, bool with_bytes) {
                     g_nvext[t] = x;  // ponytail: one state per record; a PSO a game also creates without it replays with it only
                 }
                 if (main) g_keys.insert(key_of('N', p));
+            } else if (tag == 'W') {  // nothing to replay itself
+                if (main) g_keys.insert(key_of('W', p));
+                if (with_bytes && len == 40) g_layer_made.insert(*(const Hash*)p.data());
             } else if (tag == '1' || tag == '2') {  // D3D11 items: nothing to record against, only warm needs them
                 if (with_bytes) g_items11.push_back(std::move(p));
             } else if (tag == 'P') {  // templates (main db, or gen records written before the items) are known here
@@ -1177,10 +1205,11 @@ static void note(Writer& w, double ms, bool lib, double pre_ms) {
 
 // Warm: replay the whole db on the game's own device, in the game's own process.
 static std::mutex g_rsmx;
-static std::unordered_map<Hash, ID3D12RootSignature*, HashH> g_warm_rs;
+static std::unordered_map<Hash, ID3D12RootSignature*, HashH> g_warm_rs, g_warm_rs_real;
 
 static __declspec(noinline) HRESULT rs_call(std::string_view b, ID3D12RootSignature** out) {
     __try {
+        if (t_real) return g_warm_real->CreateRootSignature(0, b.data(), b.size(), IID_PPV_ARGS(out));
         return o_rs(g_warm_dev, 0, b.data(), b.size(), IID_PPV_ARGS(out));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return E_UNEXPECTED;
@@ -1190,9 +1219,10 @@ static __declspec(noinline) HRESULT rs_call(std::string_view b, ID3D12RootSignat
 // Created outside the lock: a driver call that faults or hangs while holding it would stop every worker (a fault
 // unwound by SEH never releases a std::mutex). Two workers may create the same one at once; the loser's is released.
 static ID3D12RootSignature* warm_rootsig(const Hash& h) {
+    auto& made = t_real ? g_warm_rs_real : g_warm_rs;
     {
         std::lock_guard l(g_rsmx);
-        if (auto it = g_warm_rs.find(h); it != g_warm_rs.end()) return it->second;
+        if (auto it = made.find(h); it != made.end()) return it->second;
     }
     ID3D12RootSignature* rs = nullptr;
     auto b = g_blob_bytes.find(h);  // read-only during the warm
@@ -1202,7 +1232,7 @@ static ID3D12RootSignature* warm_rootsig(const Hash& h) {
                                            b->second.size(), (unsigned)hr);
     }
     std::lock_guard l(g_rsmx);
-    auto [it, fresh] = g_warm_rs.try_emplace(h, rs);
+    auto [it, fresh] = made.try_emplace(h, rs);
     if (!fresh && rs) rs->Release();
     else if (fresh && rs && g_roundtrip) { std::lock_guard l2(g_mx); g_rs_of[rs] = h; }  // a Writer names it by its blob
     return it->second;
@@ -1883,6 +1913,8 @@ static void warm_main() {
 static void** g_hooked_vt;                          // the device vtable our o_* originals were taken from
 static std::unordered_map<void*, ID3D12Device*> g_lib_dev;  // pipeline library -> the (hooked) device that opened it
 
+static ID3D12Device* unwrapped(IUnknown* unk);
+
 static void on_first_pso(ID3D12Device* dev) {
     // Only warm on a device whose vtable we hooked: o_* belong to that class. A layer like ReShade wraps the device,
     // and e.g. ID3D12PipelineLibrary::GetDevice returns the unwrapped one; calling ReShade's methods on it crashes.
@@ -1892,6 +1924,10 @@ static void on_first_pso(ID3D12Device* dev) {
         if (!g_warm) return;
         g_warm_dev = dev, dev->AddRef();  // the game's real device: the first one that builds a PSO
         dev->QueryInterface(IID_PPV_ARGS(&g_warm_dev2));
+        if ((g_warm_real = unwrapped(dev))) {
+            g_warm_real->QueryInterface(IID_PPV_ARGS(&g_warm_real2));
+            logf("warm: under a layer; %zu pipelines it made are created on the device under it", g_layer_made.size());
+        }
         dev->QueryInterface(IID_PPV_ARGS(&g_warm_dev5)), dev->QueryInterface(IID_PPV_ARGS(&g_warm_dev7));  // ray tracing (null: no DXR runtime)
         if (g_debug12 && FAILED(dev->QueryInterface(IID_PPV_ARGS(&g_iq)))) logf("d3d12 debug: the device has no info queue (debug layer not active)");
         std::thread(warm_main).detach();
@@ -1901,11 +1937,11 @@ static void on_first_pso(ID3D12Device* dev) {
 static thread_local bool t_in;  // guards against the runtime routing one create through another
 static thread_local double t_below_ms;  // the below-wrapper hook's own time inside the current create (a chained mod's)
 
-static HRESULT remember_rs(HRESULT hr, const void* blob, SIZE_T n, void** pp) {
+static HRESULT remember_rs(HRESULT hr, const void* blob, SIZE_T n, void** pp, std::unordered_map<void*, Hash>& of = g_rs_of) {
     if (SUCCEEDED(hr) && pp && *pp) {
         Hash h = sha1(blob, n);
         std::lock_guard l(g_mx);
-        g_rs_of[*pp] = h;
+        of[*pp] = h;
         if (g_db && !(g_db_capped && g_db_bytes >= g_db_cap) && !g_blobs_on_disk.count(h) && !imported(h)) g_rs_bytes.try_emplace(h, (const char*)blob, n);
     }
     return hr;
@@ -1914,13 +1950,17 @@ static HRESULT STDMETHODCALLTYPE hk_rs(ID3D12Device* dev, UINT mask, const void*
     return remember_rs(o_rs(dev, mask, blob, n, riid, pp), blob, n, pp);
 }
 
+static thread_local Hash t_asked;  // the key of the game's create in flight on this thread (zero: none, or not recordable)
+
 template <class F> static HRESULT timed_create(ID3D12Device* dev, void** pp, Writer& w, F&& call, bool lib = false) {
     if (t_in || !pp) return call();
     t_in = true;
     on_first_pso(dev);
     t_below_ms = 0;
+    t_asked = w.ok && !w.s.empty() ? key_of(w.tag, w.s) : kZero;
     auto t0 = std::chrono::steady_clock::now();
     HRESULT hr = call();
+    t_asked = kZero;
     // a chained mod's create reaches hk_*_below, whose recording is ours, not the driver's: proxy_ms, not ms
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - t_below_ms;
     if (SUCCEEDED(hr)) note(w, ms, lib, std::chrono::duration<double, std::milli>(t0 - w.t0).count() + t_below_ms);  // a failed library load is a miss: the game creates it next
@@ -2187,15 +2227,18 @@ static void nv_hooks() {
     logf("nvapi: hooks installed%s%s", missed.empty() ? "" : "; not hooked: ", missed.c_str());
 }
 
-// A mod's d3d12.dll (next=) hands the game its own device and passes creates on to the one the system dll made for it,
-// after any shader replacement (RenoDX, ReShade addons): the exact desc the driver compiles reaches that device's vtable,
-// shared by every device of the runtime. Those creates are recorded too (not counted as the game's: note), so the warm
-// compiles what the modded game asks the driver for; a desc the mod passes on unchanged has the game's key (one record).
+// A layer hands the game its own device and passes creates on to the real one, after any change its add-ons make (RenoDX
+// replaces shaders and adds a parameter to every root signature): a mod's d3d12.dll (next=), or ReShade as dxgi.dll, which
+// hooks the system D3D12CreateDevice. The exact desc the driver compiles reaches the real device's vtable, shared by every
+// device of the runtime. Those creates are recorded too (not counted as the game's: note), so the warm compiles what the
+// modded game asks the driver for; a desc the layer passes on unchanged has the game's key (one record), a changed one
+// gets a 'W' record naming both.
 static PFN_Gfx b_gfx;
 static PFN_Cs b_cs;
 static PFN_Rs b_rs;
 static PFN_Stream b_stream;
 static thread_local bool t_below;  // the runtime may route one create through another
+static uint64_t g_changed;
 
 template <class F> static HRESULT below(Writer& w, void** pp, F&& call) {
     if (t_below || t_replay || !pp) return call();
@@ -2211,40 +2254,49 @@ template <class F> static HRESULT below(Writer& w, void** pp, F&& call) {
     auto b = std::chrono::steady_clock::now();
     t_below = false;
     if (SUCCEEDED(hr) && w.ok && !w.s.empty()) {
+        Hash k = key_of(w.tag, w.s);
         std::lock_guard l(g_mx);
-        store(w, key_of(w.tag, w.s));
+        store(w, k);
+        if (k != t_asked && g_db && (g_keys.count(k) || imported(k))) {  // imported: an earlier recorder's, without its 'W'
+            std::string c(40, '\0');
+            memcpy(c.data(), k.data(), 20), memcpy(c.data() + 20, t_asked.data(), 20);
+            if (fresh(g_keys, key_of('W', c))) {
+                if (++g_changed <= 5) logf("below: the layer changed a create (%s)", t_asked == kZero ? "its own" : "the game's");
+                put('W', c.data(), c.size()), db_flush();
+            }
+        }
     }
     t_below_ms += std::chrono::duration<double, std::milli>(a - w.t0 + (std::chrono::steady_clock::now() - b)).count();
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hk_gfx_below(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** pp) {
     Writer w{'G'};
+    w.below = true;
     if (!t_below && !t_replay && pp && d) io_gfx(w, const_cast<D3D12_GRAPHICS_PIPELINE_STATE_DESC&>(*d));
     return below(w, pp, [&] { return b_gfx(dev, d, riid, pp); });
 }
 static HRESULT STDMETHODCALLTYPE hk_cs_below(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID riid, void** pp) {
     Writer w{'C'};
+    w.below = true;
     if (!t_below && !t_replay && pp && d) io_cs(w, const_cast<D3D12_COMPUTE_PIPELINE_STATE_DESC&>(*d));
     return below(w, pp, [&] { return b_cs(dev, d, riid, pp); });
 }
 static HRESULT STDMETHODCALLTYPE hk_stream_below(ID3D12Device2* dev, const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID riid, void** pp) {
     Writer w{'S'};
+    w.below = true;
     if (!t_below && !t_replay && pp && d) write_stream(w, *d);
     return below(w, pp, [&] { return b_stream(dev, d, riid, pp); });
 }
 static HRESULT STDMETHODCALLTYPE hk_rs_below(ID3D12Device* dev, UINT mask, const void* blob, SIZE_T n, REFIID riid, void** pp) {
-    return remember_rs(b_rs(dev, mask, blob, n, riid, pp), blob, n, pp);  // a mod may give the device its own root signature objects
+    return remember_rs(b_rs(dev, mask, blob, n, riid, pp), blob, n, pp, g_rs_below_of);
 }
 
-static void hook_below(IUnknown* adapter, D3D_FEATURE_LEVEL fl) {
-    auto create = (decltype(&D3D12CreateDevice))GetProcAddress(g_real, "D3D12CreateDevice");
-    ID3D12Device* dev = nullptr;
-    if (!create || FAILED(create(adapter, fl, IID_PPV_ARGS(&dev)))) return logf("below: no device from the system d3d12.dll");
+static void hook_below(ID3D12Device* dev, const char* layer) {
     std::lock_guard l(g_mx);
     void** vt = *(void***)dev;
-    if (vt == g_hooked_vt) logf("below: the mod returned the system device itself: its creates are recorded as the game's");
+    if (vt == g_hooked_vt) logf("below: the %s returned the system device itself: its creates are recorded as the game's", layer);
     else {
-        logf("below: device %p vtable %p under the mod's", (void*)dev, (void*)vt);
+        logf("below: device %p vtable %p under the %s", (void*)dev, (void*)vt, layer);
         auto put_below = [&](void** t, int slot, void* hook, auto& orig) {
             // the mod handed the game this interface of the system device: the game's hook is already there and records it
             if (t[slot] == (void*)hk_gfx || t[slot] == (void*)hk_cs || t[slot] == (void*)hk_rs || t[slot] == (void*)hk_stream) return;
@@ -2256,7 +2308,6 @@ static void hook_below(IUnknown* adapter, D3D_FEATURE_LEVEL fl) {
         ID3D12Device2* d2;
         if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d2)))) put_below(*(void***)d2, SLOT_STREAM, (void*)hk_stream_below, b_stream), d2->Release();
     }
-    dev->Release();
 }
 
 // Frame times: the game's presents, hooked on the vtables of the swap chains the process's DXGI factory creates (every
@@ -2515,12 +2566,51 @@ static void pin_self() {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)&pin_self, &self);
 }
 
+// The device under a layer that wraps the one the game gets (ReShade as dxgi.dll hooks the system D3D12CreateDevice, so
+// even the device we create comes wrapped); null when the game's device is the runtime's own.
+static ID3D12Device* unwrapped(IUnknown* unk) {
+    ID3D12Device *dev = nullptr, *real = nullptr;
+    if (FAILED(unk->QueryInterface(IID_PPV_ARGS(&dev)))) return nullptr;
+    HMODULE m = nullptr;
+    wchar_t path[MAX_PATH] = L"";
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)*(void***)dev, &m);
+    if (m) GetModuleFileNameW(m, path, MAX_PATH);
+    const wchar_t* name = wcsrchr(path, L'\\') ? wcsrchr(path, L'\\') + 1 : path;
+    // the runtime's own device (the debug layer's included): no layer to look under, nothing created to find one
+    if (!_wcsicmp(name, L"D3D12Core.dll") || !_wcsicmp(name, L"d3d12SDKLayers.dll") || (m && m == g_real)) return dev->Release(), nullptr;
+    static const GUID kUnwrapped = {0x7f2c9a11, 0x3b4e, 0x4d6a, {0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42}};  // ReShade 6.8+: IID_UnwrappedObject
+    IUnknown* u = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(kUnwrapped, (void**)&u)) && u) u->QueryInterface(IID_PPV_ARGS(&real)), u->Release();
+    if (!real) {
+        // a layer without that interface: root signatures aren't wrapped (ReShade, Streamline), so one's device is the real one
+        auto ser = (decltype(&D3D12SerializeRootSignature))real_D3D12SerializeRootSignature;
+        D3D12_ROOT_SIGNATURE_DESC rd{};
+        ID3DBlob *blob = nullptr, *err = nullptr;
+        ID3D12RootSignature* rs = nullptr;
+        if (ser && SUCCEEDED(ser(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) &&
+            SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs))))
+            rs->GetDevice(IID_PPV_ARGS(&real)), rs->Release();
+        if (blob) blob->Release();
+        if (err) err->Release();
+    }
+    if (real && *(void***)real == *(void***)dev) real->Release(), real = nullptr;
+    dev->Release();
+    return real;
+}
+
 // Every device the game gets, however it asked for one: the hooks, once per vtable.
 static HRESULT device_created(HRESULT hr, IUnknown* adapter, D3D_FEATURE_LEVEL fl, void** pp) {
     if (FAILED(hr) || !pp || !*pp || !admitted()) return hr;
     pin_self();
     install_hooks((IUnknown*)*pp);
-    if (g_next) hook_below(adapter, fl);
+    if (g_next) {
+        auto create = (decltype(&D3D12CreateDevice))GetProcAddress(g_real, "D3D12CreateDevice");
+        ID3D12Device* dev = nullptr;
+        if (create && SUCCEEDED(create(adapter, fl, IID_PPV_ARGS(&dev)))) hook_below(dev, "mod's"), dev->Release();
+        else logf("below: no device from the system d3d12.dll");
+    } else if (!g_warm) {
+        if (ID3D12Device* real = unwrapped((IUnknown*)*pp)) hook_below(real, "layer's"), real->Release();
+    }
     static std::once_flag nv, frames;
     std::call_once(nv, nv_hooks), std::call_once(frames, frame_hooks);
     return hr;

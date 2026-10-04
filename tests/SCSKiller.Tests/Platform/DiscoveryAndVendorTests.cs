@@ -433,6 +433,92 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void Exe_discovery_takes_no_patchers_copy_and_the_nearest_of_exes_named_alike()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-staging-test-").FullName;
+        try
+        {
+            void Put(string rel, int size) { Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(root, rel))!); File.WriteAllBytes(Path.Combine(root, rel), Exe("d3d12.dll", size)); }
+            string At(string rel) => Path.Combine(root, rel);
+            // Stellar Blade: the patcher's copy is larger
+            Put(@"SB\Binaries\Win64\SB-Win64-Shipping.exe", 4000);
+            Put(@"PatchData\SB\Binaries\Win64\SB-Win64-Shipping.exe", 5000);
+            Assert.Equal(At(@"SB\Binaries\Win64\SB-Win64-Shipping.exe"), GameFiles.FindExe(root));
+            // a deeper copy named alike, in a folder no rule names: the one nearest the root
+            Put(@"Copy\SB\Binaries\Win64\SB-Win64-Shipping.exe", 6000);
+            Assert.Equal(At(@"SB\Binaries\Win64\SB-Win64-Shipping.exe"), GameFiles.FindExe(root));
+            // exes named differently: still the largest
+            Put(@"SB\Binaries\Win64\SB-Win64-Test.exe", 7000);
+            Assert.Equal(At(@"SB\Binaries\Win64\SB-Win64-Test.exe"), GameFiles.FindExe(root));
+        }
+        finally { Directory.Delete(root, true); }
+
+        root = Directory.CreateTempSubdirectory("scskiller-staging-test-").FullName;
+        try
+        {
+            void Put(string rel, int size) { Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(root, rel))!); File.WriteAllBytes(Path.Combine(root, rel), Exe("d3d12.dll", size)); }
+            Put("game.exe", 1000);
+            Put(@"__Installer\Touchup.exe", 9000);
+            Put(@"PatchData\game.exe", 9000);
+            Put(@"backup\big.exe", 9000);
+            Assert.Equal(Path.Combine(root, "game.exe"), GameFiles.FindExe(root));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void Exe_discovery_takes_the_exe_battleye_s_launcher_starts()
+    {
+        var tmp = Directory.CreateTempSubdirectory("scskiller-battleye-test-").FullName;
+        var root = Path.Combine(tmp, "Game");
+        try
+        {
+            void Put(string rel, byte[] bytes) { Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(root, rel))!); File.WriteAllBytes(Path.Combine(root, rel), bytes); }
+            void Ini(string rel, string exe) => Put(rel, System.Text.Encoding.ASCII.GetBytes($"[Launcher]\r\nGameID=g\r\n32BitExe=win32\\game.exe\r\n64BitExe={exe}\r\n"));
+            string At(string rel) => Path.Combine(root, rel);
+            // War Thunder's layout: the launcher is the largest exe at the root, the game a level down
+            Put("launcher.exe", Exe(null, 9000));
+            Put("game_BE.exe", Exe(null, 100));
+            Put(@"win64\game.exe", Exe("d3d12.dll", 5000));
+            Put(@"win32\game.exe", Exe("d3d11.dll", 5000));
+            Assert.Equal(At("launcher.exe"), GameFiles.FindExe(root));   // no ini: as before
+
+            Ini(@"BattlEye\BELauncher.ini", @"win64\game.exe");
+            Assert.Equal(At(@"win64\game.exe"), GameFiles.FindExe(root));
+            Assert.Equal(At(@"win64\game.exe"), GameFiles.FindExe(root, "launcher.exe"));   // a store naming the launcher
+
+            // relative to the folder holding BattlEye\ (a *_BE.exe beside the game, a level down)
+            Directory.Delete(At("BattlEye"), true);
+            Ini(@"win64\BattlEye\BELauncher.ini", "game.exe");
+            Assert.Equal(At(@"win64\game.exe"), GameFiles.FindExe(root));
+
+            // a second ini naming the same exe agrees; one naming another makes it ambiguous: as before
+            Ini(@"BattlEye\BELauncher.ini", @"win64\game.exe");
+            Assert.Equal(At(@"win64\game.exe"), GameFiles.FindExe(root));
+            Ini(@"BattlEye\BELauncher.ini", @"win32\game.exe");
+            Assert.Equal(At("launcher.exe"), GameFiles.FindExe(root));
+            Directory.Delete(At(@"win64\BattlEye"), true);
+
+            // a target that's missing, outside the install, rooted, or an ini outside a BattlEye folder: as before
+            Put(@"..\Other\game.exe", Exe("d3d12.dll", 100));
+            foreach (var bad in new[] { @"win64\gone.exe", @"..\Other\game.exe", Path.Combine(tmp, "Other", "game.exe"), "" })
+            {
+                Ini(@"BattlEye\BELauncher.ini", bad);
+                Assert.Equal(At("launcher.exe"), GameFiles.FindExe(root));
+            }
+            Directory.Delete(At("BattlEye"), true);
+            Ini(@"Other\BELauncher.ini", @"..\win64\game.exe");
+            Assert.Equal(At("launcher.exe"), GameFiles.FindExe(root));
+
+            // Unreal keeps its Binaries\Win64 pick
+            Ini(@"BattlEye\BELauncher.ini", @"win64\game.exe");
+            Put(@"Game\Binaries\Win64\Game-Win64-Shipping.exe", Exe("d3d12.dll", 200));
+            Assert.Equal(At(@"Game\Binaries\Win64\Game-Win64-Shipping.exe"), GameFiles.FindExe(root));
+        }
+        finally { Directory.Delete(tmp, true); }
+    }
+
+    [Fact]
     public void Exe_discovery_takes_the_one_exe_that_imports_a_graphics_api_over_a_launcher_that_doesn_t()
     {
         var root = Directory.CreateTempSubdirectory("scskiller-launcher-test-").FullName;
@@ -664,6 +750,7 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
             Assert.Equal(AntiCheat.BattlEye, GameFiles.DetectAntiCheat(Install("battleye", "Game_BE.exe")));
             Assert.Equal(AntiCheat.None, GameFiles.DetectAntiCheat(Install("clean", @"Game\Plugins\NCGuardSDKTools\readme.txt", "notes.xem.txt")));
             Assert.Equal(AntiCheat.BattlEye, GameFiles.DetectAntiCheat(Install("beclient", @"Game\Binaries\Win64\BEClient_x64.dll")));
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(Install("warframe", "Warframe.x64.exe")));
         }
         finally { Directory.Delete(root, true); }
     }
@@ -899,6 +986,46 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void HoYoPlay_lists_finished_installs_and_each_games_own_anti_cheat_files_flag_it()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-hoyoplay-test-").FullName;
+        try
+        {
+            void Put(string rel, string text = "") { Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(root, rel))!); File.WriteAllText(Path.Combine(root, rel), text); }
+            // the install roots' files as HoYoPlay lays them out (names only)
+            foreach (var (dir, exe, ac) in new[]
+            {
+                ("Genshin Impact game", "GenshinImpact", new[] { "HoYoKProtect.sys", "mhypbase.dll" }),
+                ("Star Rail", "StarRail", new[] { "HoYoKProtect.sys", "mhypbase.dll" }),
+                ("ZenlessZoneZero Game", "ZenlessZoneZero", new[] { "HoYoKProtect.sys", "mhypbase.dll" }),
+                ("Honkai Impact 3rd game", "BH3", new[] { "ACE-BASE.sys", @"AntiCheatExpert\SGuard64.exe" }),
+            })
+            {
+                Put($@"{dir}\{exe}.exe", new string('x', 100));
+                Put($@"{dir}\{exe}_Data\globalgamemanagers");
+                Put($@"{dir}\UnityPlayer.dll");
+                Put($@"{dir}\config.ini", "[General]\r\nchannel=1\r\ncps=hyp_hoyoverse\r\ngame_version=5.1.0\r\nsub_channel=0\r\n");
+                foreach (var f in ac) Put($@"{dir}\{f}");
+            }
+            Put(@"Downloading\StarRail.exe", "x");   // no config.ini yet
+
+            var games = new HoYoPlaySource([("hk4e_global", Path.Combine(root, "Genshin Impact game")), ("hkrpg_global", Path.Combine(root, "Star Rail")),
+                ("nap_global", Path.Combine(root, "ZenlessZoneZero Game")), ("bh3_global", Path.Combine(root, "Honkai Impact 3rd game")),
+                ("hkrpg_cn", Path.Combine(root, "Downloading")), ("hk4e_cn", Path.Combine(root, "Missing"))]).Discover();
+
+            Assert.Equal(["hoyoplay:hk4e_global Genshin Impact GenshinImpact.exe 5.1.0", "hoyoplay:hkrpg_global Honkai: Star Rail StarRail.exe 5.1.0",
+                "hoyoplay:nap_global Zenless Zone Zero ZenlessZoneZero.exe 5.1.0", "hoyoplay:bh3_global Honkai Impact 3rd BH3.exe 5.1.0"],
+                games.Select(g => $"{g.Id} {g.Name} {Path.GetFileName(g.ExePath)} {g.Version}"));
+            foreach (var g in games)
+            {
+                Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(g));
+                Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(g with { Id = "epic:x" }));   // the same install from another store: its files
+            }
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
     public void Nvidia_cache_size_encoding()
     {
         Assert.Equal(new CacheLimit(100L << 30, false), NvidiaBackend.Decode(0x19000, false));   // NVCP "100 GB"
@@ -1018,6 +1145,32 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
             Item("b.item", new { AppName = "Addon", MainGameAppName = "Game", InstallLocation = install });  // an add-on in the game's install
             Item("c.item", new { AppName = "Other", MainGameAppName = "", InstallLocation = install });      // the launcher's own base game
             Assert.Equal(["epic:Game", "epic:Other"], new EpicSource(manifests).Discover().Select(g => g.Id).Order());
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void Purple_lists_a_finished_install_with_its_game_exe_and_nc_anti_cheat()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-purple-test-").FullName;
+        try
+        {
+            void Put(string rel, string text = "") { Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(root, rel))!); File.WriteAllText(Path.Combine(root, rel), text); }
+            Put(@"Game\VersionInfo_G1_WW_PURPLE.xml", "﻿<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersionInfo><Version>25</Version><Updated>1</Updated></VersionInfo>");
+            Put(@"Game\Game1\Binaries\Win64\Game1.exe", new string('x', 100));
+            Put(@"Game\Engine\Binaries\Win64\CrashReportClient.exe", new string('x', 1000));
+            Put(@"Game\Game1\Plugins\NCGuardSDK\Libraries\Win64\bb64.dll");
+            Put(@"Downloading\Game2\Binaries\Win64\Game2.exe", "x");   // no VersionInfo yet
+            Put(@"Broken\VersionInfo_G3.xml", "<VersionInfo>");        // being rewritten
+            Put(@"Broken\Game3\Binaries\Win64\Game3.exe", "x");
+
+            var games = new PurpleSource([("G1_WW_PURPLE", "Game One", Path.Combine(root, "Game")), ("G2", "Game Two", Path.Combine(root, "Downloading")),
+                ("G3", "Game Three", Path.Combine(root, "Broken")), ("G4", "Gone", Path.Combine(root, "Missing"))]).Discover();
+
+            var g = Assert.Single(games);
+            Assert.Equal(("purple:G1_WW_PURPLE", "Game One", "25"), (g.Id, g.Name, g.Version));
+            Assert.Equal(Path.Combine(root, @"Game\Game1\Binaries\Win64\Game1.exe"), g.ExePath);
+            Assert.Equal(AntiCheat.Other, GameFiles.DetectAntiCheat(g));
         }
         finally { Directory.Delete(root, true); }
     }

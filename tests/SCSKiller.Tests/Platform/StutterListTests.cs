@@ -48,6 +48,9 @@ public class StutterListTests : IDisposable
         var townfall = list.Find(G("steam:1636440", "?"))!;
         Assert.Equal(StutterSeverity.Severe, townfall.Severity);
         Assert.StartsWith("https://", townfall.Source);
+        var eldenRing = list.Find(G("steam:1245620", "?"))!;   // most of its hitches aren't shader compiles
+        Assert.Equal(StutterSeverity.Moderate, eldenRing.Severity);
+        Assert.StartsWith("https://www.digitalfoundry.net/", eldenRing.Source);
     }
 
     [Fact]
@@ -55,9 +58,10 @@ public class StutterListTests : IDisposable
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);
         while (!File.Exists(Path.Combine(root.FullName, "SCSKiller.slnx"))) root = root.Parent!;
-        if (!Directory.Exists(Path.Combine(root.FullName, "server"))) return;   // the public source has no server/
+        var served = Path.Combine(root.FullName, "server-rs", "content", "known-stutter.json");
+        if (!Directory.Exists(Path.Combine(root.FullName, "server-rs"))) return;   // the public source has no server-rs/
         Assert.Equal(File.ReadAllBytes(Path.Combine(root.FullName, "src", "SCSKiller.Core", "Games", "known-stutter.json")),
-                     File.ReadAllBytes(Path.Combine(root.FullName, "server", "content", "known-stutter.json")));
+                     File.ReadAllBytes(served));
     }
 
     [Fact]
@@ -69,7 +73,7 @@ public class StutterListTests : IDisposable
         Assert.Equal(StutterSeverity.Moderate, StutterList.TryParse(One(e => e["severity"] = "moderate"))!.Find(G("steam:42", "x"))!.Severity);
         Assert.NotNull(StutterList.TryParse(One(e => e["source"] = StutterList.OwnMeasurement)));
         Assert.NotNull(StutterList.TryParse(One(e => e["ids"] = new JsonArray())));
-        Assert.NotNull(StutterList.TryParse(One(e => e["ids"] = new JsonArray("xbox:Bethesda.Project_3275kfvn8vcwc", "epic:a-b", "ea:198300"))));
+        Assert.NotNull(StutterList.TryParse(One(e => e["ids"] = new JsonArray("xbox:Bethesda.Project_3275kfvn8vcwc", "epic:a-b", "ea:198300", "purple:A2_WW_L_GA_PURPLE"))));
     }
 
     [Fact]

@@ -30,6 +30,7 @@ sealed class PlanBuilder
     readonly List<Rec> recs = [];   // PSO records ('G' / 'C' / 'S'): what plans are built from
     readonly List<Rec> stateObjects = []; // recorded ray tracing state objects ('R' / 'A'): replayed as recorded; RtPlan learns from them
     readonly List<Rec> nvRecs = [];       // the recording's 'N' records: the NVAPI state RtPlan gives synthesized collections
+    readonly HashSet<string> layered = [];  // what the driver got from a layer wrapping the device ('W'): a mod's, kept out of packs (they are shared)
     readonly Dictionary<string, byte[]> recBlobs = [];
     readonly Dictionary<string, List<(string Key, string Rs, bool Layout)>> templates = [];
     readonly Dictionary<string, Rec> recByKey = [];
@@ -116,7 +117,7 @@ sealed class PlanBuilder
         if (dlls.Count == 0) return;
         // a game the user added never fills a pack: packs are shared, and its recording's origin is unknown
         if (recs.Count > 0 && packs != null && game.Store != Store.Manual)
-            foreach (var p in packs.Promote(recs, recBlobs, bc, dlls, game.Id, caps.Profile.StartsWith("amd") ? "amd" : caps.Profile.StartsWith("nvidia") ? "nvidia" : null))
+            foreach (var p in packs.Promote(recs, recBlobs, bc, dlls, game.Id, caps.Profile.StartsWith("amd") ? "amd" : caps.Profile.StartsWith("nvidia") ? "nvidia" : null, layered))
                 log?.Report($"middleware: {p.Records} recorded PSOs are {p.Dll.Name}'s ({p.Dll.Vendor}, {p.ContentHash[..12]}), {p.New} new in its pack");
         var seen = new HashSet<string>();
         var recKeys = recs.Select(r => r.Key).ToHashSet();
@@ -177,6 +178,7 @@ sealed class PlanBuilder
                 else if (r.Tag is 'G' or 'C' or 'S') recs.Add(r);
                 else if (IsStateObject(r.Tag)) stateObjects.Add(r);
                 else if (r.Tag == 'N') nvRecs.Add(r);
+                else if (r.Tag == 'W' && r.Payload.Length == 40) layered.Add(Hex(r.Payload.AsSpan(0, 20)));
         // a root signature the readers can't follow (a shared recording's) goes with the records naming it, not the game
         var named = recs.Select(r => Parse(r).Rs).Concat(stateObjects.SelectMany(r => ParseStateObject(r).RootSignatures)).ToHashSet();
         var bad = named.Where(h => recBlobs.TryGetValue(h, out var b) && !Carved.Dxbc.RootSignatureValid(b)).ToHashSet();
@@ -190,7 +192,8 @@ sealed class PlanBuilder
         foreach (var r in recs)
         {
             var pso = Parse(r);
-            if (!pso.Stages.Values.All(bc.ContainsKey)) { have.Add(pso.Tuple); continue; } // not a library shader (e.g. an overlay's): no template
+            // a layer's output (what the driver got, 'W'): replayed as recorded, never a template nor a rule check
+            if (layered.Contains(r.Key) || !pso.Stages.Values.All(bc.ContainsKey)) { have.Add(pso.Tuple); continue; } // not a library shader (e.g. an overlay's): no template
             var st = Infos(pso.Stages);
             if (pso.Stages.Values.Select(h => bc[h].RootSignature).FirstOrDefault(h => h != null) is { } own)
             {
@@ -627,9 +630,33 @@ sealed class PlanBuilder
 
         // a material PS nothing in its own map feeds is drawn behind a global VS (UE 5.1 Nanite material passes)
         var gvs = gpool.Where(d => d.Stage == Stage.Vertex && Planner.Rasterizable(d)).ToLookup(v => Planner.Sig(v.Outputs));
+        var orphans = new List<ShaderInfo>();
         foreach (var p in unfed.Where(p => !fed.Contains(p.Sha1)).DistinctBy(p => p.Sha1))
+        {
+            var n = 0;
             foreach (var v in gvs[Planner.Sig(p.Inputs)].Where(v => Planner.Links(v, p) && Planner.SameRs(v, p)))
+            {
+                n++;
                 sink(new() { [(int)Stage.Vertex] = v.Sha1, [(int)Stage.Pixel] = p.Sha1 }, Planner.Shape(Stage.Vertex, Stage.Pixel), Planner.Sig(p.Outputs, false));
+            }
+            if (n == 0) orphans.Add(p);
+        }
+
+        // a per-stage cache compiles the PS on its own, keyed with its root signature: a PS still unpaired that carries its own
+        // (so no VS changes it) gets the first VS of any map that feeds it. Elden Ring draws gxflvershader's pixel shaders
+        // behind material VSs of its shaderbdle bundles
+        orphans.RemoveAll(p => p.RootSignature == null);
+        if (caps.PerStageCache && orphans.Count > 0)
+        {
+            var vss = maps.Where(m => !m.Pooled && OnPlatform(m.Platform)).SelectMany(m => m.Shas).Distinct()
+                .Where(h => Usable(h) && bc[h].Stage == Stage.Vertex && Planner.Rasterizable(bc[h])).Select(h => bc[h]).ToLookup(v => Planner.Sig(v.Outputs));
+            foreach (var p in orphans)
+                if (vss[Planner.Sig(p.Inputs)].FirstOrDefault(v => Planner.Links(v, p) && Planner.SameRs(v, p)) is { } v)
+                {
+                    Count("orphan_ps_paired");
+                    sink(new() { [(int)Stage.Vertex] = v.Sha1, [(int)Stage.Pixel] = p.Sha1 }, Planner.Shape(Stage.Vertex, Stage.Pixel), Planner.Sig(p.Outputs, false));
+                }
+        }
 
         if (engine.Family == "Unreal" && engine.Version.StartsWith("5.")) SharedAcrossMaps(sink, Usable);
     }
@@ -677,10 +704,10 @@ sealed class PlanBuilder
     /// off as played) for Unreal 4.26/4.27 from UE 4.26's source as Jedi: Survivor confirms it, or Avalanche's 4.27 fork's
     /// when its libraries carry the fork's bindless marker (<see cref="RtCollections.GlobalFor"/>), and for Unreal 5.0-5.4
     /// <see cref="RtCollections.Ue51Global"/> (5.4: <see cref="RtCollections.Ue54Global"/>) when the libraries have 5.1's
-    /// binding shape (<see cref="RtCollections.Ue5ShapeMismatch"/>; verified on 5.1 only). An engine in
-    /// <see cref="RtCollections.GuessedFamilies"/> (Elden Ring: no recording possible) gets a guess from its libraries'
-    /// bindings (<see cref="RtCollections.GuessedGlobal"/>), unverified in game. A library declaring a
-    /// resource neither root signature gives it is left out ("rt_uncovered").</summary>
+    /// binding shape (<see cref="RtCollections.Ue5ShapeMismatch"/>; verified on 5.1 only); for Northlight its own global and local root
+    /// signatures, the rest guessed. REDengine 3 and FromSoftware
+    /// plan their material hit groups instead. A library declaring a resource neither root signature gives it is left out
+    /// ("rt_uncovered").</summary>
     void RtPlan()
     {
         var libs = maps.Where(m => m.Platform == plat).SelectMany(m => m.Shas).Distinct().Where(h => bc.TryGetValue(h, out var s) && s.Stage == Stage.Library).ToList();
@@ -691,9 +718,10 @@ sealed class PlanBuilder
             return;
         }
         if (this.rule == RootSig.Rule.Red3) { Red3HitGroups(libs.Count); return; }
+        if (engine.Family == FromSoft.FromSoftReader.Family) { SoulsHitGroups(libs.Count); return; }
         var learned = stateObjects.Select(RtCollections.Read).OfType<RtCollections.Recorded>().ToList();
         RtCollections.Rule rule;
-        string? guessedLocal = null; // a guessed rule's one local root signature (else UE's, per library)
+        string? guessedLocal = null; // Northlight's one local root signature (else UE's, per library)
         string how;
         if (learned.Count > 0)
         {
@@ -746,14 +774,14 @@ sealed class PlanBuilder
                 ? $"UE 5.1's (Oblivion Remastered's recording: 589/589 collections rebuilt from its files{(engine.Fork != null ? "; unverified for this fork" : "")})"
                 : $"UE 5.1's{(engine.Version == "5.4" ? " with 5.4's 32 samplers" : "")}, for the libraries' 5.1 binding shape; unverified for {engine.Version}";
         }
-        else if (RtCollections.GuessedFamilies.Contains(engine.Family))
+        else if (this.rule == RootSig.Rule.Northlight)
         {
-            var (h, b) = RtCollections.Serialize(RtCollections.GuessedGlobal(libs.Select(l => bc[l])), []);
+            var (h, b) = RtCollections.Serialize(RootSig.NorthlightCompute, []);
             rsBlobs[h] = b;
-            (guessedLocal, var lb) = RtCollections.Serialize(RtCollections.EmptyLocal, []);
+            (guessedLocal, var lb) = RtCollections.Serialize(RtCollections.NorthlightLocal, []);
             rsBlobs[guessedLocal] = lb;
-            rule = RtCollections.GuessedRule(h);
-            how = "guessed: RS + local RS from the library bindings, one collection per library; unverified in game";
+            rule = new(h, 0, 1, 0, 0, false); // payload and attributes: each library's own
+            how = "Northlight's global and local root signatures as its renderer builds them, one collection per library; depth 1 and no state object flags guessed: unverified in game";
         }
         else { log?.Report($"ray tracing: {libs.Count} DXIL libraries; no collection rule for {engine.Family} {engine.Version} without a recording: none synthesized"); return; }
 
@@ -829,6 +857,38 @@ sealed class PlanBuilder
             + $"{shape.Global[..8]}, shader config ({shape.Payload}, {shape.Attributes}), pipeline config ({shape.Depth}, 0x{shape.PipelineFlags:x})), {stats.GetValueOrDefault("rt_uncovered")} uncovered");
     }
 
+    /// <summary>Elden Ring: one collection per material's closest hit and any hit pair of one ray payload ('H',
+    /// <see cref="FromSoft.SoulsRayTracing"/>). Ray generation and miss libraries are only linked into its pipelines, which
+    /// it builds from whichever collections are loaded: not planned. No NVAPI state: its recording has none.</summary>
+    void SoulsHitGroups(int libraries)
+    {
+        var (global, local) = (FromSoft.SoulsRayTracing.Global, FromSoft.SoulsRayTracing.Local);
+        var ranges = new RootSig.Ranges(0, [.. RootSig.Parse(global.Blob).Slots, .. RootSig.Parse(local.Blob).Slots]);
+        var recordedLibs = stateObjects.SelectMany(r => ParseStateObject(r).Libraries).ToHashSet();
+        var pairs = new HashSet<string>();
+        foreach (var m in index.Maps.Where(m => m.Platform == plat && FromSoft.SoulsRayTracing.IsPair(m) && m.Shaders.All(h => bc.TryGetValue(h, out var s) && s.Stage == Stage.Library)))
+        {
+            pairs.Add(string.Join('|', m.Shaders.Order()));
+            if (m.Shaders.All(recordedLibs.Contains)) { Count("rt_recorded"); continue; }
+            if (m.Shaders.Select(h => RootSig.Uncovered(ranges, Stage.Library, bc[h])).FirstOrDefault(w => w != null) is { } why)
+            {
+                Count("rt_uncovered");
+                uncoveredExample.TryAdd("ray tracing " + why, m.Shaders[0]);
+                continue;
+            }
+            hitGroupItems.Add(RedEngine.RedRayTracing.Item(m.Shaders[0], m.Shaders[1], local.Hash, FromSoft.SoulsRayTracing.Shape, null));
+        }
+        rsBlobs[global.Hash] = global.Blob;
+        rsBlobs[local.Hash] = local.Blob;
+        if (hitGroupItems.Count > 0) usedRs.UnionWith([global.Hash, local.Hash]);
+        // the recorded collections (one state object type 0) this rule makes: the same pair and both root signatures
+        var collections = stateObjects.Where(r => r.Tag == 'R').Select(ParseStateObject).Where(s => s.Type == 0).ToList();
+        var same = collections.Count(s => pairs.Contains(string.Join('|', s.Libraries.Order())) && s.RootSignatures.Order().SequenceEqual(new[] { global.Hash, local.Hash }.Order()));
+        log?.Report($"ray tracing: {libraries} DXIL libraries, {hitGroupItems.Count} material collections synthesized (Elden Ring's closest + any hit pairs, "
+            + $"global root signature {global.Hash[..8]}, local {local.Hash[..8]}{(collections.Count > 0 ? $"; {same}/{collections.Count} recorded collections are these" : "")}), "
+            + $"{stats.GetValueOrDefault("rt_recorded")} already recorded, {stats.GetValueOrDefault("rt_uncovered")} uncovered");
+    }
+
     /// <summary>A library's local root signature (<see cref="RtCollections.LocalRs"/>), serialized once per shape; null when
     /// the runtime won't serialize it (that library is left out).</summary>
     string? LocalRs(ShaderInfo lib, bool rayGen)
@@ -902,7 +962,7 @@ sealed class PlanBuilder
                 MiddlewareSharedItems: packShared, RtStateObjects: replayable.Count, RtInline: rtInline),
             Path.Combine(outDir, "plan.bin"));
         PlanFile.Write(plan, body);
-        log?.Report($"plan: {items.Count + synthesized.Count} PSOs{(rtItems.Count > 0 ? $" + {rtItems.Count} ray tracing collections" : "")} ({string.Join(", ", stats.Select(s => $"{s.Key} {s.Value}"))}), "
+        log?.Report($"plan: {items.Count + synthesized.Count} PSOs{(rtItems.Count + hitGroupItems.Count > 0 ? $" + {rtItems.Count + hitGroupItems.Count} ray tracing collections" : "")} ({string.Join(", ", stats.Select(s => $"{s.Key} {s.Value}"))}), "
             + $"{synthesized.Count} synthesized templates, {usedRs.Count} root signatures, {n11} DirectX 11 items"
             + (packEntries.Count > 0 ? $", {packEntries.Count} middleware pack PSOs ({packNew} not in the recording)" : "")
             + (n11 > 0 ? $" ({string.Join(", ", d3d11.GroupBy(h => bc[h].Stage).Select(g => $"{g.Count()} {g.Key}").Append(tess11.Count > 0 ? $"{tess11.Count} HS+DS" : "").Where(s => s != ""))})" : "")

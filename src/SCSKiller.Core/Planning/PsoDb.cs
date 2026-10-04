@@ -11,11 +11,13 @@ namespace SCSKiller.Core.Planning;
 /// root sig[20], u32 n, n x (u32 stage, sha1[20]), then u32 0xFFFFFFFF (keep the template's input layout) or a canonical
 /// input layout. '1' D3D11 item = u32 stage (1 VS, 2 PS, 3 DS, 4 HS, 5 GS, 6 CS) + sha1[20] of a 'B' blob in the same db:
 /// the warmer creates that shader and draws/dispatches it once. '2' D3D11 tessellation pair = HS sha1[20] + DS sha1[20]: the warmer draws them together,
-/// behind a generated VS. 'Y' (plan only) = a ray tracing collection to synthesize at materialize (<see cref="RtCollections.Item"/>); 'H' (plan only) = a REDengine 3 hit group's (<see cref="RedEngine.RedRayTracing.Item"/>).
+/// behind a generated VS. 'Y' (plan only) = a ray tracing collection to synthesize at materialize (<see cref="RtCollections.Item"/>); 'H' (plan only) = a REDengine 3 or FromSoftware hit group's (<see cref="RedEngine.RedRayTracing.Item"/>).
 /// A stream output declaration: <see cref="SoDecl"/>. 'R' / 'A' = ray tracing state objects
 /// (<see cref="ParseStateObject"/>), replayed exactly as recorded. 'N' = the NVAPI state another record was created with
-/// (<see cref="NvState"/>). Hashes are lowercase hex here; all-zero = none.</summary>
-public static class PsoDb
+/// (<see cref="NvState"/>). 'W' = a create a layer wrapping the device (a mod) changed: key[20] of the record the driver got +
+/// key[20] of the record the game asked for (all zero: the layer's own create); both are records of the same db, and
+/// only the game's is shared (<see cref="HashOnly.Canonical"/>). Hashes are lowercase hex here; all-zero = none.</summary>
+public static partial class PsoDb
 {
     public readonly record struct Rec(char Tag, byte[] Payload)
     {
@@ -365,6 +367,115 @@ public static class PsoDb
         if (pos != p.Length) throw new InvalidDataException($"state object record parse mismatch ({pos} != {p.Length})");
         return so;
     }
+
+    /// <summary>What a state object record compiles on NVIDIA, for counting new pipelines (never to merge or replay records):
+    /// the SHA-1 of its tag and its subobjects, an addition's base left out and a launch's alias ending taken off. An alias
+    /// is an export's name given to another function (ExportToRename set) and ending in <c>_LRS_&lt;16 hex&gt;</c>; the
+    /// ending comes off it and off the hit group and association names that name it, nothing else. The Witcher 3 renames
+    /// its fixed DXIL functions so, a new suffix every launch, and adds its materials in another order each launch:
+    /// NVIDIA's key leaves export names out (selftest dxr), and its 24 single-material additions byte for byte an earlier
+    /// session's, on other bases, took 6.5-14 ms against 28-80 ms cold. A record two of whose names would become one, one
+    /// with a library or collection that exports all its functions (no export listed: their names aren't in the record),
+    /// or one that doesn't parse, is its key.</summary>
+    public static string StateObjectIdentity(Rec r)
+    {
+        if (!IsStateObject(r.Tag)) return r.Key;
+        try
+        {
+            var aliases = new Dictionary<string, string>();   // an alias -> it without its ending
+            var names = new HashSet<string>();                // every export name and hit group name, as recorded
+            var listed = WalkStateObject(r, (name, renames) =>
+            {
+                names.Add(name);
+                if (renames != null && LaunchSuffix().Replace(name, "") is var bare && bare != name) aliases[name] = bare;
+            }, null);
+            if (!listed) return r.Key;
+            if (names.Select(n => aliases.GetValueOrDefault(n, n)).Distinct().Count() < names.Count) return r.Key;
+            var w = new MemoryStream();
+            WalkStateObject(r, null, (bytes, name) =>
+            {
+                if (name == null) { w.Write(bytes.Span); return; }
+                var v = aliases.GetValueOrDefault(name, name);
+                w.Write(BitConverter.GetBytes(v.Length));
+                w.Write(Encoding.Unicode.GetBytes(v));
+            });
+            return Hex(SHA1.HashData([(byte)r.Tag, .. w.ToArray()]));
+        }
+        catch (InvalidDataException) { return r.Key; }
+    }
+
+    /// <summary>A state object record's subobjects past its base key: <paramref name="export"/> gets each export's name and
+    /// the function it renames (and each hit group's name, renaming none); <paramref name="write"/> gets the bytes in order,
+    /// a string that names an export or hit group (an export's own name, a hit group's name and the exports it imports, an
+    /// association's exports) with its text, every other piece with null. False when a library or collection lists no
+    /// export (it exports all its functions).</summary>
+    static bool WalkStateObject(Rec r, Action<string, string?>? export, Action<ReadOnlyMemory<byte>, string?>? write)
+    {
+        var p = r.Payload;
+        var pos = r.Tag == 'A' ? 20 : 0;
+        if (pos > p.Length) throw new InvalidDataException("state object record truncated");
+        uint Next() { if (pos + 4 > p.Length) throw new InvalidDataException("state object record truncated"); var v = U(p, pos); write?.Invoke(p.AsMemory(pos, 4), null); pos += 4; return v; }
+        void H() { if (pos + 20 > p.Length) throw new InvalidDataException("state object record truncated"); write?.Invoke(p.AsMemory(pos, 20), null); pos += 20; }
+        string? Read()
+        {
+            if (pos + 4 > p.Length) throw new InvalidDataException("state object record truncated");
+            var n = U(p, pos);
+            if (n == uint.MaxValue) { pos += 4; return null; }
+            if (2L * n > p.Length - pos - 4) throw new InvalidDataException("malformed string");
+            var v = Encoding.Unicode.GetString(p, pos + 4, 2 * (int)n);
+            pos += 4 + 2 * (int)n;
+            return v;
+        }
+        void Str(bool name)
+        {
+            var at = pos;
+            var v = Read();
+            write?.Invoke(p.AsMemory(at, pos - at), name ? v : null);
+        }
+        void Names() { for (var n = Next(); n > 0; n--) Str(true); }
+        var listed = true;
+        void Exports()
+        {
+            var count = Next();
+            listed &= count > 0;
+            for (var n = count; n > 0; n--)
+            {
+                var at = pos;
+                var name = Read();
+                var mid = pos;
+                var renames = Read();
+                if (name != null) export?.Invoke(name, renames);
+                write?.Invoke(p.AsMemory(at, mid - at), name);
+                write?.Invoke(p.AsMemory(mid, pos - mid), null);
+                Next();
+            }
+        }
+        Next();
+        var count = Next();
+        if (count > MaxSubobjects) throw new InvalidDataException($"state object of {count} subobjects, over {MaxSubobjects}");
+        for (var n = count; n > 0; n--)
+            switch (Next())
+            {
+                case 0 or 3 or 10: Next(); break;
+                case 9 or 12: Next(); Next(); break;
+                case 1 or 2: H(); break;
+                case 5 or 6: H(); Exports(); break;
+                case 7: Next(); Names(); break;
+                case 8: Str(false); Names(); break;
+                case 11:
+                    var at = pos;
+                    if (Read() is { } group) export?.Invoke(group, null);
+                    pos = at;
+                    Str(true); Next(); Str(true); Str(true); Str(true);
+                    break;
+                case var t: throw new InvalidDataException($"unknown state subobject type {t}");
+            }
+        if (pos != p.Length) throw new InvalidDataException("state object record parse mismatch");
+        return listed;
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"_LRS_[0-9A-Fa-f]{16}\z")]
+    private static partial System.Text.RegularExpressions.Regex LaunchSuffix();
 
     /// <summary>The state of a graphics PSO record that vendors key their caches on (on top of <see cref="Parse"/>'s tuple).
     /// <paramref name="RtWriteMasks"/> / <paramref name="LogicOps"/>: one per render target (RtFormats.Length), RT 0's when

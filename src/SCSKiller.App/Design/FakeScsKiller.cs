@@ -35,7 +35,7 @@ public sealed class FakeScsKiller : IScsKiller
             bool encrypted = false, string? unsupported = null, PlanStats? plan = null, long? cache = null, TimeSpan? time = null, string at = "steam", string? exePath = null)
         {
             bool warmable = status is GameStatus.Ready or GameStatus.Stale && shaders != null;
-            var store = at switch { "steam" => Store.Steam, "epic" => Store.Epic, "xbox" => Store.Xbox, "ea" => Store.EA, "manual" => Store.Manual, _ => Store.Other };   // gog/ubisoft/battlenet: Other, like the real sources
+            var store = at switch { "steam" => Store.Steam, "epic" => Store.Epic, "xbox" => Store.Xbox, "ea" => Store.EA, "manual" => Store.Manual, _ => Store.Other };   // gog/ubisoft/battlenet/purple/hoyoplay/gaijin: Other, like the real sources
             var game = new Game($"{at}:{id}", name, store, $@"X:\Sample\{name}", exePath ?? $@"X:\Sample\{name}\{exe}");
             return new(game,
                 new EngineInfo("Unreal", ver, null, "D3D12", encrypted, unsupported), AntiCheat.None, status, reason,

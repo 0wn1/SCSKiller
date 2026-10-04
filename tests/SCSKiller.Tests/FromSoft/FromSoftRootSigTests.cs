@@ -23,6 +23,15 @@ public class FromSoftRootSigTests
         Assert.Equal("0e93201c87d0e117d87e3ee342d261ea3134531d", Convert.ToHexStringLower(SHA1.HashData(RootSig.AsVersion10(compute))));
     }
 
+    /// <summary>Elden Ring's ray tracing root signatures (<see cref="SCSKiller.Core.FromSoft.SoulsRayTracing"/>), which no shader
+    /// carries. The SHA-1s are the recorded blobs' (all 30 recorded collections use both).</summary>
+    [Fact]
+    public void EldenRingsRayTracingRootSignatures()
+    {
+        Assert.Equal("41b9c9383870b59ab7462ecfac7c0c1a8cdbf5f2", SCSKiller.Core.FromSoft.SoulsRayTracing.Global.Hash);
+        Assert.Equal("c820a584432ba0523f0902c2c4a4c83b65ff6a54", SCSKiller.Core.FromSoft.SoulsRayTracing.Local.Hash);
+    }
+
     /// <summary>Multi-range tables, root constants and descriptors and static samplers keep every register and visibility.</summary>
     [Fact]
     public void KeepsEveryRange()

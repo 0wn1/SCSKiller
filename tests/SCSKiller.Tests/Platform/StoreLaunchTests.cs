@@ -74,6 +74,32 @@ public sealed class StoreLaunchTests : IDisposable
     }
 
     [Fact]
+    public void Purple_runs_its_own_desktop_shortcut_command()
+    {
+        const string launcher = @"C:\Program Files (x86)\NC\Purple\PurpleLauncher.exe";
+        var c = StoreLaunch.Command(G("purple:A2_WW_L_GA_PURPLE", Store.Other), purpleLauncher: launcher)!;
+        Assert.Equal((launcher, "--game-id A2_WW_L_GA_PURPLE", @"C:\Program Files (x86)\NC\Purple"), (c.FileName, c.Arguments, c.WorkingDirectory));
+        Assert.False(c.UseShellExecute);
+        Assert.Null(StoreLaunch.Command(G("purple:A2 --uninstall", Store.Other), purpleLauncher: launcher));   // never an argument of its own
+    }
+
+    [Fact]
+    public void Purple_handler_command_names_purple_launcher_only()
+    {
+        var dir = Directory.CreateDirectory(Path.Combine(_dir, "NC Purple")).FullName;
+        var launcher = Path.Combine(dir, "PurpleLauncher.exe");
+        var other = Path.Combine(dir, "notepad.exe");
+        File.WriteAllBytes(launcher, [0]);
+        File.WriteAllBytes(other, [0]);
+        Assert.Equal(launcher, PurpleSource.LauncherIn($"\"{launcher}\" \"%1\""));
+        Assert.Equal(launcher, PurpleSource.LauncherIn($"{launcher} \"%1\""));   // unquoted, with a space in the path, as PURPLE registers it
+        Assert.Null(PurpleSource.LauncherIn($"\"{other}\" \"%1\""));
+        Assert.Null(PurpleSource.LauncherIn($"{other} \"%1\""));
+        Assert.Null(PurpleSource.LauncherIn($"\"{Path.Combine(dir, "gone", "PurpleLauncher.exe")}\" \"%1\""));
+        Assert.Null(PurpleSource.LauncherIn($"\"{launcher}.evil.exe\" \"%1\""));
+    }
+
+    [Fact]
     public void A_game_the_user_added_runs_its_exe_from_its_folder()
     {
         var g = G("manual:0123456789abcdef", Store.Manual, @"X:\Games\Some Game");

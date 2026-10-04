@@ -201,6 +201,193 @@ public class MiddlewarePackTests(ITestOutputHelper output)
         Assert.Contains(log.All, l => l.Contains("3 pack PSOs (3 already in the recording, 0 new"));
     }
 
+    /// <summary>A pipeline of the DLL's shaders that a layer wrapping the device changed (here its root signature) or created
+    /// itself goes in no pack: packs are shared, and that pipeline is the layer's.</summary>
+    /// <summary>What the driver got from a layer is replayed, never learned from: a synthesized pipeline takes the game's
+    /// root signature, not the one a layer made, even when the layer's record comes first.</summary>
+    [Fact]
+    public void A_layer_s_records_teach_the_planner_nothing()
+    {
+        var root = Ff7.TempDir("plan-layer");
+        var (s1, s2) = (Container("DXIL", "recorded shader"), Container("DXIL", "planned shader"));
+        var (gameRs, layerRs) = (Container("RTS0", "the game's root signature"), Container("RTS0", "a layer's root signature"));
+        var asked = new PsoDb.Rec('C', PsoDb.Compute(Sha(gameRs), Sha(s1)));
+        var got = new PsoDb.Rec('C', PsoDb.Compute(Sha(layerRs), Sha(s1)));
+        var db = Path.Combine(root, "recording.db");
+        using (var f = File.Create(db))
+        {
+            foreach (var b in new[] { s1, gameRs, layerRs }) PsoDb.WriteBlob(f, Sha(b), b);
+            foreach (var r in new[] { got, SCSKiller.Tests.Platform.RecordingsTests.W(got, asked), asked }) PsoDb.Write(f, r.Tag, r.Payload);
+        }
+        var plan = new Planner(Path.Combine(root, "packs")).Build(GameIn(root, "test:plan-layer"), Engine, Index(Sha(s1), Sha(s2)), new Recording(db), Caps, Path.Combine(root, "plan"), null, default);
+        var rs = PlanFile.Read(plan.FilePath).Records.Where(r => r.Tag is 'P' or 'S')
+            .Select(r => r.Tag == 'P' ? PsoDb.ParseItem(r.Payload) is var i ? (i.Rs, i.Stages) : default : PsoDb.Parse(r) is var p ? (p.Rs, p.Stages) : default)
+            .Where(x => x.Stages.ContainsValue(Sha(s2))).Select(x => x.Rs).ToList();
+        Assert.NotEmpty(rs);
+        Assert.All(rs, r => Assert.Equal(Sha(gameRs), r));
+    }
+
+    [Fact]
+    public void ALayersRecordsGoInNoPack()
+    {
+        var x = Make("mw-layer");
+        var layerRs = Container("RTS0", "a layer's root signature");
+        var (changed, own) = (new PsoDb.Rec('C', PsoDb.Compute(Sha(layerRs), Sha(x.A))), new PsoDb.Rec('C', PsoDb.Compute(Sha(layerRs), Sha(x.B))));
+        using (var f = File.Open(x.RecordingDb, FileMode.Append))
+        {
+            PsoDb.WriteBlob(f, Sha(layerRs), layerRs);
+            foreach (var r in new[] { changed, SCSKiller.Tests.Platform.RecordingsTests.W(changed, new('C', PsoDb.Compute(Sha(x.Rs), Sha(x.A)))), own, SCSKiller.Tests.Platform.RecordingsTests.W(own, null) })
+                PsoDb.Write(f, r.Tag, r.Payload);
+        }
+        var first = GameIn(Install(x, "first", x.Dll), "test:first");
+        new Planner(x.PacksDir).Build(first, Engine, Index(Sha(x.GameCs)), new Recording(x.RecordingDb), Caps, Path.Combine(x.Root, "plan-first"), null, default);
+
+        var pack = MiddlewarePack.Read(Path.Combine(x.PacksDir, "amd", MiddlewarePack.FileName("amdxcffx64.dll", Sha(x.Dll))));
+        Assert.Equal(3, pack.Entries.Count);
+        Assert.DoesNotContain(pack.Entries, e => e.Key == changed.Key || e.Key == own.Key);
+        Assert.Equal([Sha(x.Rs)], pack.RootSignatures.Keys);
+    }
+
+    /// <summary>A pack an earlier recording filled with a layer's pipelines (before their 'W' was known: a recording from
+    /// before the recorder wrote it) loses them, and the root signature only they named, once the 'W' arrives: packs are
+    /// shared.</summary>
+    [Fact]
+    public void ALayersRecordsLeaveAPackTheyWereAlreadyIn()
+    {
+        var x = Make("mw-layer-late");
+        var layerRs = Container("RTS0", "a layer's root signature");
+        var (changed, own) = (new PsoDb.Rec('C', PsoDb.Compute(Sha(layerRs), Sha(x.A))), new PsoDb.Rec('C', PsoDb.Compute(Sha(layerRs), Sha(x.B))));
+        using (var f = File.Open(x.RecordingDb, FileMode.Append))
+        {
+            PsoDb.WriteBlob(f, Sha(layerRs), layerRs);
+            foreach (var r in new[] { changed, own }) PsoDb.Write(f, r.Tag, r.Payload);
+        }
+        var first = GameIn(Install(x, "first", x.Dll), "test:first");
+        var packPath = Path.Combine(x.PacksDir, "amd", MiddlewarePack.FileName("amdxcffx64.dll", Sha(x.Dll)));
+        new Planner(x.PacksDir).Build(first, Engine, Index(Sha(x.GameCs)), new Recording(x.RecordingDb), Caps, Path.Combine(x.Root, "plan-1"), null, default);
+        Assert.Equal(5, MiddlewarePack.Read(packPath).Entries.Count);
+
+        using (var f = File.Open(x.RecordingDb, FileMode.Append))
+            foreach (var r in new[] { SCSKiller.Tests.Platform.RecordingsTests.W(changed, new('C', PsoDb.Compute(Sha(x.Rs), Sha(x.A)))), SCSKiller.Tests.Platform.RecordingsTests.W(own, null) })
+                PsoDb.Write(f, r.Tag, r.Payload);
+        new Planner(x.PacksDir).Build(first, Engine, Index(Sha(x.GameCs)), new Recording(x.RecordingDb), Caps, Path.Combine(x.Root, "plan-2"), null, default);
+        var pack = MiddlewarePack.Read(packPath);
+        Assert.Equal(3, pack.Entries.Count);
+        Assert.DoesNotContain(pack.Entries, e => e.Key == changed.Key || e.Key == own.Key);
+        Assert.Equal([Sha(x.Rs)], pack.RootSignatures.Keys);
+    }
+
+    /// <summary>Once one recording's 'W' named a layer's pipeline (<see cref="MiddlewarePacks.Exclude"/>), another game's
+    /// recording that has it without the 'W' (from before the recorder wrote one) doesn't promote it again.</summary>
+    [Fact]
+    public void A_layer_s_record_once_known_is_never_promoted_again()
+    {
+        var x = Make("mw-layer-known");
+        var layerRs = Container("RTS0", "a layer's root signature");
+        var changed = new PsoDb.Rec('C', PsoDb.Compute(Sha(layerRs), Sha(x.A)));
+        using (var f = File.Open(x.RecordingDb, FileMode.Append))
+        {
+            PsoDb.WriteBlob(f, Sha(layerRs), layerRs);
+            PsoDb.Write(f, changed.Tag, changed.Payload);
+        }
+        var planner = new Planner(x.PacksDir);
+        planner.Packs!.Exclude([changed.Key]);
+        var second = GameIn(Install(x, "second", x.Dll), "test:second");
+        planner.Build(second, Engine, Index(Sha(x.GameCs)), new Recording(x.RecordingDb), Caps, Path.Combine(x.Root, "plan"), null, default);
+        var pack = MiddlewarePack.Read(Path.Combine(x.PacksDir, "amd", MiddlewarePack.FileName("amdxcffx64.dll", Sha(x.Dll))));
+        Assert.DoesNotContain(pack.Entries, e => e.Key == changed.Key);
+        Assert.Equal([Sha(x.Rs)], pack.RootSignatures.Keys);
+    }
+
+    /// <summary>A plan built from a recording with a layer's 'W' remembers its target (no import or sharing pass between):
+    /// a plan built next from an older recording that has it without the 'W' doesn't promote it.</summary>
+    [Fact]
+    public void A_promotion_remembers_the_layer_s_records_for_the_next_one()
+    {
+        var x = Make("mw-layer-persist");
+        var layerRs = Container("RTS0", "a layer's root signature");
+        var changed = new PsoDb.Rec('C', PsoDb.Compute(Sha(layerRs), Sha(x.A)));
+        var older = Path.Combine(x.Root, "older.db");
+        File.Copy(x.RecordingDb, older);
+        foreach (var (db, w) in new[] { (x.RecordingDb, true), (older, false) })
+            using (var f = File.Open(db, FileMode.Append))
+            {
+                PsoDb.WriteBlob(f, Sha(layerRs), layerRs);
+                PsoDb.Write(f, changed.Tag, changed.Payload);
+                if (w) PsoDb.Write(f, 'W', [.. Convert.FromHexString(changed.Key), .. new byte[20]]);
+            }
+        var game = GameIn(Install(x, "first", x.Dll), "test:first");
+        new Planner(x.PacksDir).Build(game, Engine, Index(Sha(x.GameCs)), new Recording(x.RecordingDb), Caps, Path.Combine(x.Root, "plan-a"), null, default);
+        new Planner(x.PacksDir).Build(game, Engine, Index(Sha(x.GameCs)), new Recording(older), Caps, Path.Combine(x.Root, "plan-b"), null, default);
+        var pack = MiddlewarePack.Read(Path.Combine(x.PacksDir, "amd", MiddlewarePack.FileName("amdxcffx64.dll", Sha(x.Dll))));
+        Assert.DoesNotContain(pack.Entries, e => e.Key == changed.Key);
+        Assert.Equal([Sha(x.Rs)], pack.RootSignatures.Keys);
+    }
+
+    /// <summary>A layer-made list that is there but can't be read promotes nothing that pass (it fails closed): the pack
+    /// stays as it was.</summary>
+    [Fact]
+    public void An_unreadable_layer_made_list_promotes_nothing()
+    {
+        var x = Make("mw-layer-locked");
+        var planner = new Planner(x.PacksDir);
+        planner.Packs!.Exclude(["0000000000000000000000000000000000000001"]);
+        var game = GameIn(Install(x, "first", x.Dll), "test:first");
+        var pack = Path.Combine(x.PacksDir, "amd", MiddlewarePack.FileName("amdxcffx64.dll", Sha(x.Dll)));
+        using (new FileStream(Path.Combine(x.PacksDir, "layer-made.keys"), FileMode.Open, FileAccess.Read, FileShare.None))
+            planner.Build(game, Engine, Index(Sha(x.GameCs)), new Recording(x.RecordingDb), Caps, Path.Combine(x.Root, "plan-1"), null, default);
+        Assert.False(File.Exists(pack));
+        planner.Build(game, Engine, Index(Sha(x.GameCs)), new Recording(x.RecordingDb), Caps, Path.Combine(x.Root, "plan-2"), null, default);
+        Assert.Equal(3, MiddlewarePack.Read(pack).Entries.Count);
+    }
+
+    /// <summary>A layer-made list or a recording this user may not read fails closed like a locked one: the list's read
+    /// throws (no promotion, no upload), and so do the recording's 'W' targets.</summary>
+    [Fact]
+    public void A_layer_made_list_or_recording_denied_to_this_user_throws()
+    {
+        var x = Make("mw-layer-denied");
+        var packs = new MiddlewarePacks(x.PacksDir);
+        packs.Exclude(["0000000000000000000000000000000000000001"]);
+        var sid = System.Security.Principal.WindowsIdentity.GetCurrent().User!;
+        var deny = new System.Security.AccessControl.FileSystemAccessRule(sid, System.Security.AccessControl.FileSystemRights.ReadData,
+            System.Security.AccessControl.AccessControlType.Deny);
+        foreach (var path in new[] { Path.Combine(x.PacksDir, "layer-made.keys"), x.RecordingDb })
+        {
+            var info = new FileInfo(path);
+            var acl = info.GetAccessControl();
+            acl.AddAccessRule(deny);
+            info.SetAccessControl(acl);
+            try
+            {
+                if (path == x.RecordingDb) Assert.ThrowsAny<UnauthorizedAccessException>(() => SCSKiller.Core.App.Recordings.LayerMade(path));
+                else Assert.ThrowsAny<UnauthorizedAccessException>(() => packs.LayerMade());
+            }
+            finally
+            {
+                acl.RemoveAccessRule(deny);
+                info.SetAccessControl(acl);
+            }
+        }
+        Assert.Single(packs.LayerMade());
+        Assert.Empty(new MiddlewarePacks(Path.Combine(x.Root, "none")).LayerMade());   // missing: none
+    }
+
+    /// <summary>Exclusions of different records running at once, from two processes' imports, each take theirs out of the
+    /// same pack; neither puts the other's back.</summary>
+    [Fact]
+    public async Task Concurrent_exclusions_keep_each_other_s_removals()
+    {
+        var x = Make("mw-layer-race");
+        new Planner(x.PacksDir).Build(GameIn(Install(x, "first", x.Dll), "test:first"), Engine, Index(Sha(x.GameCs)), new Recording(x.RecordingDb), Caps, Path.Combine(x.Root, "plan"), null, default);
+        var path = Path.Combine(x.PacksDir, "amd", MiddlewarePack.FileName("amdxcffx64.dll", Sha(x.Dll)));
+        var keys = MiddlewarePack.Read(path).Entries.Select(e => e.Key).ToList();
+        Assert.Equal(3, keys.Count);
+        await Task.WhenAll(keys.Take(2).Select(k => Task.Run(() => new MiddlewarePacks(x.PacksDir).Exclude([k]))));
+        Assert.Equal([keys[2]], MiddlewarePack.Read(path).Entries.Select(e => e.Key));
+        Assert.Equal(keys.Take(2).Order(StringComparer.Ordinal), new MiddlewarePacks(x.PacksDir).LayerMade().Order(StringComparer.Ordinal));
+    }
+
     [Fact]
     public void AGameTheUserAddedNeverFillsAPackButIsSeededFromOne()
     {

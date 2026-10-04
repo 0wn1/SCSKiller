@@ -67,7 +67,7 @@ public static class Recordings
                     if (seen.Add(Id(r)))
                     {
                         if (r.Tag == 'N') nv = true;
-                        else if (r.Tag != 'B') added.Add(r.Key);
+                        else if (r.Tag is not ('B' or 'W')) added.Add(r.Key);
                         yield return r;
                     }
         }
@@ -118,6 +118,124 @@ public static class Recordings
         }
         finally { File.Delete(tmp); }
         return records.Count - keep.Count;
+    }
+
+    /// <summary>The records of <paramref name="store"/> a layer wrapping the device (a mod) made, by its 'W' records: the
+    /// game's creates it changed before the driver got them, and its own creates. (0, 0): recorded without one.</summary>
+    public static (int Changed, int Own) Layered(string store)
+    {
+        var pairs = Pairs(store);
+        var own = pairs.Count(p => p.EndsWith(Zero, StringComparison.Ordinal));
+        return (pairs.Count - own, own);
+    }
+
+    /// <summary>The keys of the records of <paramref name="store"/> a layer made ('W': changed or its own); a store that
+    /// can't be read throws: what is shared is checked against them.</summary>
+    public static HashSet<string> LayerMade(string store) => [.. Pairs(store).Select(p => p[..40])];
+
+    /// <summary>A recording whose 'W' records can't all be read yet: a torn tail (normal while the recorder writes its
+    /// inbox) or a malformed 'W'. Nothing is shared until it reads whole, usually once the game has closed.</summary>
+    public sealed class IncompleteLayerList(string message) : IOException(message);
+
+    static IReadOnlySet<string> Pairs(string store) =>
+        KeyFiles.Keys(store, p =>
+        {
+            // the recorder holds its inbox open for writing while the game runs: read alongside it
+            using var f = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var head = new byte[8];
+            var n = f.ReadAtLeast(head, 8, false);
+            f.Position = 0;
+            // a proxy db starts with a record's tag, never 0: a leading 0 is a compact recording's magic, whole or damaged
+            if (n > 0 && head[0] == 0 && !head.AsSpan(0, n).SequenceEqual("\0SCSKREC"u8)) throw new IncompleteLayerList($"{p}: a damaged compact header");
+            IEnumerable<Rec> records;
+            try { records = n > 0 && head[0] == 0 ? [.. Read(p)] : [.. Whole(new BufferedStream(f, 1 << 20), f.Length, p)]; }
+            catch (InvalidDataException e) { throw new IncompleteLayerList($"{p}: {e.Message}"); }
+            if (records.Where(r => r.Tag == 'W').Select(r => r.Payload.Length).FirstOrDefault(n => n != 40, 40) is not 40 and var bad)
+                throw new IncompleteLayerList($"{p}: a 'W' record of {bad} bytes");
+            return [.. records.Where(r => r.Tag == 'W').Select(r => Hex(r.Payload))];
+        }, "layer", failOpen: false);
+
+    /// <summary>A proxy db's records, all of them: a torn tail throws, where <see cref="Read(Stream)"/> stops quietly.</summary>
+    static IEnumerable<Rec> Whole(Stream f, long length, string path)
+    {
+        var head = new byte[5];
+        long at = 0;
+        for (int n; (n = f.ReadAtLeast(head, 5, false)) > 0;)
+        {
+            var len = BitConverter.ToUInt32(head, 1);
+            if (n < 5 || len > length - at - 5) throw new IncompleteLayerList($"{path}: a torn tail at byte {at}");
+            var body = new byte[len];
+            f.ReadExactly(body);
+            at += 5 + len;
+            yield return new Rec((char)head[0], body);
+        }
+    }
+
+    static readonly object DiskGate = new();
+    static (string Fingerprint, HashSet<string> Keys)? onDisk;
+    static readonly Dictionary<string, (long Length, long Written, string[] Inboxes)> InboxesOf = [];
+
+    /// <summary>What a layer made by every recording on this PC, read from disk (not from the scan's games, which a
+    /// first scan publishes only once evaluated): every games\*\recording.db, and the recorder's inbox (scskiller.db)
+    /// next to each recorded exe in state.json. One enumeration and a stat per file on each call; the set is rebuilt
+    /// only when one of them changed. Anything there that can't be listed, stat'ed or read throws (a recording not whole
+    /// yet: <see cref="IncompleteLayerList"/>): what is shared is checked against it.</summary>
+    public static HashSet<string> LayerMadeOnDisk(string dataDir)
+    {
+        var games = new DirectoryInfo(Path.Combine(dataDir, "games"));
+        List<DirectoryInfo> dirs;
+        try { dirs = [.. games.EnumerateDirectories()]; }
+        catch (DirectoryNotFoundException) { return []; }   // only a missing folder is none: Exists is false on an error too
+        var sources = new List<string>();
+        var fingerprint = new System.Text.StringBuilder();
+        void Add(string path, long length, long written) { sources.Add(path); fingerprint.Append(path).Append('|').Append(length).Append('|').Append(written).Append('\n'); }
+        foreach (var dir in dirs)
+            foreach (var f in dir.EnumerateFiles())
+                if (f.Name.Equals("recording.db", StringComparison.OrdinalIgnoreCase)) Add(f.FullName, f.Length, f.LastWriteTimeUtc.Ticks);
+                else if (f.Name.Equals("state.json", StringComparison.OrdinalIgnoreCase))
+                {
+                    fingerprint.Append(f.FullName).Append('|').Append(f.Length).Append('|').Append(f.LastWriteTimeUtc.Ticks).Append('\n');
+                    foreach (var inbox in Inboxes(f))
+                        if (Stat(inbox) is { } st) Add(inbox, st.Length, st.Written);
+                }
+        var fp = fingerprint.ToString();
+        // unchanged sizes and write times: the files hold what was read, so their keys stand even if a read would now fail
+        lock (DiskGate)
+            if (onDisk is { } c && c.Fingerprint == fp) return [.. c.Keys];
+        HashSet<string> keys = [];
+        foreach (var s in sources) keys.UnionWith(LayerMade(s));
+        lock (DiskGate) onDisk = (fp, keys);
+        return [.. keys];
+    }
+
+    /// <summary>The recorder inboxes a game's state.json names (next to its recorded exe, and the two of a move), parsed
+    /// again only when the file changed.</summary>
+    static string[] Inboxes(FileInfo state)
+    {
+        lock (DiskGate)
+            if (InboxesOf.TryGetValue(state.FullName, out var c) && (c.Length, c.Written) == (state.Length, state.LastWriteTimeUtc.Ticks)) return c.Inboxes;
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(state.FullName));
+        string[] inboxes = [.. new[] { "RecorderExe", "RecorderMoveFrom", "RecorderMoveTo" }
+            .Select(n => !doc.RootElement.TryGetProperty(n, out var exe) ? null : exe.ValueKind switch
+            {
+                System.Text.Json.JsonValueKind.String => exe.GetString(),
+                System.Text.Json.JsonValueKind.Null => null,
+                _ => throw new InvalidDataException($"{state.FullName}: {n} is a {exe.ValueKind}, not a path"),
+            })
+            .OfType<string>().Where(p => p.Length > 0).Select(p => Path.Combine(Path.GetDirectoryName(p)!, "scskiller.db"))];
+        lock (DiskGate) InboxesOf[state.FullName] = (state.Length, state.LastWriteTimeUtc.Ticks, inboxes);
+        return inboxes;
+    }
+
+    /// <summary>A file's size and write time from its handle; null only when it (or its folder) isn't there.</summary>
+    static (long Length, long Written)? Stat(string path)
+    {
+        try
+        {
+            using var h = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return (RandomAccess.GetLength(h), File.GetLastWriteTimeUtc(h).Ticks);
+        }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException) { return null; }
     }
 
     /// <summary>Empties the recorder's scskiller.db once imported, only while nothing has it open (the recorder holds it for

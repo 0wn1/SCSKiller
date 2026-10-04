@@ -68,6 +68,9 @@ public interface IEngineReader
     /// cached Detect result is redone when it changes. <paramref name="engine"/>: the engine detected before, null when
     /// not known (every reader's stamp).</summary>
     string DetectStamp(Game game, EngineInfo? engine) => "";
+    /// <summary>The game files Index reads when a user setting picks them (not fixed by the exe or the store build), as a stamp
+    /// (path, size, write time): a warm is stale once it changes. Cheap, called on every evaluation; "" when there are none.</summary>
+    string IndexStamp(Game game) => "";
     ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, CancellationToken ct);
     /// <summary>Streams container bytes (hash convention above) for the requested shaders; the sink is called sequentially.</summary>
     void ReadShaders(Game game, EngineInfo engine, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct);
@@ -254,8 +257,10 @@ public sealed record GameState(
     int CommunityDbPsos = 0,        // the manifest entry's pipelines while InCommunityDb
     double? PsoPerSecond = null,   // the game's last complete warm onto a cold cache (ScsKiller.ColdWarm); null = none measured
     FrameReport? LastFrames = null,    // the last launch's frame times (FrameLog); null = none measured
-    string? ShaderMod = null,          // a ReShade add-on that replaces the game's shaders (Games.ReShade.Detect); null = none
-    bool ShaderModBlocks = false,      // ...and adds to every root signature the game creates: never compiled, recorded or shared
+    string? ShaderMod = null,          // a ReShade add-on that changes the game's pipelines (Games.ReShade.Detect); null = none
+    bool ShaderModBlocks = false,      // ...adds to every root signature, with ReShade outside the exe's folder: never compiled, recorded or shared
+    bool ShaderModLayer = false,       // ...compiles through a copy of the layer (ScsKiller.LayerFor)
+    bool ShaderModAsD3D12 = false,     // ...with ReShade installed as d3d12.dll: the recorder records under it only when chained
     bool RootUnconfirmed = false,      // a game the user added whose folder they haven't confirmed: never recorded (ScsKiller.SkipManual)
     bool RtUnseen = false,             // recorded long enough without ray tracing (GameRecord.RtUnseen) and planned since: its uncovered ray tracing isn't asked for
     bool RtToPlan = false,             // its plan asks for a ray tracing recording and a newer recording waits for the plan check (ScsKiller.RtPlanCheck)

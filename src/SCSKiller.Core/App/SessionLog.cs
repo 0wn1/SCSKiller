@@ -206,13 +206,13 @@ public static class SessionLog
         }
     }
 
-    /// <summary>Writes the keys of the recording's PSOs with a shader that traces rays inline (SFI0's RayQuery flag), one
-    /// per line; the recording must carry the shader bytes (rehydrated).</summary>
-    public static void WriteRayQueryKeys(string recordingDb, string keysFile)
+    /// <summary>Writes the keys of the PSOs with a shader that traces rays inline (SFI0's RayQuery flag), one per line, of
+    /// the dbs together: a PSO's shader bytes may be in another of them. They must carry the shader bytes (rehydrated).</summary>
+    public static void WriteRayQueryKeys(IEnumerable<string> dbs, string keysFile)
     {
         var rayQuery = new HashSet<string>();
         var psos = new List<(string Key, ICollection<string> Stages)>();
-        foreach (var r in PsoDb.Read(recordingDb))
+        foreach (var r in dbs.Where(File.Exists).SelectMany(PsoDb.Read))
             if (r.Tag == 'B') { if (r.Payload.Length > 20 && Dxbc.InlineRayTracing(r.Payload.AsSpan(20))) rayQuery.Add(PsoDb.Hex(r.Payload.AsSpan(0, 20))); }
             else if (r.Tag is 'G' or 'C' or 'S')
                 try { psos.Add((r.Key, PsoDb.Parse(r).Stages.Values)); }

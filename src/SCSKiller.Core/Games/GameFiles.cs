@@ -11,18 +11,24 @@ public static class GameFiles
     static readonly EnumerationOptions Flat = new() { IgnoreInaccessible = true };
 
     /// <summary>The process that creates the D3D12 device: the largest exe under a Binaries\Win64 folder (Unreal; not
-    /// Engine\Binaries, which only holds helpers like CrashReportClient), else <paramref name="launcherExe"/>, else the largest
-    /// exe near the install root. A launcher among the last two is replaced by the game it starts (<see cref="LaunchedExe"/>).</summary>
+    /// Engine\Binaries, which only holds helpers like CrashReportClient; of exes named alike, the one nearest the root), else
+    /// the exe BattlEye's launcher starts (<see cref="BattlEyeTarget"/>), else <paramref name="launcherExe"/>, else the
+    /// largest exe near the install root. A launcher among the last two is replaced by the game it starts
+    /// (<see cref="LaunchedExe"/>). Exes in a patcher's or installer's copy of the game (<see cref="Staging"/>) are never
+    /// picked.</summary>
     public static string? FindExe(string installDir, string? launcherExe = null)
     {
         if (!Directory.Exists(installDir)) return null;
         var unreal = Directory.EnumerateDirectories(installDir, "Win64", Deep)
             .Where(d => string.Equals(Path.GetFileName(Path.GetDirectoryName(d)), "Binaries", StringComparison.OrdinalIgnoreCase))
             .SelectMany(d => Directory.EnumerateFiles(d, "*.exe", Flat))
-            .Where(f => !IsEngineFolder(installDir, f))
+            .Where(f => !IsEngineFolder(installDir, f) && !InStaging(installDir, f))
             .Select(f => new FileInfo(f))
+            .GroupBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(same => same.MinBy(f => Path.GetRelativePath(installDir, f.FullName).Count(c => c == Path.DirectorySeparatorChar))!)
             .MaxBy(f => f.Length);
         if (unreal != null) return unreal.FullName;
+        if (BattlEyeTarget(installDir) is { } be) return be;
         if (launcherExe != null)
         {
             var p = Path.GetFullPath(Path.Combine(installDir, launcherExe));
@@ -30,7 +36,7 @@ public static class GameFiles
         }
         // ponytail: non-Unreal games get a guess; Steam's real launch target lives in the binary appinfo.vdf, parse it if this misfires
         var exes = Directory.EnumerateFiles(installDir, "*.exe", Deep)
-            .Where(f => !NotTheGame.Any(s => Path.GetRelativePath(installDir, f).Contains(s, StringComparison.OrdinalIgnoreCase)))
+            .Where(f => !NotTheGame.Any(s => Path.GetRelativePath(installDir, f).Contains(s, StringComparison.OrdinalIgnoreCase)) && !InStaging(installDir, f))
             .Select(f => new FileInfo(f))
             .ToList();
         if (exes.FirstOrDefault(f => Directory.Exists(Path.ChangeExtension(f.FullName, null) + "_Data")) is { } unity) return unity.FullName;   // Unity: Game.exe + Game_Data
@@ -50,6 +56,38 @@ public static class GameFiles
             || DetectAntiCheat(new Game("", "", Store.Other, installDir, guess.FullName)) != AntiCheat.None) return guess.FullName;
         var imports = larger.Select(f => (f.FullName, Imports: ImportsGraphics(f.FullName))).ToList();
         return imports.All(x => x.Imports != null) && imports.Where(x => x.Imports == true).ToList() is [var game] ? game.FullName : guess.FullName;
+    }
+
+    /// <summary>The 64BitExe of the BattlEye\BELauncher.ini files near the install root (relative to the folder holding
+    /// BattlEye\, where the game's *_BE.exe sits): the one existing exe inside the install they
+    /// name; null when they name none or several.</summary>
+    internal static string? BattlEyeTarget(string installDir)
+    {
+        var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var ini in Directory.EnumerateFiles(installDir, "BELauncher.ini", Deep))
+        {
+            var dir = Path.GetDirectoryName(ini)!;
+            if (!Path.GetFileName(dir).Equals("BattlEye", StringComparison.OrdinalIgnoreCase)) continue;
+            string[] lines;
+            try { lines = File.ReadAllLines(ini); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { continue; }
+            var rel = lines.Select(l => l.Split('=', 2)).FirstOrDefault(p => p.Length == 2 && p[0].Trim().Equals("64BitExe", StringComparison.OrdinalIgnoreCase))?[1].Trim();
+            if (string.IsNullOrEmpty(rel) || Path.IsPathRooted(rel) || rel.IndexOfAny(Path.GetInvalidPathChars()) >= 0) continue;
+            try { if (Path.GetFullPath(Path.Combine(Path.GetDirectoryName(dir)!, rel)) is var exe && InsideNoLinks(installDir, exe)) targets.Add(exe); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { }
+        }
+        return targets.Count == 1 ? targets.First() : null;
+    }
+
+    /// <summary><paramref name="target"/> is an existing file inside <paramref name="installDir"/>, reached through no junction or
+    /// symlink below it (the anti-cheat scan doesn't follow those; the root itself may be one).</summary>
+    static bool InsideNoLinks(string installDir, string target)
+    {
+        var root = DirKey(installDir);
+        if (!target.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || !File.Exists(target)) return false;
+        for (var p = target; p.Length > root.Length; p = Path.GetDirectoryName(p)!)
+            if ((p == target ? new FileInfo(p) : (FileSystemInfo)new DirectoryInfo(p)) is { LinkTarget: not null }) return false;
+        return true;
     }
 
     /// <summary>launcher-configuration.json's executables[]: the entry whose description is its "fallback", else the first;
@@ -72,12 +110,7 @@ public static class GameFiles
             string? S(string k) => x.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
             if (S("fileName") is not { Length: > 0 } name) return null;
             var target = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(config)!, S("directoryPath") ?? "", name));
-            var root = DirKey(installDir);
-            if (!target.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || !File.Exists(target)) return null;
-            // a junction or symlink below the install root leads out of it, as the anti-cheat scan takes it (the root itself may be one)
-            for (var p = target; p.Length > root.Length; p = Path.GetDirectoryName(p)!)
-                if ((p == target ? new FileInfo(p) : (FileSystemInfo)new DirectoryInfo(p)) is { LinkTarget: not null }) return null;
-            return target;
+            return InsideNoLinks(installDir, target) ? target : null;
         }
         catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException or ArgumentException) { return null; }
     }
@@ -94,22 +127,48 @@ public static class GameFiles
 
     /// <summary>The exes near the install root (as <see cref="FindExe"/> looks) that import a graphics API.</summary>
     internal static IEnumerable<string> GraphicsExes(string installDir) => Directory.EnumerateFiles(installDir, "*.exe", Deep)
-        .Where(f => !NotTheGame.Any(s => Path.GetRelativePath(installDir, f).Contains(s, StringComparison.OrdinalIgnoreCase)) && !IsEngineFolder(installDir, f))
+        .Where(f => !NotTheGame.Any(s => Path.GetRelativePath(installDir, f).Contains(s, StringComparison.OrdinalIgnoreCase)) && !IsEngineFolder(installDir, f) && !InStaging(installDir, f))
         .Where(f => ImportsGraphics(f) == true);
 
     /// <summary><paramref name="path"/> is inside the folder <paramref name="dir"/> (case-insensitive, full paths).</summary>
     public static bool Inside(string dir, string path) =>
         dir.Length > 0 && Path.GetFullPath(path).StartsWith(DirKey(dir) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>The folder's path with every junction and symlink on the way resolved, as a process's image path names
+    /// it; null when it can't be opened.</summary>
+    public static string? FinalPath(string dir)
+    {
+        using var h = CreateFileW(dir, 0, 7 /* FILE_SHARE_READ | WRITE | DELETE */, 0, 3 /* OPEN_EXISTING */, 0x02000000 /* FILE_FLAG_BACKUP_SEMANTICS */, 0);
+        if (h.IsInvalid) return null;
+        var name = new char[32768];
+        var n = GetFinalPathNameByHandleW(h, name, name.Length, 0);
+        if (n == 0 || n >= name.Length) return null;
+        var path = new string(name, 0, (int)n);
+        return path.StartsWith(@"\\?\UNC\", StringComparison.Ordinal) ? @"\\" + path[8..]
+             : path.StartsWith(@"\\?\", StringComparison.Ordinal) ? path[4..] : path;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, nint security, uint disposition, uint flags, nint template);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle h, char[] name, int size, uint flags);
+
     /// <summary>An install folder compared across sources: full path, no trailing separator (a drive root keeps its own).</summary>
     public static string DirKey(string dir) => dir.Length == 0 ? dir : Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir));
 
     static readonly string[] NotTheGame = ["redist", "directx", "crash", "unins", "setup", "vconsole"];   // vconsole2.exe: Source 2's developer console
 
+    /// <summary>Folders a patcher or installer keeps a copy of the game's files in, which never run: Stellar Blade's
+    /// PatchData\SB\Binaries\Win64 holds a second SB-Win64-Shipping.exe; the EA app's __Installer its own tools.</summary>
+    static readonly string[] Staging = ["PatchData", "__Installer", "Backup", "Backups", "Staging"];
+
+    static bool InStaging(string installDir, string path) =>
+        Path.GetRelativePath(installDir, Path.GetDirectoryName(path)!).Split(Path.DirectorySeparatorChar).Any(seg => Staging.Contains(seg, StringComparer.OrdinalIgnoreCase));
+
     static bool IsEngineFolder(string installDir, string path) =>
         Path.GetRelativePath(installDir, path).StartsWith("Engine" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
 
-    static readonly (string Name, AntiCheat Kind)[] Markers =
+    internal static readonly (string Name, AntiCheat Kind)[] Markers =
     [
         ("EasyAntiCheat", AntiCheat.EasyAntiCheat), ("EasyAntiCheat_EOS", AntiCheat.EasyAntiCheat), ("start_protected_game.exe", AntiCheat.EasyAntiCheat),
         ("EasyAntiCheat_EOS_Setup.exe", AntiCheat.EasyAntiCheat), ("EasyAntiCheat_Setup.exe", AntiCheat.EasyAntiCheat),
@@ -119,12 +178,14 @@ public static class GameFiles
         ("randgrid.sys", AntiCheat.Other),   // Ricochet (Call of Duty)
         ("NCGuardSDK", AntiCheat.Other), ("NCGuard", AntiCheat.Other),
         ("AntiCheatExpert", AntiCheat.Other), ("AceAntibotClient", AntiCheat.Other), ("TP3Helper.exe", AntiCheat.Other),
-        ("HoYoKProtect.sys", AntiCheat.Other), ("mhypbase.dll", AntiCheat.Other),
+        ("HoYoKProtect.sys", AntiCheat.Other), ("mhypbase.dll", AntiCheat.Other), ("mhyprot2.sys", AntiCheat.Other), ("mhyprot3.sys", AntiCheat.Other),
+        ("ACE-BASE.sys", AntiCheat.Other),   // Anti-Cheat Expert's driver in a game's root (Honkai Impact 3rd)
         ("NeacClient.exe", AntiCheat.Other), ("NeacSafe64.sys", AntiCheat.Other), ("NeacSafe64_ex.sys", AntiCheat.Other),
         ("BlackCall.aes", AntiCheat.Other), ("BlackCall64.aes", AntiCheat.Other), ("BlackCat64.sys", AntiCheat.Other),
         ("HShield", AntiCheat.Other),
         ("PunkBuster", AntiCheat.Other), ("PnkBstrA.exe", AntiCheat.Other), ("pbsvc.exe", AntiCheat.Other), ("pbsv.dll", AntiCheat.Other),
         ("equ8_conf.json", AntiCheat.Other),
+        ("Warframe.x64.exe", AntiCheat.Other),   // Digital Extremes' own client-side detection: no driver or folder of its own
         ("gameguard.des", AntiCheat.Other),
         ("DenuvoAC", AntiCheat.Other), ("denuvo-anti-cheat.sys", AntiCheat.Other), ("denuvo-anti-cheat-runtime.dll", AntiCheat.Other),
         ("denuvo-anti-cheat-update-service.exe", AntiCheat.Other), ("Denuvo Anti-Cheat Installer.exe", AntiCheat.Other),
@@ -142,13 +203,13 @@ public static class GameFiles
     /// folder's own entries only, for a recheck right after a full one. A game added by hand (<see cref="Store.Manual"/>) also has
     /// the entries of each folder above its install read, one level each, up to a drive root or a store's folder of games
     /// (<see cref="ManualSource.IsLibrary"/>), not included: the folder the user confirmed may be a subfolder of the game's. Battle.net titles are marked conservatively:
-    /// Blizzard's Warden is server-side, not a file the install carries. The only anti-cheat detector: engine readers and
+    /// Blizzard's Warden is server-side, not a file the install carries. HoYoPlay titles too: every HoYoverse game ships a kernel anti-cheat. The only anti-cheat detector: engine readers and
     /// middleware detection call it to skip their own work, exe discovery to read no other binary; the app's evaluation acts on its verdict.
     /// <paramref name="ignore"/>: that anti-cheat's markers don't count (an offline session's check for any other).</summary>
     public static AntiCheat DetectAntiCheat(Game game, bool quick = false, TimeSpan? budget = null, AntiCheat ignore = AntiCheat.None)
     {
         AntiCheat Marker(string name) => GameFiles.Marker(name) is var kind && kind == ignore ? AntiCheat.None : kind;
-        if (game.Id.StartsWith("battlenet:", StringComparison.Ordinal)) return AntiCheat.Other;
+        if (game.Id.StartsWith("battlenet:", StringComparison.Ordinal) || game.Id.StartsWith("hoyoplay:", StringComparison.Ordinal)) return AntiCheat.Other;
         var install = Path.TrimEndingDirectorySeparator(Path.GetFullPath(game.InstallDir));
         var exeDir = Path.GetDirectoryName(Path.GetFullPath(game.ExePath))!;
         bool Inside(string d) => d.Equals(install, StringComparison.OrdinalIgnoreCase) || d.StartsWith(install + '\\', StringComparison.OrdinalIgnoreCase);

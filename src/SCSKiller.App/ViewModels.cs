@@ -44,13 +44,13 @@ static class Fmt
     /// <summary>"Severe shader-compilation stutter: reason", then the source and when it was checked; null when not listed.</summary>
     public static string? StutterTip(GameState s) => s.KnownStutter is { } k
         ? $"{(k.Severity == StutterSeverity.Severe ? "Severe" : "Moderate")} shader-compilation stutter: {k.Reason}.\nSource: {k.Source} (checked {k.Date})" : null;
-    /// <summary>Library sections, in list order. GOG, Ubisoft and Battle.net games are Store.Other: told apart by their id prefix.</summary>
-    public static readonly string[] Stores = ["Steam", "Epic Games", "Xbox / Game Pass", "EA app", "GOG", "Ubisoft Connect", "Battle.net", "Other", AddedByYou];
+    /// <summary>Library sections, in list order. GOG, Ubisoft, Battle.net, PURPLE, HoYoPlay and Gaijin games are Store.Other: told apart by their id prefix.</summary>
+    public static readonly string[] Stores = ["Steam", "Epic Games", "Xbox / Game Pass", "EA app", "GOG", "Ubisoft Connect", "Battle.net", "PURPLE", "HoYoPlay", "Gaijin", "Other", AddedByYou];
     public const string AddedByYou = "Added by you";
     public static string StoreName(Game g) => g.Store switch
     {
         Store.Steam => "Steam", Store.Epic => "Epic Games", Store.Xbox => "Xbox / Game Pass", Store.EA => "EA app", Store.Manual => AddedByYou,
-        _ => g.Id[..Math.Max(0, g.Id.IndexOf(':'))] switch { "gog" => "GOG", "ubisoft" => "Ubisoft Connect", "battlenet" => "Battle.net", _ => "Other" },
+        _ => g.Id[..Math.Max(0, g.Id.IndexOf(':'))] switch { "gog" => "GOG", "ubisoft" => "Ubisoft Connect", "battlenet" => "Battle.net", "purple" => "PURPLE", "hoyoplay" => "HoYoPlay", "gaijin" => "Gaijin", _ => "Other" },
     };
     /// <summary>Measured driver cache when known, else the estimate.</summary>
     public static string Cache(GameState s) => s.CacheOnDisk is { } c ? Format.Bytes(c) : s.EstimatedCacheBytes is { } b ? "≈ " + Format.Bytes(b) : Format.Dash;
@@ -279,8 +279,8 @@ public sealed class GameRow(GameState s, bool queued = false, bool compiling = f
         GameStatus.NeedsRecording when s.RecorderInstalled && !ScsKiller.RecordedEnough(s) => "recorder on: play for about 5 minutes",
         _ => s.StatusReason,
     } + ModNote(s);
-    /// <summary>A shader mod that doesn't block the game: "; RenoDX replaces some shaders: ...".</summary>
-    internal static string ModNote(GameState s) => s is { ShaderMod: { } m, ShaderModBlocks: false } ? "; " + ScsKiller.ShaderModNote(m) : "";
+    /// <summary>A shader mod that doesn't block the game: "; RenoDX changes this game's pipelines: ...".</summary>
+    internal static string ModNote(GameState s) => s is { ShaderMod: not null, ShaderModBlocks: false } ? "; " + ScsKiller.ShaderModNote(s) : "";
     /// <summary>The row's note under the status: a few words (<see cref="Format.ShortNote"/>); null when the status says it all.</summary>
     public string? Note => Format.ShortNote(s);
     public string RowNote => Playing ? "Playing now" + (Note is { } n ? " · " + n : "") : Note ?? "";
@@ -410,7 +410,7 @@ public sealed class LibraryVm : Bindable
     bool slowScan, forced;
     public bool ScanEmpty => slowScan && Games.Count == 0;
     public bool ScanBusy => slowScan && Games.Count > 0;
-    public string ScanEmptyNote => "Checking Steam, Epic, Xbox, EA, GOG, Ubisoft Connect and Battle.net, then which engine each game uses. "
+    public string ScanEmptyNote => "Checking Steam, Epic, Xbox, EA, GOG, Ubisoft Connect, Battle.net, PURPLE, HoYoPlay and Gaijin, then which engine each game uses. "
         + "The first scan reads every game's files, so it can take a minute.";
     public string ScanBusyNote => forced ? "Re-reading every game's engine and anti-cheat; the list updates when it's done."
         : "The list updates when it's done.";

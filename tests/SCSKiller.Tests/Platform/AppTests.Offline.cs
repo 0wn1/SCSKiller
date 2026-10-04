@@ -13,8 +13,9 @@ public partial class AppTests
 {
     /// <summary>The fake game listed as an offline-session game while <paramref name="body"/> runs; the child processes
     /// don't arm themselves (the selftest's own attestation is the app's, here the test's).</summary>
-    static async Task Listed(Func<Task> body, string exe = "Fake-Win64-Shipping.exe", string id = "test:fake")
+    async Task Listed(Func<Task> body, string exe = "Fake-Win64-Shipping.exe", string? id = null)
     {
+        id ??= _game.Id;   // this test's: the cleanup helper's mutex is named by it, shared with every run in the logon session
         var (list, unarmed) = (OfflineEac.Current, Environment.GetEnvironmentVariable("SCSKILLER_SELFTEST_UNARMED"));
         OfflineEac.Current = [new(id, "Fake Game", exe, "480")];
         Environment.SetEnvironmentVariable("SCSKILLER_SELFTEST_UNARMED", "1");
@@ -168,7 +169,7 @@ public partial class AppTests
 
             Assert.False(k.OfflineBlocksUpdate);   // its process has exited and no helper runs: files left don't hold updates back
             var store = new AppStore(Path.Combine(_root, "data"));
-            if (helper) Assert.Equal(0, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero));
+            if (helper) Assert.Equal(0, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero, othersRun: OurOthersRun));
             else
             {
                 var next = Killer(new FakeReader(Unreal));   // the next start
@@ -198,11 +199,11 @@ public partial class AppTests
         File.WriteAllText(Path.Combine(_exeDir, "scskiller.ini"), "[scski");
 
         using (new FileStream(Path.Combine(_exeDir, "scskiller.ini"), FileMode.Open, FileAccess.Read, FileShare.None))
-            Assert.Equal(1, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero));
+            Assert.Equal(1, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero, othersRun: OurOthersRun));
         Assert.NotNull(store.LoadGame(_game.Id).OfflineSession);
         Assert.Equal(before.Append("scskiller.ini").Order(), Names(_exeDir));
 
-        Assert.Equal(0, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero));
+        Assert.Equal(0, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero, othersRun: OurOthersRun));
         Assert.Equal(before, Names(_exeDir));
         Assert.Null(store.LoadGame(_game.Id).OfflineSession);
     }
@@ -314,12 +315,12 @@ public partial class AppTests
     public void An_offline_cleanup_ends_for_a_folder_gone_and_waits_for_a_drive_gone()
     {
         var store = Journal(["d3d12.dll"], files: [], exe: Path.Combine(_root, "uninstalled", "Game", "game.exe"));
-        Assert.Equal(0, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero));
+        Assert.Equal(0, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero, othersRun: OurOthersRun));
         Assert.Null(store.LoadGame(_game.Id).OfflineSession);
 
         var free = "ZYXWVUTSRQPONMLKJIHGFED".Select(c => $"{c}:\\").First(d => !Directory.Exists(d));
         store = Journal(["d3d12.dll"], files: [], exe: Path.Combine(free, "Games", "Game", "game.exe"));
-        Assert.Equal(1, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero));
+        Assert.Equal(1, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero, othersRun: OurOthersRun));
         Assert.NotNull(store.LoadGame(_game.Id).OfflineSession);
         Assert.True(ScsKiller.Gone(Path.Combine(_root, "uninstalled")));
         Assert.False(ScsKiller.Gone(Path.Combine(free, "Games")));

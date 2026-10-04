@@ -11,7 +11,8 @@ namespace SCSKiller.Core.Planning;
 /// tables, <see cref="BindlessTables"/>). The stock rules
 /// are read from Epic's source (D3D12RootSignature.cpp: FD3D12RootSignatureDesc; D3D12Util.cpp: InitShaderRegisterCounts and
 /// the bound-shader-state quantizer; D3D12RHI.h: MAX_*), for resource binding tier 3 (every NVIDIA GPU SCSKiller supports).
-/// REDengine 3's are one per kind of pipeline (<see cref="BuildRed3"/>).</summary>
+/// REDengine 3's are one per kind of pipeline (<see cref="BuildRed3"/>), Northlight's one graphics and one compute
+/// (<see cref="BuildNorthlight"/>).</summary>
 public static unsafe class RootSig
 {
     /// <summary>One construction rule per range of engine versions (each rule holds until the next one's version). 4.20/4.21
@@ -30,6 +31,7 @@ public static unsafe class RootSig
         Ue54,   // 5.4: MAX_SAMPLERS 32, root constants
         Ue55,   // 5.5-5.7: vertex shaders get UAVs
         Red3,   // REDengine 3 (The Witcher 3, DX12): three fixed root signatures, see BuildRed3
+        Northlight, // Northlight (Control, DX12): one graphics and one compute root signature, see BuildNorthlight
     }
 
     /// <summary>The rule a game's engine (an Unreal version, REDengine 3) builds with; null = none known. A fork other than FF7's gets its base
@@ -37,6 +39,7 @@ public static unsafe class RootSig
     public static Rule? RuleFor(EngineInfo e)
     {
         if (e.Family == RedEngine.RedEngineReader.Family) return Rule.Red3;
+        if (e.Family == Northlight.NorthlightReader.Family) return Rule.Northlight;
         if (e.Family != "Unreal" || !System.Version.TryParse(e.Version, out var v)) return null;
         if (e.Fork == "GAME_FinalFantasy7Rebirth" && e.Version == "4.26") return Rule.Ff7;
         return (v.Major, v.Minor) switch
@@ -62,7 +65,7 @@ public static unsafe class RootSig
     public static readonly byte[] Ue426Samplers = UeSamplers(0, 1000);
 
     /// <summary>The static samplers a rule's root signatures carry (4.25: the same six at s1000-s1005 in space 0; before: none).</summary>
-    public static byte[] StaticSamplers(Rule r) => r switch { Rule.Ue420 or Rule.Ue421 or Rule.Ue422 or Rule.Red3 => [], Rule.Ue425 => Ue425Samplers, _ => Ue426Samplers };
+    public static byte[] StaticSamplers(Rule r) => r switch { Rule.Ue420 or Rule.Ue421 or Rule.Ue422 or Rule.Red3 or Rule.Northlight => [], Rule.Ue425 => Ue425Samplers, _ => Ue426Samplers };
 
     static readonly byte[] Ue425Samplers = UeSamplers(1000, 0);
 
@@ -86,17 +89,18 @@ public static unsafe class RootSig
     /// space, flags), root constants (1, vis, register, space, count) or a root CBV/UAV (2/4, vis, register, space, flags).
     /// A single-range table's range is at OFFSET_APPEND unless the row carries an explicit offset as an 8th value; a multi-range
     /// table's ranges all start at offset 0 (they alias one heap region, see <see cref="BindlessTables"/>), or with
-    /// <paramref name="AppendRanges"/> each at OFFSET_APPEND (one after the other). <see cref="Key"/> identifies it.</summary>
-    public sealed record Desc(uint Flags, List<uint[]> Rows, bool AppendRanges = false)
+    /// <paramref name="AppendRanges"/> each at OFFSET_APPEND (one after the other). <paramref name="Version10"/>: serialized
+    /// as a version 1.0 root signature (range and root descriptor flags dropped). <see cref="Key"/> identifies it.</summary>
+    public sealed record Desc(uint Flags, List<uint[]> Rows, bool AppendRanges = false, bool Version10 = false)
     {
-        public string Key => $"{Flags}|{string.Join(';', Rows.Select(r => string.Join(',', r)))}{(AppendRanges ? "|append" : "")}";
+        public string Key => $"{Flags}|{string.Join(';', Rows.Select(r => string.Join(',', r)))}{(AppendRanges ? "|append" : "")}{(Version10 ? "|1.0" : "")}";
     }
 
     /// <param name="meshTier">the RHI runs at feature level SM6 (the game's PCD3D_SM6 shaders), where UE 5 sets
     /// GRHISupportsMeshShadersTier0 on mesh-shader GPUs and so denies the mesh/amplification stages it doesn't use</param>
     /// <param name="maxSrvs">the game's MAX_SRVS when it isn't the rule's (<see cref="MaxSrvsFor"/>); 0 = the rule's</param>
     public static Desc Build(Rule r, IReadOnlyDictionary<Stage, ShaderInfo> stages, bool meshTier, uint maxSrvs = 0) =>
-        r switch { Rule.Ff7 => BuildUe(stages), Rule.Red3 => BuildRed3(stages), _ => BuildStock(r, stages, meshTier, maxSrvs) };
+        r switch { Rule.Ff7 => BuildUe(stages), Rule.Red3 => BuildRed3(stages), Rule.Northlight => BuildNorthlight(stages), _ => BuildStock(r, stages, meshTier, maxSrvs) };
 
     /// <summary>The stage sets the recording confirmed <see cref="BuildRed3"/> on: VS, VS+PS, VS+HS+DS, VS+HS+DS+PS,
     /// VS+GS+PS, VS+GS+HS+DS, CS.</summary>
@@ -130,6 +134,30 @@ public static unsafe class RootSig
             rows.AddRange([[0, vis, 2, 32, 0, 0, 1], [0, vis, 0, 64, 0, 0, 1], [0, vis, 3, 8, 0, 0, 0], [0, vis, 3, 8, 8, 0, 0]]);
         return new(0x41, rows); // input layout, stream output
     }
+
+    /// <summary>Northlight's root signatures, version 1.0, as Control's renderer (d3d_*.dll) builds them in code: per stage a
+    /// table of 5 CBVs (b4 for VS and PS, b0 for HS and DS), 36 SRVs and 8 UAVs, then a table of 4 samplers per stage, root
+    /// CBVs b0-b3 for VS and PS, a table of 64 samplers in space 1, and a table of 244000 SRVs in space 1 for the PS; input
+    /// layout, GS denied. Compute: the same tables and root CBVs once, all visible to every stage, the SRV table too; no flags.</summary>
+    static Desc BuildNorthlight(IReadOnlyDictionary<Stage, ShaderInfo> stages)
+    {
+        if (stages.ContainsKey(Stage.Compute)) return NorthlightCompute;
+        if (stages.ContainsKey(Stage.Geometry) || stages.Keys.Any(s => s is Stage.Mesh or Stage.Amplification))
+            throw new SerializeException($"Northlight has no root signature for {string.Join('+', stages.Keys)}");
+        static uint[] Table(uint vis, uint cbvBase) => [0, vis, 2, 5, cbvBase, 0, 0, 0, 36, 0, 0, 0, 1, 8, 0, 0, 0];
+        uint[] vps = [Vis(Stage.Vertex), Vis(Stage.Pixel)], hds = [Vis(Stage.Hull), Vis(Stage.Domain)];
+        return new(0x11, [
+            .. vps.Select(v => Table(v, 4)), .. hds.Select(v => Table(v, 0)),
+            .. vps.Concat(hds).Select(v => new uint[] { 0, v, 3, 4, 0, 0, 0 }),
+            .. vps.SelectMany(v => Enumerable.Range(0, 4).Select(b => new uint[] { 2, v, (uint)b, 0, 0 })),
+            [0, 0, 3, 64, 0, 1, 0], [0, Vis(Stage.Pixel), 0, 244000, 0, 1, 0]], AppendRanges: true, Version10: true);
+    }
+
+    /// <summary>Northlight's compute root signature, also its global ray tracing one (<see cref="BuildNorthlight"/>).</summary>
+    public static readonly Desc NorthlightCompute = new(0, [
+        [0, 0, 2, 5, 4, 0, 0, 0, 36, 0, 0, 0, 1, 8, 0, 0, 0], [0, 0, 3, 4, 0, 0, 0],
+        .. Enumerable.Range(0, 4).Select(b => new uint[] { 2, 0, (uint)b, 0, 0 }),
+        [0, 0, 3, 64, 0, 1, 0], [0, 0, 0, 244000, 0, 1, 0]], AppendRanges: true, Version10: true);
 
     static readonly Stage[] Ue4Stages = [Stage.Pixel, Stage.Vertex, Stage.Geometry, Stage.Hull, Stage.Domain];
     static readonly Stage[] Ue5Stages = [Stage.Pixel, Stage.Vertex, Stage.Geometry, Stage.Mesh, Stage.Amplification];
@@ -250,29 +278,31 @@ public static unsafe class RootSig
     }
 
     /// <summary>What a serialized root signature gives each stage: its flags and every register range (visibility, range type
-    /// SRV 0 / UAV 1 / CBV 2 / sampler 3, base, count (uint.MaxValue = unbounded), space), root descriptors and constants as
-    /// one-register ranges, static samplers included.</summary>
-    public sealed record Ranges(uint Flags, (uint Vis, uint Type, uint Base, uint Count, uint Space)[] Slots);
+    /// SRV 0 / UAV 1 / CBV 2 / sampler 3, base, count (uint.MaxValue = unbounded), space, whether it's a descriptor table's
+    /// range), root descriptors and constants as one-register ranges, static samplers included.</summary>
+    public sealed record Ranges(uint Flags, (uint Vis, uint Type, uint Base, uint Count, uint Space, bool Table)[] Slots);
 
     public static Ranges Parse(byte[] blob)
     {
         var b = Rts0(blob);
         uint U(uint o) => BitConverter.ToUInt32(b, (int)o);
-        var (ver, slots) = (U(0), new List<(uint, uint, uint, uint, uint)>());
+        var (ver, slots) = (U(0), new List<(uint, uint, uint, uint, uint, bool)>());
         for (var i = 0u; i < U(4); i++)
         {
             var (type, vis, p) = (U(U(8) + 12 * i), U(U(8) + 12 * i + 4), U(U(8) + 12 * i + 8));
             if (type == 0)
-                for (var r = 0u; r < U(p); r++) { var q = U(p + 4) + (ver >= 2 ? 24u : 20u) * r; slots.Add((vis, U(q), U(q + 8), U(q + 4), U(q + 12))); }
-            else slots.Add((vis, type switch { 3 => 0u, 4 => 1u, _ => 2u }, U(p), 1, U(p + 4))); // 1 constants and 2 CBV: b, 3 SRV, 4 UAV
+                for (var r = 0u; r < U(p); r++) { var q = U(p + 4) + (ver >= 2 ? 24u : 20u) * r; slots.Add((vis, U(q), U(q + 8), U(q + 4), U(q + 12), true)); }
+            else slots.Add((vis, type switch { 3 => 0u, 4 => 1u, _ => 2u }, U(p), 1, U(p + 4), false)); // 1 constants and 2 CBV: b, 3 SRV, 4 UAV
         }
-        for (var s = 0u; s < U(12); s++) { var q = U(16) + SamplerSize(ver) * s; slots.Add((U(q + 48), 3, U(q + 40), 1, U(q + 44))); }
+        for (var s = 0u; s < U(12); s++) { var q = U(16) + SamplerSize(ver) * s; slots.Add((U(q + 48), 3, U(q + 40), 1, U(q + 44), false)); }
         return new Ranges(U(20), [.. slots]);
     }
 
     /// <summary>The first resource a shader declares that the root signature doesn't give its stage (no range of that type and
     /// space visible to it covers the registers, or the stage is denied), as "stage class space"; null = all covered. The D3D12
-    /// runtime rejects such a pipeline (E_INVALIDARG: "root signature doesn't match shader").</summary>
+    /// runtime rejects such a pipeline (E_INVALIDARG: "root signature doesn't match shader"). An unbounded shader range only
+    /// needs a descriptor table range holding its first register (Control's bounded bindless tables: 1333 of 1333 PSOs and
+    /// collections created on WARP); a root descriptor never serves one.</summary>
     public static string? Uncovered(Ranges rs, Stage stage, ShaderInfo sh)
     {
         var deny = stage switch { Stage.Vertex => 0x2u, Stage.Hull => 0x4u, Stage.Domain => 0x8u, Stage.Geometry => 0x10u, Stage.Pixel => 0x20u, Stage.Amplification => 0x100u, Stage.Mesh => 0x200u, _ => 0u };
@@ -282,7 +312,7 @@ public static unsafe class RootSig
             var type = b.Class switch { "srv" => 0u, "uav" => 1u, "cbv" => 2u, "sampler" => 3u, _ => 9u };
             if (type == 9) continue;
             if (!rs.Slots.Any(s => (s.Vis == 0 || s.Vis == Vis(stage)) && s.Type == type && s.Space == (uint)b.Space && s.Base <= (uint)b.Lower
-                    && (s.Count == Unbounded || (b.Count >= 0 && (ulong)b.Lower + (ulong)b.Count <= (ulong)s.Base + s.Count))))
+                    && (s.Count == Unbounded || (b.Count >= 0 ? (ulong)b.Lower + (ulong)b.Count <= (ulong)s.Base + s.Count : s.Table && (ulong)b.Lower < (ulong)s.Base + s.Count))))
                 return $"{stage} {b.Class} space {b.Space}{(b.Count < 0 ? " unbounded" : "")}";
         }
         return null;
@@ -316,10 +346,12 @@ public static unsafe class RootSig
 
     public static byte[] Serialize(Desc d, byte[] samplers)
     {
-        // x64 layouts: D3D12_ROOT_PARAMETER1 = 32 bytes (type @0, union @8, visibility @24), D3D12_DESCRIPTOR_RANGE1 = 6 x u32,
-        // D3D12_VERSIONED_ROOT_SIGNATURE_DESC (1.1) = version @0, NumParameters @8, pParameters @16, NumStaticSamplers @24, pStaticSamplers @32, Flags @40.
+        // x64 layouts: D3D12_ROOT_PARAMETER(1) = 32 bytes (type @0, union @8, visibility @24), D3D12_DESCRIPTOR_RANGE1 = 6 x u32
+        // (1.0: 5, no flags), D3D12_VERSIONED_ROOT_SIGNATURE_DESC = version @0, NumParameters @8, pParameters @16,
+        // NumStaticSamplers @24, pStaticSamplers @32, Flags @40 (the same for 1.0 and 1.1).
         var n = d.Rows.Count;
-        var ranges = new uint[Math.Max(1, d.Rows.Where(r => r[0] == 0).Sum(r => (r.Length - 2) / 5)) * 6];
+        var stride = d.Version10 ? 5 : 6;
+        var ranges = new uint[Math.Max(1, d.Rows.Where(r => r[0] == 0).Sum(r => (r.Length - 2) / 5)) * stride];
         var parms = new byte[Math.Max(1, n) * 32];
         var desc = new byte[48];
         var samp = samplers.Length > 0 ? samplers : new byte[1];
@@ -337,15 +369,15 @@ public static unsafe class RootSig
                     var count = (r.Length - 2) / 5;
                     *(uint*)(p + 8) = (uint)count;
                     *(uint**)(p + 16) = next;
-                    for (var j = 0; j < count; j++, next += 6)
+                    for (var j = 0; j < count; j++, next += stride)
                     {
-                        for (var k = 0; k < 5; k++) next[k] = r[2 + 5 * j + k];
-                        next[5] = count == 1 ? r.Length == 8 ? r[7] : Append : d.AppendRanges ? Append : 0;
+                        for (var k = 0; k < stride - 1; k++) next[k] = r[2 + 5 * j + k];
+                        next[stride - 1] = count == 1 ? r.Length == 8 ? r[7] : Append : d.AppendRanges ? Append : 0;
                     }
                 }
                 else for (var k = 0; k < 3; k++) ((uint*)(p + 8))[k] = r[2 + k];
             }
-            *(uint*)pd = 2; // D3D_ROOT_SIGNATURE_VERSION_1_1
+            *(uint*)pd = d.Version10 ? 1u : 2u; // D3D_ROOT_SIGNATURE_VERSION_1_0 / 1_1
             *(uint*)(pd + 8) = (uint)n;
             *(byte**)(pd + 16) = pp;
             *(uint*)(pd + 24) = (uint)(samplers.Length / 52);

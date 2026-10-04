@@ -31,7 +31,7 @@ public partial class AppTests : IDisposable
         Directory.CreateDirectory(Path.Combine(install, "Engine", "Binaries", "Win64"));
         File.WriteAllBytes(Path.Combine(install, "Engine", "Binaries", "Win64", "CrashReportClient.exe"), new byte[8192]);
         File.WriteAllBytes(Path.Combine(install, "Fake.exe"), new byte[100]);   // launcher stub
-        _game = new Game("test:fake", "Fake Game", Store.Other, install, Core.Games.GameFiles.FindExe(install)!);
+        _game = new Game("test:fake-" + Guid.NewGuid().ToString("N")[..8], "Fake Game", Store.Other, install, Core.Games.GameFiles.FindExe(install)!);
         _proxy = Path.Combine(_root, "tools", "d3d12.dll");
         Directory.CreateDirectory(Path.GetDirectoryName(_proxy)!);
         File.WriteAllBytes(_proxy, [.. "MZ fake proxy SCSKiller_StartWarm "u8, .. Guid.NewGuid().ToByteArray()]);
@@ -56,8 +56,21 @@ public partial class AppTests : IDisposable
         {
             LocalAppData = _root, MyGames = Path.Combine(_root, "My Games"), ProgramData = Path.Combine(_root, "ProgramData"),   // never the real D3DSCache or Saved folders
             Adapters = () => [Listed(v.Gpu)],   // DXGI lists the vendor's adapter, its version as the user-mode one
+            Processes = Ours, ProcessNames = OurNames,
         };
     }
+
+    /// <summary>The PC's processes this test run started: another run on the PC (CI, a teammate's) runs the same fake game
+    /// exe names and selftest.exe, which would count as this test's game running.</summary>
+    static List<(int Pid, int Parent, string Exe)> Ours(bool fresh)
+    {
+        var ours = Core.Warming.ProcessTree.WithDescendants(Environment.ProcessId).ToHashSet();
+        return (fresh ? Core.Warming.ProcessTree.Snapshot() : Core.Warming.ProcessTree.RecentSnapshot()).Where(p => ours.Contains(p.Pid)).ToList();
+    }
+
+    static bool OurOthersRun(OfflineSession s) => ScsKiller.OthersRun(s, Ours(true));
+
+    static IReadOnlySet<string> OurNames() => Ours(true).Select(p => Path.GetFileNameWithoutExtension(p.Exe)).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     async Task<ScsKiller> Warmed(Game? game = null)
     {
@@ -1023,12 +1036,12 @@ public partial class AppTests : IDisposable
         Assert.False(File.Exists(Path.Combine(dir, ScsKiller.ArmedFile)));
     }
 
-    /// <summary>An HDR mod that blocks recording, found by a scan with no install watcher (as the command line scans) while
+    /// <summary>An HDR mod that blocks recording (ReShade with it in the install root), found by a scan with no install watcher (as the command line scans) while
     /// the proxy is held open: the removal waits, but the game is disarmed at once (its ledger entry revoked).</summary>
     [Fact]
     public async Task A_blocking_hdr_mod_disarms_even_when_the_recorder_cant_come_out_yet()
     {
-        File.WriteAllBytes(Path.Combine(_exeDir, "dxgi.dll"), ReShadeDll);
+        File.WriteAllBytes(Path.Combine(_game.InstallDir, "dxgi.dll"), ReShadeDll);
         var dll = Path.Combine(_exeDir, "d3d12.dll");
         var k = Killer(new FakeReader(Unreal));
         k.ProcessNames = () => new HashSet<string>();
@@ -1037,7 +1050,7 @@ public partial class AppTests : IDisposable
         var ledger = ScsKiller.LedgerFile(_game.ExePath);
         Assert.True(File.Exists(ledger));
         k.StopWatchingInstalls();
-        File.WriteAllBytes(Path.Combine(_exeDir, "renodx-ff7rebirth.addon64"), RenoDxAddon);
+        File.WriteAllBytes(Path.Combine(_game.InstallDir, "renodx-ff7rebirth.addon64"), RenoDxAddon);
         using (new FileStream(dll, FileMode.Open, FileAccess.Read, FileShare.None))
         {
             Assert.True((await k.ScanAsync(default)).Single().ShaderModBlocks);
@@ -1510,7 +1523,7 @@ public partial class AppTests : IDisposable
         try
         {
             // at once: the cached snapshot, taken just before the launch, would miss it
-            ScsKiller.RemoveAllRecorders(k.Store, new HashSet<string>());
+            ScsKiller.RemoveAllRecorders(k.Store, OurNames());
             Assert.True(ScsKiller.IsOurProxy(dll));
         }
         finally
@@ -1536,7 +1549,7 @@ public partial class AppTests : IDisposable
             using (Recordings.Lock(Path.Combine(k.Store.GameDir(_game.Id), "recording.db"))) { held.Set(); release.Wait(); }
         }, TaskCreationOptions.LongRunning);
         held.Wait();
-        var hook = Task.Factory.StartNew(() => ScsKiller.RemoveAllRecorders(k.Store, new HashSet<string>(), TimeSpan.FromSeconds(15)),
+        var hook = Task.Factory.StartNew(() => ScsKiller.RemoveAllRecorders(k.Store, OurNames, TimeSpan.FromSeconds(15)),
             TaskCreationOptions.LongRunning);
         await Until(() => !File.Exists(Path.Combine(_exeDir, "d3d12.dll")));   // the recorder is out; its data waits for the merge
         var launched = Path.Combine(_exeDir, "Launched.exe");
@@ -1582,7 +1595,7 @@ public partial class AppTests : IDisposable
             Assert.True(k.IsPlaying(_game.Id));
             Assert.Throws<InvalidOperationException>(() => k.InstallRecorder(_game.Id));
             Assert.False(File.Exists(dll));
-            ScsKiller.RemoveAllRecorders(k.Store, new HashSet<string>());   // SCSKiller's uninstall: by name the game isn't running
+            ScsKiller.RemoveAllRecorders(k.Store, OurNames());   // SCSKiller's uninstall: by name the game isn't running
             Assert.True(ScsKiller.IsOurProxy(Path.Combine(other.InstallDir, "d3d12.dll")));
             Assert.Contains("is running: recorder left in", RecordersLog());
         }
@@ -2083,7 +2096,8 @@ public partial class AppTests : IDisposable
     {
         File.WriteAllBytes(Path.Combine(_game.InstallDir, "dxgi.dll"), ReShadeDll);
         File.WriteAllBytes(Path.Combine(_game.InstallDir, "renodx-unrealengine.addon64"), RenoDxAddon);
-        Assert.Equal(AddonKind.LayoutInjecting, Core.Games.ReShade.Detect(_game)!.ShaderMod!.Kind);
+        var r = Core.Games.ReShade.Detect(_game)!;
+        Assert.Equal((AddonKind.LayoutInjecting, false, true, null), (r.ShaderMod!.Kind, r.Layered, r.Blocks, r.Fingerprint));
     }
 
     [Fact]
@@ -2101,29 +2115,106 @@ public partial class AppTests : IDisposable
         Assert.Null(Kind("Luma-Game.addon"));
     }
 
-    /// <summary>A listed injecting RenoDX add-on next to ReShade: the game isn't compiled, its recorder comes out at once,
-    /// with or without the app's reconcile, and the block lifts when the add-on goes. Plain ReShade with an add-on that
-    /// leaves the pipelines alone, or a RenoDX add-on that only replaces shaders, blocks nothing.</summary>
+    /// <summary>RenoDX next to ReShade, adding to the game's root signatures: the game still compiles and records. The
+    /// compile runs through a copy of the layer in its work folder (ReShade as dxgi.dll, the add-ons that change pipelines,
+    /// ReShade.ini without the keys that point it elsewhere), and the warm remembers it: the add-on changing or going makes
+    /// the game Stale. ReShade as d3d12.dll is copied the same way; the game page says the recorder needs chaining then.</summary>
     [Fact]
-    public async Task A_shader_mod_that_adds_to_root_signatures_blocks_compiling_and_recording_until_it_is_removed()
+    public async Task A_shader_mod_compiles_through_a_copy_of_the_layer_and_a_change_to_it_makes_the_warm_stale()
     {
         File.WriteAllBytes(Path.Combine(_exeDir, "dxgi.dll"), ReShadeDll);
-        File.WriteAllBytes(Path.Combine(_exeDir, "renodx-dlss5.addon64"), DlssAddon);
+        Directory.CreateDirectory(Path.Combine(_exeDir, "addons"));   // ReShade.ini's AddonPath: the add-ons are there
+        File.WriteAllBytes(Path.Combine(_exeDir, "addons", "renodx-dlss5.addon64"), DlssAddon);
+        var addon = Path.Combine(_exeDir, "addons", "renodx-ff7rebirth.addon64");
+        File.WriteAllBytes(addon, RenoDxAddon);
+        File.WriteAllLines(Path.Combine(_exeDir, "ReShade.ini"), ["[ADDON]", "AddonPath=addons", "DisabledAddons=", "[INSTALL]", @"BasePath=C:\elsewhere", "[RenoDX]", "ToneMapType=3"]);
         var k = Killer(new FakeReader(Unreal));
         k.ProcessNames = () => new HashSet<string>();
         await k.ScanAsync(default);
-        Assert.Equal((GameStatus.Ready, null, null), (k.Games.Single().Status, k.Games.Single().ShaderMod, k.Games.Single().RecorderSkip));
+        var s = k.Games.Single();
+        Assert.Equal((GameStatus.Ready, "RenoDX", false, null), (s.Status, s.ShaderMod, s.ShaderModAsD3D12, s.RecorderSkip));
+        Assert.Contains("compiles run through a copy of ReShade and RenoDX", ScsKiller.ShaderModNote(s));
+        k.ReconcileRecorders();
+        Assert.True(ScsKiller.IsOurProxy(Path.Combine(_exeDir, "d3d12.dll")));   // the recorder records under ReShade
+
+        var work = Path.Combine(_root, "layer-work");
+        var (dir, fingerprint) = k.LayerFor(_game, work)!.Value;
+        Assert.Equal(Path.Combine(work, "layer"), dir);
+        Assert.Equal(["ReShade.ini", "dxgi.dll", "renodx-ff7rebirth.addon64"], Directory.GetFiles(dir).Select(Path.GetFileName).Order(StringComparer.Ordinal));
+        Assert.Equal(ReShadeDll, File.ReadAllBytes(Path.Combine(dir, "dxgi.dll")));
+        Assert.Equal(["[ADDON]", "DisabledAddons=", "[INSTALL]", "[RenoDX]", "ToneMapType=3"], File.ReadAllLines(Path.Combine(dir, "ReShade.ini")));
+
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
+        Assert.Equal(fingerprint, k.Store.LoadGame(_game.Id).WarmedLayer);
+
+        File.WriteAllBytes(addon, [.. RenoDxAddon, .. "a newer build"u8]);
+        await k.ScanAsync(default);
+        Assert.Equal((GameStatus.Stale, "the HDR mod changed since the compile"), (k.Games.Single().Status, k.Games.Single().StatusReason));
+        File.Delete(addon);
+        await k.ScanAsync(default);
+        Assert.Equal((GameStatus.Stale, "the HDR mod the last compile ran through is gone", null), (k.Games.Single().Status, k.Games.Single().StatusReason, k.Games.Single().ShaderMod));
+
+        File.WriteAllBytes(addon, RenoDxAddon);
+        File.Move(Path.Combine(_exeDir, "dxgi.dll"), Path.Combine(_exeDir, "ReShade64.dll"));
+        await k.ScanAsync(default);
+        Assert.Equal((false, true, GameStatus.Unsupported), (k.Games.Single().ShaderModAsD3D12, k.Games.Single().ShaderModBlocks, k.Games.Single().Status));
+        k.ReconcileRecorders();
+        File.Delete(Path.Combine(_exeDir, "d3d12.dll"));
+        File.Move(Path.Combine(_exeDir, "ReShade64.dll"), Path.Combine(_exeDir, "d3d12.dll"));
+        await k.ScanAsync(default);
+        s = k.Games.Single();
+        Assert.Equal(("RenoDX", true, ScsKiller.SkipForeignDll), (s.ShaderMod, s.ShaderModAsD3D12, s.RecorderSkip));
+        Assert.Contains("Record alongside ReShade", ScsKiller.ShaderModNote(s));
+        Assert.Equal(ReShadeDll, File.ReadAllBytes(Path.Combine(k.LayerFor(_game, work)!.Value.Dir, "dxgi.dll")));
+    }
+
+    /// <summary>A compile that waited for the game to exit copies the layer as its warm starts: the mod may have come with it.</summary>
+    [Fact]
+    public async Task A_shader_mod_installed_while_a_compile_waits_goes_into_the_warm()
+    {
+        var warmer = new ControlledWarmer();
+        var k = Killer(new FakeReader(Unreal), warmer: warmer);
+        var running = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Fake-Win64-Shipping.exe" };
+        k.RunningGameExes = () => { lock (running) return running.ToHashSet(StringComparer.OrdinalIgnoreCase); };
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await Until(() => k.Queue.Single().Stage == QueueStage.Paused);
+        File.WriteAllBytes(Path.Combine(_exeDir, "dxgi.dll"), ReShadeDll);
+        File.WriteAllBytes(Path.Combine(_exeDir, "renodx-ff7rebirth.addon64"), RenoDxAddon);
+        lock (running) running.Clear();
+        await Until(() => warmer.Started.Count == 1);
+        Assert.True(File.Exists(Path.Combine(k.Store.GameDir(_game.Id), "work", "layer", "renodx-ff7rebirth.addon64")));
+        warmer.Run!.Finish();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    /// <summary>ReShade only in the install root above the exe: the game may not load it, so no copy of it goes into a
+    /// compile. A RenoDX add-on there that adds to every root signature blocks the game: not compiled, its recorder out at
+    /// once without the app's reconcile, until the add-on goes. One that replaces some shaders only adds a note.</summary>
+    [Fact]
+    public async Task A_shader_mod_only_in_the_install_root_blocks_compiling_and_recording_until_it_is_removed()
+    {
+        File.WriteAllBytes(Path.Combine(_game.InstallDir, "dxgi.dll"), ReShadeDll);
+        var k = Killer(new FakeReader(Unreal));
+        k.ProcessNames = () => new HashSet<string>();
+        await k.ScanAsync(default);
         k.ReconcileRecorders();
         Assert.True(ScsKiller.IsOurProxy(Path.Combine(_exeDir, "d3d12.dll")));
 
-        var addon = Path.Combine(_exeDir, "renodx-hitmanwoa.addon64");
+        var addon = Path.Combine(_game.InstallDir, "renodx-hitmanwoa.addon64");
         File.WriteAllBytes(addon, RenoDxAddon);
         await k.ScanAsync(default);
         var s = k.Games.Single();
-        Assert.Equal((GameStatus.Ready, "RenoDX", false, null), (s.Status, s.ShaderMod, s.ShaderModBlocks, s.RecorderSkip));
+        Assert.Equal((GameStatus.Ready, "RenoDX", false, false, null), (s.Status, s.ShaderMod, s.ShaderModBlocks, s.ShaderModLayer, s.RecorderSkip));
+        Assert.Equal("RenoDX replaces some shaders: those few pipelines aren't precompiled", ScsKiller.ShaderModNote(s));
+        Assert.Null(k.LayerFor(_game, Path.Combine(_root, "layer-work")));
         File.Delete(addon);
 
-        addon = Path.Combine(_exeDir, "renodx-ff7rebirth.addon64");
+        addon = Path.Combine(_game.InstallDir, "renodx-ff7rebirth.addon64");
         File.WriteAllBytes(addon, RenoDxAddon);
         await k.ScanAsync(default);   // no reconcile, as the command line scans
         s = k.Games.Single();
@@ -2132,7 +2223,6 @@ public partial class AppTests : IDisposable
         Assert.Equal("RenoDX changes all its pipelines", Format.ShortNote(s));
         Assert.False(s.RecorderInstalled);   // the state the removal left
         Assert.False(File.Exists(Path.Combine(_exeDir, "d3d12.dll")));
-        Assert.Equal(ReShadeDll, File.ReadAllBytes(Path.Combine(_exeDir, "dxgi.dll")));
 
         k.Enqueue(_game.Id);
         k.StartQueue();
@@ -2145,9 +2235,9 @@ public partial class AppTests : IDisposable
         Assert.Equal((GameStatus.Ready, null, null), (k.Games.Single().Status, k.Games.Single().ShaderMod, k.Games.Single().RecorderSkip));
     }
 
-    /// <summary>A compile that waited for the game to exit checks again before its warm starts: the mod may have come with it.</summary>
+    /// <summary>A compile that waited for the game to exit checks again before its warm starts: a blocking mod may have come.</summary>
     [Fact]
-    public async Task A_shader_mod_installed_while_a_compile_waits_stops_it_before_the_warm()
+    public async Task A_blocking_shader_mod_installed_while_a_compile_waits_stops_it_before_the_warm()
     {
         var warmer = new ControlledWarmer();
         var k = Killer(new FakeReader(Unreal), warmer: warmer);
@@ -2157,8 +2247,8 @@ public partial class AppTests : IDisposable
         k.Enqueue(_game.Id);
         k.StartQueue();
         await Until(() => k.Queue.Single().Stage == QueueStage.Paused);
-        File.WriteAllBytes(Path.Combine(_exeDir, "dxgi.dll"), ReShadeDll);
-        File.WriteAllBytes(Path.Combine(_exeDir, "renodx-ff7rebirth.addon64"), RenoDxAddon);
+        File.WriteAllBytes(Path.Combine(_game.InstallDir, "dxgi.dll"), ReShadeDll);
+        File.WriteAllBytes(Path.Combine(_game.InstallDir, "renodx-ff7rebirth.addon64"), RenoDxAddon);
         lock (running) running.Clear();
         await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Empty(warmer.Started);
@@ -2487,6 +2577,50 @@ public partial class AppTests : IDisposable
         Assert.All(ps, h => Assert.Contains(h, blobs));
     }
 
+    /// <summary>The proxy under a layer that isn't a d3d12.dll (ReShade as dxgi.dll with a RenoDX addon), on WARP: fakenext
+    /// hands out a wrapper from the system D3D12CreateDevice that adds a root constant to every root signature. The real
+    /// device is found through IID_UnwrappedObject, or without it through a root signature's device. The game's compute PSO
+    /// is recorded with the game's root signature and again as the driver got it, with the layer's; a 'W' pairs the two, and
+    /// another names the layer's own create (zero for what the game asked).</summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("old")]
+    public void The_proxy_records_under_a_layer_what_the_driver_gets(string mode)
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root != null && !File.Exists(Path.Combine(root.FullName, "SCSKiller.slnx"))) root = root.Parent;
+        var bin = root == null ? null : Path.Combine(root.FullName, "proxy", "build", "Release");
+        if (bin == null || !File.Exists(Path.Combine(bin, "fakenext.dll"))) return;   // this checkout's proxy isn't built
+        var dir = Path.Combine(_root, "layer");
+        Directory.CreateDirectory(dir);
+        foreach (var f in new[] { "selftest.exe", "d3d12.dll", "fakenext.dll" }) File.Copy(Path.Combine(bin, f), Path.Combine(dir, f));
+        File.WriteAllText(Path.Combine(dir, "scskiller.ini"), "[scskiller]\r\nmode=record\r\n");
+        using (var p = Process.Start(new ProcessStartInfo(Path.Combine(dir, "selftest.exe"), $"layer {Environment.TickCount % 100000} {mode}") { RedirectStandardOutput = true })!)
+        {
+            var o = p.StandardOutput.ReadToEnd();
+            p.WaitForExit();
+            Assert.Equal(0, p.ExitCode);
+            Assert.Contains("created 0x00000000", o);
+            Assert.Contains("own 0x00000000", o);
+        }
+        Assert.Contains("under the layer's", File.ReadAllText(Path.Combine(dir, "scskiller.log")));
+
+        var db = PsoDb.Read(Path.Combine(dir, "scskiller.db")).ToList();
+        var cs = db.Where(r => r.Tag == 'C').ToDictionary(r => r.Key);
+        Assert.Equal(3, cs.Count);
+        var changed = db.Where(r => r.Tag == 'W').Select(r => (Driver: Convert.ToHexStringLower(r.Payload.AsSpan(0, 20)), Asked: Convert.ToHexStringLower(r.Payload.AsSpan(20)))).ToList();
+        Assert.Equal(2, changed.Count);
+        var (driver, asked) = changed.Single(w => w.Asked != PsoDb.Zero);
+        var game = PsoDb.Parse(cs[asked]);
+        var got = PsoDb.Parse(cs[driver]);
+        Assert.NotEqual(game.Rs, got.Rs);
+        Assert.Equal(game.Stages, got.Stages);
+        var own = changed.Single(w => w.Asked == PsoDb.Zero).Driver;
+        Assert.Equal(got.Rs, PsoDb.Parse(cs[own]).Rs);
+        var rs = db.Where(r => r.Tag == 'B').ToDictionary(r => Convert.ToHexStringLower(r.Payload.AsSpan(0, 20)), r => r.Payload.Length - 20);
+        Assert.True(rs[got.Rs] > rs[game.Rs]);   // the root constant the layer added
+    }
+
     /// <summary>The proxy's frame times on WARP (`selftest frames`): each present of a swap chain made by the hooked DXGI factory
     /// is one frame, with an overlay that hooked Present / Present1 before the proxy did, a present nested in another, and a
     /// second overlay that hooked them after the proxy did before another swap chain of that vtable was made; a
@@ -2701,14 +2835,30 @@ public partial class AppTests : IDisposable
         Assert.Equal(0, Launch());
     }
 
+    static string ProxySource() => File.ReadAllText(Path.Combine(TestEnv.RepoRoot, "proxy", "proxy.cpp"));
+
+    static IEnumerable<string> ProxyMarkers(string src)
+    {
+        var list = System.Text.RegularExpressions.Regex.Match(src, @"kAntiCheatMarkers\[\] = \{(.*?)\};", System.Text.RegularExpressions.RegexOptions.Singleline).Groups[1].Value;
+        return System.Text.RegularExpressions.Regex.Matches(list, "L\"([^\"]+)\"").Select(m => m.Groups[1].Value);
+    }
+
     /// <summary>The proxy's own marker list is the app's.</summary>
     [Fact]
-    public void The_proxy_knows_the_apps_anti_cheat_markers()
+    public void The_proxy_knows_the_apps_anti_cheat_markers() => Assert.Equal(SCSKiller.Core.Games.GameFiles.MarkerNames, ProxyMarkers(ProxySource()));
+
+    /// <summary>The proxy's offline admission drops the first kEasyAntiCheatMarkers names of its list by position: they must
+    /// be EasyAntiCheat's, all of them and nothing else, in both lists.</summary>
+    [Fact]
+    public void An_offline_session_drops_exactly_EasyAntiCheats_markers()
     {
-        var src = File.ReadAllText(Path.Combine(TestEnv.RepoRoot, "proxy", "proxy.cpp"));
-        var list = System.Text.RegularExpressions.Regex.Match(src, @"kAntiCheatMarkers\[\] = \{(.*?)\};", System.Text.RegularExpressions.RegexOptions.Singleline).Groups[1].Value;
-        var names = System.Text.RegularExpressions.Regex.Matches(list, "L\"([^\"]+)\"").Select(m => m.Groups[1].Value);
-        Assert.Equal(SCSKiller.Core.Games.GameFiles.MarkerNames, names);
+        string[] eac = ["EasyAntiCheat", "EasyAntiCheat_EOS", "start_protected_game.exe", "EasyAntiCheat_EOS_Setup.exe", "EasyAntiCheat_Setup.exe"];
+        var src = ProxySource();
+        var n = int.Parse(System.Text.RegularExpressions.Regex.Match(src, @"kEasyAntiCheatMarkers = (\d+);").Groups[1].Value);
+        var markers = SCSKiller.Core.Games.GameFiles.Markers;
+        Assert.Equal(eac, markers.Where(m => m.Kind == AntiCheat.EasyAntiCheat).Select(m => m.Name));
+        Assert.Equal(eac, markers.Take(n).Select(m => m.Name));
+        Assert.Equal(eac, ProxyMarkers(src).Take(n));
     }
 
     /// <summary>An update puts anti-cheat deep in a recorder game's install: the install watcher's event disarms the recorder
@@ -3756,6 +3906,61 @@ public partial class AppTests : IDisposable
     }
 
     [Fact]
+    public async Task A_program_elsewhere_named_like_an_exe_of_the_game_folder_is_not_the_game_running()
+    {
+        // Gaijin's agent ships in War Thunder's root and runs all the time from its own folder
+        var g = FakeGame("test:agent", "Agent");
+        File.WriteAllBytes(Path.Combine(g.InstallDir, "gjagent.exe"), new byte[64]);
+        string? path = Path.Combine(_root, "NetAgent", "gjagent.exe");
+        var k = RecordKiller([g], running: () => new HashSet<string> { "gjagent" });
+        k.RunningGameExes = () => new HashSet<string>();
+        k.Processes = _ => [(4242, 1, "gjagent.exe")];
+        k.ProcessPath = _ => path;
+        await k.ScanAsync(default);
+        k.PollGames();
+        Assert.False(k.IsPlaying(g.Id));
+        k.InstallRecorder(g.Id);   // a write guard: not running either
+        Assert.True(ScsKiller.IsOurProxy(Dll(g)));
+        k.UninstallRecorder(g.Id);
+
+        foreach (var where in new[] { Path.Combine(g.InstallDir, "gjagent.exe"), null })   // from the folder, or a path it can't tell
+        {
+            path = where;
+            k.PollGames();
+            Assert.True(k.IsPlaying(g.Id));
+            for (int i = 0; i < ScsKiller.ExitPolls; i++) { k.Processes = _ => []; k.PollGames(); }
+            Assert.False(k.IsPlaying(g.Id));
+            k.Processes = _ => [(4242, 1, "gjagent.exe")];
+            Assert.Throws<InvalidOperationException>(() => k.InstallRecorder(g.Id));
+        }
+    }
+
+    [Fact]
+    public async Task A_process_in_a_junctioned_game_folder_is_the_game_running()
+    {
+        // the library is reached through a junction: the process's image path is the junction's target
+        var real = Path.Combine(_root, "Real", "Junctioned");
+        Directory.CreateDirectory(real);
+        File.WriteAllBytes(Path.Combine(real, "Junctioned.exe"), new byte[64]);
+        File.WriteAllBytes(Path.Combine(real, "Started.exe"), new byte[64]);
+        var link = Path.Combine(_root, "Junctioned");
+        using (var mk = Process.Start(new ProcessStartInfo("cmd.exe", $"/c mklink /J \"{link}\" \"{real}\"") { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!)
+            mk.WaitForExit();
+        var g = new Game("test:junctioned", "Junctioned", Store.Other, link, Path.Combine(link, "Junctioned.exe"));
+        var k = RecordKiller([g], running: () => new HashSet<string> { "Started" });
+        k.RunningGameExes = () => new HashSet<string>();
+        k.Processes = _ => [(4242, 1, "Started.exe")];
+        k.ProcessPath = _ => Path.Combine(real, "Started.exe");
+        await k.ScanAsync(default);
+        k.PollGames();
+        Assert.True(k.IsPlaying(g.Id));
+        for (int i = 0; i < ScsKiller.ExitPolls; i++) { k.Processes = _ => []; k.PollGames(); }
+        k.Processes = _ => [(4242, 1, "Started.exe")];
+        Assert.Throws<InvalidOperationException>(() => k.InstallRecorder(g.Id));
+        Directory.Delete(link);
+    }
+
+    [Fact]
     public async Task The_watcher_installs_a_waiting_recorder_when_the_game_exits()
     {
         var g = FakeGame("test:watched", "Watched");
@@ -3775,6 +3980,191 @@ public partial class AppTests : IDisposable
         Assert.True(ScsKiller.IsOurProxy(Dll(g)));
         Assert.Null(k.Games.Single().RecorderNote);
         Assert.True(k.Games.Single().RecorderInstalled);
+    }
+
+    [Fact]
+    public async Task The_watcher_follows_the_exe_a_game_runs_and_moves_the_recorder_there_after_it_exits()
+    {
+        // discovery took the patcher's copy (Stellar Blade's PatchData): the recorder went next to an exe that never runs
+        var root = Path.Combine(_root, "StellarBlade");
+        string Exe(string dir) => Path.Combine(root, dir, "SB", "Binaries", "Win64", "SB-Win64-Shipping.exe");
+        var (copy, real) = (Exe("PatchData"), Exe(""));
+        foreach (var f in new[] { copy, real }) { Directory.CreateDirectory(Path.GetDirectoryName(f)!); File.WriteAllBytes(f, new byte[64]); }
+        var game = new Game("steam:3489700", "Stellar Blade", Store.Steam, root, copy, "1");
+        var playing = false;
+        var k = RecordKiller([game], running: () => playing ? new HashSet<string> { "SB-Win64-Shipping" } : new HashSet<string>());
+        k.ManageRecorders = true;
+        await k.ScanAsync(default);
+        var (copyDll, realDll) = (Path.Combine(Path.GetDirectoryName(copy)!, "d3d12.dll"), Path.Combine(Path.GetDirectoryName(real)!, "d3d12.dll"));
+        Assert.True(ScsKiller.IsOurProxy(copyDll));
+
+        k.RunningGameExes = () => playing ? new HashSet<string> { "SB-Win64-Shipping.exe" } : new HashSet<string>();
+        k.Processes = _ => playing ? [(4242, 1, "SB-Win64-Shipping.exe")] : [];
+        k.ProcessPath = pid => pid == 4242 ? real : null;
+        playing = true;
+        k.PollGames();
+        Assert.True(k.IsPlaying(game.Id));
+        Assert.Equal(real, k.Store.LoadGame(game.Id).RunsExe);
+        Assert.True(ScsKiller.IsOurProxy(copyDll));   // nothing touched while it runs
+        Assert.False(File.Exists(realDll));
+
+        playing = false;
+        for (int i = 0; i < ScsKiller.ExitPolls; i++) k.PollGames();
+        Assert.Equal(real, k.Games.Single().Game.ExePath);
+        Assert.False(File.Exists(copyDll));
+        Assert.True(ScsKiller.IsOurProxy(realDll));
+        Assert.Equal(real, k.Store.LoadGame(game.Id).RecorderExe);
+        Assert.Equal(real, (await k.ScanAsync(default)).Single().Game.ExePath);   // discovery still names the copy: the record wins
+    }
+
+    [Fact]
+    public async Task The_watcher_follows_no_exe_outside_the_install_nor_of_an_anti_cheat_game()
+    {
+        var g = FakeGame("test:followed", "Followed");
+        var other = Path.Combine(_root, "Elsewhere", "Followed.exe");
+        Directory.CreateDirectory(Path.GetDirectoryName(other)!);
+        File.WriteAllBytes(other, new byte[64]);
+        var k = RecordKiller([g]);
+        await k.ScanAsync(default);
+        k.RunningGameExes = () => new HashSet<string> { "Followed.exe" };
+        k.Processes = _ => [(4242, 1, "Followed.exe")];
+        k.ProcessPath = _ => other;   // a copy outside the install (another install, a staged warm)
+        k.PollGames();
+        Assert.True(k.IsPlaying(g.Id));
+        Assert.Null(k.Store.LoadGame(g.Id).RunsExe);
+
+        var ac = FakeGame("test:protected", "Protected");
+        File.WriteAllBytes(Path.Combine(ac.InstallDir, "BEService_x64.exe"), [0]);
+        var inside = Path.Combine(ac.InstallDir, "bin", "Protected.exe");
+        Directory.CreateDirectory(Path.GetDirectoryName(inside)!);
+        File.WriteAllBytes(inside, new byte[64]);
+        var opened = 0;
+        k = RecordKiller([ac]);
+        await k.ScanAsync(default);
+        k.RunningGameExes = () => new HashSet<string> { "Protected.exe" };
+        k.Processes = _ => [(4243, 1, "Protected.exe")];
+        k.ProcessPath = _ => { opened++; return inside; };
+        k.PollGames();
+        Assert.True(k.IsPlaying(ac.Id));
+        Assert.Equal(0, opened);   // no anti-cheat game's process is opened
+        Assert.Null(k.Store.LoadGame(ac.Id).RunsExe);
+    }
+
+    [Fact]
+    public async Task A_protected_game_sharing_the_exe_name_is_never_followed_into()
+    {
+        var clean = FakeGame("test:clean", "Game", "clean");
+        var guarded = FakeGame("test:guarded", "Game", "guarded");
+        File.WriteAllBytes(Path.Combine(guarded.InstallDir, "BEService_x64.exe"), [0]);
+        var k = RecordKiller([clean, guarded]);
+        await k.ScanAsync(default);
+        var asked = new List<int>();
+        k.RunningGameExes = () => new HashSet<string> { "Game.exe" };
+        k.Processes = _ => [(4243, 1, "Game.exe")];   // the protected one runs: both are marked playing
+        k.ProcessPath = pid => { asked.Add(pid); return guarded.ExePath; };
+        k.PollGames();
+        Assert.True(k.IsPlaying(clean.Id) && k.IsPlaying(guarded.Id));
+        Assert.Null(k.Store.LoadGame(clean.Id).RunsExe);   // a process outside its install
+        Assert.Null(k.Store.LoadGame(guarded.Id).RunsExe);
+        Assert.Equal([4243], asked);   // asked once, for the clean game: a path from the process list, the process isn't opened
+    }
+
+    [Fact]
+    public async Task Anti_cheat_added_since_the_scan_stops_the_watcher_from_following()
+    {
+        var g = FakeGame("test:patched", "Patched");
+        var inside = Path.Combine(g.InstallDir, "bin", "Patched.exe");
+        Directory.CreateDirectory(Path.GetDirectoryName(inside)!);
+        File.WriteAllBytes(inside, new byte[64]);
+        var k = RecordKiller([g]);
+        await k.ScanAsync(default);
+        Assert.Equal(AntiCheat.None, k.Games.Single().AntiCheat);   // the cached verdict
+        File.WriteAllBytes(Path.Combine(g.InstallDir, "BEService_x64.exe"), [0]);   // an update added it
+        var asked = 0;
+        k.RunningGameExes = () => new HashSet<string> { "Patched.exe" };
+        k.Processes = _ => [(4244, 1, "Patched.exe")];
+        k.ProcessPath = _ => { asked++; return inside; };
+        k.PollGames();
+        Assert.Equal(0, asked);
+        Assert.Null(k.Store.LoadGame(g.Id).RunsExe);
+    }
+
+    [Theory]
+    [InlineData("version")]
+    [InlineData("discovery")]
+    [InlineData("gone")]
+    public async Task A_followed_exe_is_dropped_when_the_game_changes(string change)
+    {
+        var g = FakeGame("test:moved", "Moved") with { Version = "1" };
+        var inside = Path.Combine(g.InstallDir, "bin", "Moved.exe");
+        Directory.CreateDirectory(Path.GetDirectoryName(inside)!);
+        File.WriteAllBytes(inside, new byte[64]);
+        var source = new FakeSource([g]);
+        var k = Killer(new FakeReader(Unreal), source: source);
+        await k.ScanAsync(default);
+        var playing = true;
+        k.RunningGameExes = () => playing ? new HashSet<string> { "Moved.exe" } : new HashSet<string>();
+        k.Processes = _ => playing ? [(4245, 1, "Moved.exe")] : [];
+        k.ProcessPath = _ => inside;
+        k.PollGames();
+        playing = false;
+        for (int i = 0; i < ScsKiller.ExitPolls; i++) k.PollGames();
+        Assert.Equal(inside, (await k.ScanAsync(default)).Single().Game.ExePath);
+
+        var other = Path.Combine(g.InstallDir, "Other.exe");
+        File.WriteAllBytes(other, new byte[64]);
+        switch (change)
+        {
+            case "version": source.Games = [g with { Version = "2" }]; break;   // an update may have moved the launch target
+            case "discovery": source.Games = [g with { ExePath = other }]; break;
+            default: File.Delete(inside); break;
+        }
+        var now = (await k.ScanAsync(default)).Single().Game;
+        Assert.Equal(source.Games[0].ExePath, now.ExePath);
+        Assert.Null(k.Store.LoadGame(g.Id).RunsExe);
+    }
+
+    [Fact]
+    public void A_process_path_is_read_without_opening_it_and_mapped_to_its_drive()
+    {
+        Assert.Equal(Environment.ProcessPath, Core.Warming.ProcessTree.ImagePath(Environment.ProcessId), StringComparer.OrdinalIgnoreCase);
+        (string, string)[] devices = [("C:", @"\Device\HarddiskVolume3"), ("D:", @"\Device\HarddiskVolume30")];
+        Assert.Equal(@"D:\Games\a.exe", Core.Warming.ProcessTree.DosPath(@"\Device\HarddiskVolume30\Games\a.exe", devices));
+        Assert.Equal(@"C:\a.exe", Core.Warming.ProcessTree.DosPath(@"\Device\HarddiskVolume3\a.exe", devices));
+        Assert.Null(Core.Warming.ProcessTree.DosPath(@"\Device\Mup\server\a.exe", devices));
+    }
+
+    [Fact]
+    public async Task A_game_the_user_added_follows_the_exe_it_runs_only_once_its_folder_is_confirmed()
+    {
+        var root = Path.Combine(_root, "Hand");
+        var (picked, runs) = (Path.Combine(root, "Hand.exe"), Path.Combine(root, "bin", "Hand.exe"));
+        foreach (var f in new[] { picked, runs }) { Directory.CreateDirectory(Path.GetDirectoryName(f)!); File.WriteAllBytes(f, new byte[64]); }
+        var manual = Manual();
+        manual.Add(new Core.Games.ManualEntry(picked, root, "Hand"));
+        var playing = true;
+        ScsKiller Start()
+        {
+            var k = Killer(new FakeReader(Unreal), sources: [manual]);
+            k.RunningGameExes = () => playing ? new HashSet<string> { "Hand.exe" } : new HashSet<string>();
+            k.Processes = _ => playing ? [(4242, 1, "Hand.exe")] : [];
+            k.ProcessPath = _ => runs;
+            return k;
+        }
+        var k = Start();
+        await k.ScanAsync(default);
+        var id = k.Games.Single().Game.Id;
+        k.PollGames();
+        Assert.Null(k.Store.LoadGame(id).RunsExe);   // not confirmed: its folder isn't the user's yet
+
+        manual.Add(new Core.Games.ManualEntry(picked, root, "Hand", Confirmed: true));
+        k = Start();
+        await k.ScanAsync(default);
+        k.PollGames();
+        Assert.Equal(runs, k.Store.LoadGame(id).RunsExe);
+        playing = false;
+        for (int i = 0; i < ScsKiller.ExitPolls; i++) k.PollGames();
+        Assert.Equal((id, runs), (k.Games.Single().Game.Id, k.Games.Single().Game.ExePath));   // the same game, its exe followed
     }
 
     [Fact]
@@ -4244,7 +4634,7 @@ public partial class AppTests : IDisposable
         }
         var keysFile = Path.Combine(_root, "rayquery.keys");
         Assert.Null(SessionLog.ReadRayQueryKeys(keysFile));
-        SessionLog.WriteRayQueryKeys(db, keysFile);
+        SessionLog.WriteRayQueryKeys([db], keysFile);
         var keys = SessionLog.ReadRayQueryKeys(keysFile)!;
         Assert.Equal([rq], keys);
 
@@ -4255,6 +4645,32 @@ public partial class AppTests : IDisposable
         Assert.Equal(new SessionStats(TimeSpan.FromMilliseconds(6), 6, 0, 1, 5, 300.0), SessionLog.Read(csv).Last);
         File.WriteAllText(csv, $"1.0,C,1,1,20.0,{rq},0.01\n2.0,C,1,1,8.0,{other},0.01\n");
         Assert.Equal(new SessionStats(TimeSpan.FromMilliseconds(2), 2, 0, 0, 1, 8.0, 1), SessionLog.Read(csv, rayQuery: keys).Last);   // not the worst
+    }
+
+    /// <summary>A compile writes the RayQuery keys of what it replays, the plan's PSOs with the recorded ones: the plan's
+    /// own shader bytes, or the recording's.</summary>
+    [Fact]
+    public async Task A_compile_writes_the_RayQuery_keys_of_the_plan_and_the_recording()
+    {
+        var (traces, tracesToo, plain) = (Tests.Planning.RtCollectionTests.Sfi0(0x100000), Tests.Planning.RtCollectionTests.Sfi0(0x100000 | 0x4000), Tests.Planning.RtCollectionTests.Sfi0(0x4000));
+        string Sha(byte[] b) => Convert.ToHexStringLower(SHA1.HashData(b));
+        byte[] Cs(string sha) => PsoDb.Stream(PsoDb.Zero, new Dictionary<int, string> { [(int)Stage.Compute] = sha }, null, 0, [], 0);
+        byte[] Db(params (char Tag, byte[] Payload)[] records)
+        {
+            using var m = new MemoryStream();
+            foreach (var (tag, payload) in records)
+                if (tag == 'B') PsoDb.WriteBlob(m, Sha(payload), payload);
+                else PsoDb.Write(m, tag, payload);
+            return m.ToArray();
+        }
+        var recorded = Db(('B', traces), ('C', PsoDb.Compute(PsoDb.Zero, Sha(traces))));
+        var plan = Db(('B', tracesToo), ('B', plain), ('S', Cs(Sha(tracesToo))), ('S', Cs(Sha(traces))), ('S', Cs(Sha(plain))));
+        var k = Killer(new FakeReader(Unreal), new FakePlanner(genDb: plan, mainDb: recorded), new FakeWarmer());
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);
+        var keys = SessionLog.ReadRayQueryKeys(Path.Combine(k.Store.GameDir(_game.Id), "rayquery.keys"));
+        Assert.Equal(new[] { new PsoDb.Rec('C', PsoDb.Compute(PsoDb.Zero, Sha(traces))), new('S', Cs(Sha(tracesToo))), new('S', Cs(Sha(traces))) }.Select(r => r.Key).Order(),
+            keys!.Order());
     }
 
     /// <summary>The game's RayQuery keys (written by a compile) count apart on NVIDIA only; AMD keeps every create a hit or a compile.</summary>
@@ -4942,7 +5358,7 @@ public partial class AppTests : IDisposable
         var warmer = new ControlledWarmer();
         var k = Killer(new FakeReader(Unreal), warmer: warmer, games: Three());
         await k.ScanAsync(default);
-        k.Enqueue("test:fake");   // the Library's "Add to queue"
+        k.Enqueue(_game.Id);   // the Library's "Add to queue"
         await Task.Delay(200);
         Assert.False(k.QueueRunning);
         Assert.Empty(warmer.Started);
@@ -4950,23 +5366,23 @@ public partial class AppTests : IDisposable
         k.StartQueue();
         await Until(() => warmer.Run != null);
         k.StopQueue();
-        await Until(() => k.Queue.Any(q => q is { GameId: "test:fake", Stage: QueueStage.Stopped }));
+        await Until(() => k.Queue.Any(q => q.GameId == _game.Id && q.Stage == QueueStage.Stopped));
         Assert.False(k.QueueRunning);
 
         k.Compile("test:b");   // the queue isn't running: it runs test:b, not the stopped item
         Assert.True(k.QueueRunning);
         await Until(() => warmer.Started.Count == 2);
-        Assert.Equal(["test:fake", "test:b"], warmer.Started);
+        Assert.Equal([_game.Id, "test:b"], warmer.Started);
 
         k.Compile("test:c");   // the queue runs: only added
-        Assert.Equal(QueueStage.Stopped, k.Queue.Single(q => q.GameId == "test:fake").Stage);
+        Assert.Equal(QueueStage.Stopped, k.Queue.Single(q => q.GameId == _game.Id).Stage);
         warmer.Run!.Finish();
         await Until(() => warmer.Started.Count == 3);
         warmer.Run!.Finish();
         await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal(["test:fake", "test:b", "test:c"], warmer.Started);
-        Assert.Equal(QueueStage.Stopped, k.Queue.Single(q => q.GameId == "test:fake").Stage);
-        Assert.All(k.Queue.Where(q => q.GameId != "test:fake"), q => Assert.Equal(QueueStage.Done, q.Stage));
+        Assert.Equal([_game.Id, "test:b", "test:c"], warmer.Started);
+        Assert.Equal(QueueStage.Stopped, k.Queue.Single(q => q.GameId == _game.Id).Stage);
+        Assert.All(k.Queue.Where(q => q.GameId != _game.Id), q => Assert.Equal(QueueStage.Done, q.Stage));
     }
 
     [Fact]
@@ -5089,9 +5505,9 @@ public partial class AppTests : IDisposable
         Assert.Equal([true, false, false], k.Queue.Select(q => q.PlanCheck));
 
         k.MoveInQueue("test:c", 0);
-        Assert.Equal(["test:fake", "test:c", "test:b"], k.Queue.Select(q => q.GameId));
+        Assert.Equal([_game.Id, "test:c", "test:b"], k.Queue.Select(q => q.GameId));
         k.MoveInQueue("test:c", 1);   // the queue page's "move down": below b, wherever the check is
-        Assert.Equal(["test:fake", "test:b", "test:c"], k.Queue.Select(q => q.GameId));
+        Assert.Equal([_game.Id, "test:b", "test:c"], k.Queue.Select(q => q.GameId));
         foreach (var q in k.Queue) k.Remove(q.GameId);
     }
 
@@ -5295,6 +5711,55 @@ public partial class AppTests : IDisposable
     }
 
     [Fact]
+    public async Task A_compile_stopped_before_its_ReShade_layer_changed_starts_over()
+    {
+        WarmResult R(WarmOutcome o, long done) => new(o, done, 10000, 0, TimeSpan.FromSeconds(10), 1 << 20, "", null);
+        var warmer = new ScriptedWarmer(R(WarmOutcome.Stopped, 4000), R(WarmOutcome.Completed, 10000), R(WarmOutcome.Stopped, 3000), R(WarmOutcome.Completed, 10000));
+        var k = Killer(new FakeReader(Unreal), warmer: warmer);
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal((4000L, null), (k.Store.LoadGame(_game.Id).ResumeAt, k.Store.LoadGame(_game.Id).ResumeLayer));
+
+        File.WriteAllBytes(Path.Combine(_exeDir, "dxgi.dll"), ReShadeDll);   // RenoDX installed while stopped: the first 4000 went through none
+        var addon = Path.Combine(_exeDir, "renodx-ff7rebirth.addon64");
+        File.WriteAllBytes(addon, RenoDxAddon);
+        await WarmOnce(k, _game.Id);
+        Assert.Equal([0L, 0L], warmer.StartAts);
+
+        k.Enqueue(_game.Id);   // stopped at 3000 through this layer
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(3000, k.Store.LoadGame(_game.Id).ResumeAt);
+        Assert.NotNull(k.Store.LoadGame(_game.Id).ResumeLayer);
+        File.WriteAllBytes(addon, [.. RenoDxAddon, .. "a newer build"u8]);
+        await WarmOnce(k, _game.Id);
+        Assert.Equal([0L, 0L, 0L, 0L], warmer.StartAts);
+        Assert.Equal(0, k.Store.LoadGame(_game.Id).ResumeAt);
+    }
+
+    /// <summary>A copy of the layer goes into a compile only when it reproduces what the game loads: ReShade under a name
+    /// the game loads by itself, and no Luma add-on (its shader files aren't copied). Otherwise a mod that changes every
+    /// pipeline blocks the game, and one that replaces some shaders only gets the note.</summary>
+    [Fact]
+    public void A_layer_a_copy_cant_reproduce_is_never_copied()
+    {
+        File.WriteAllBytes(Path.Combine(_exeDir, "dxgi.dll"), ReShadeDll);
+        var luma = Path.Combine(_exeDir, "Luma-Game.addon");
+        File.WriteAllBytes(luma, LumaAddon);
+        var r = Core.Games.ReShade.Detect(_game)!;
+        Assert.Equal(("Luma", false, false, null), (r.ShaderMod!.Mod, r.Layered, r.Blocks, r.Fingerprint));
+        File.Delete(luma);
+
+        File.WriteAllBytes(Path.Combine(_exeDir, "renodx-ff7rebirth.addon64"), RenoDxAddon);
+        Assert.True(Core.Games.ReShade.Detect(_game)!.Layered);
+        File.Move(Path.Combine(_exeDir, "dxgi.dll"), Path.Combine(_exeDir, "ReShade64.dll"));   // loaded only if something injects it
+        r = Core.Games.ReShade.Detect(_game)!;
+        Assert.Equal((AddonKind.LayoutInjecting, false, true, null), (r.ShaderMod!.Kind, r.Layered, r.Blocks, r.Fingerprint));
+    }
+
+    [Fact]
     public async Task A_resume_point_without_its_driver_from_an_earlier_build_starts_over()
     {
         WarmResult R(WarmOutcome o, long done) => new(o, done, 10000, 0, TimeSpan.FromSeconds(10), 1 << 20, "", null);
@@ -5486,12 +5951,41 @@ public partial class AppTests : IDisposable
     }
 
     [Fact]
+    public async Task A_setting_that_switches_the_shaders_the_game_loads_makes_the_warm_stale()
+    {
+        var reader = new StampedReader(Unreal) { Stamp = "game.ps50|1|1" };
+        var k = Killer(reader);
+        await k.ScanAsync(default);
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
+        reader.Stamp = "game.compatibility.ps50|2|2";   // the same exe and build, another dump
+        var s = (await k.ScanAsync(default)).Single();
+        Assert.Equal((GameStatus.Stale, "game shaders changed since the warm"), (s.Status, s.StatusReason));
+        k.Enqueue(_game.Id);
+        k.StartQueue();
+        await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(GameStatus.Warmed, k.Games.Single().Status);
+    }
+
+    sealed class StampedReader(EngineInfo engine) : IEngineReader
+    {
+        public string Stamp = "";
+        public EngineInfo? Detect(Game game) => engine;
+        public string IndexStamp(Game game) => Stamp;
+        public ShaderIndex Index(Game game, EngineInfo e, IProgress<string>? log, CancellationToken ct) =>
+            new("content-" + Stamp, ["PCD3D_SM6"], new Dictionary<string, ShaderInfo>(), []);
+        public void ReadShaders(Game game, EngineInfo e, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct) { }
+    }
+
+    [Fact]
     public async Task A_compile_after_an_update_the_scan_missed_records_the_installed_build()
     {
         await Warmed(_game with { Version = "100" });
         var source = new FakeSource([_game with { Version = "100" }]);
         var k = new ScsKiller([source], new FakeVendor(Gpu with { DriverVersion = "100.01" }), new FakeReader(Unreal), new FakePlanner(),
-            new FakeWarmer(), Path.Combine(_root, "data"), _proxy) { LocalAppData = _root };
+            new FakeWarmer(), Path.Combine(_root, "data"), _proxy) { LocalAppData = _root, Processes = Ours, ProcessNames = OurNames };
         await k.ScanAsync(default);
         source.Games = [_game with { Version = "101" }];   // the store updated the game while the app ran
         k.Enqueue(_game.Id);
@@ -5762,7 +6256,7 @@ public partial class AppTests : IDisposable
         var warmer = new FakeWarmer();
         var k = Killer(new FakeReader(Unreal), warmer: warmer, games: Three());
         await k.ScanAsync(default);
-        foreach (var id in new[] { "test:fake", "test:b", "test:c" }) k.Enqueue(id);
+        foreach (var id in new[] { _game.Id, "test:b", "test:c" }) k.Enqueue(id);
         int events = 0;
         k.QueueChanged += _ => Interlocked.Increment(ref events);
         await Task.Delay(700);
@@ -5770,13 +6264,13 @@ public partial class AppTests : IDisposable
         Assert.False(k.QueueRunning);
 
         k.MoveInQueue("test:c", 0);
-        k.MoveInQueue("test:fake", 99);   // clamped: last
-        Assert.Equal(["test:c", "test:b", "test:fake"], k.Queue.Select(q => q.GameId));
+        k.MoveInQueue(_game.Id, 99);   // clamped: last
+        Assert.Equal(["test:c", "test:b", _game.Id], k.Queue.Select(q => q.GameId));
         Assert.Equal(2, events);
 
         k.StartQueue();
         await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal(["test:c", "test:b", "test:fake"], warmer.Started);
+        Assert.Equal(["test:c", "test:b", _game.Id], warmer.Started);
         Assert.False(k.QueueRunning);
         Assert.All(k.Queue, q => Assert.Equal(QueueStage.Done, q.Stage));   // finished items stay listed...
         k.Enqueue("test:b");                                                 // (a finished game queued again waits before them)
@@ -5792,25 +6286,25 @@ public partial class AppTests : IDisposable
         var warmer = new ControlledWarmer();
         var k = Killer(new FakeReader(Unreal), warmer: warmer, games: Three());
         await k.ScanAsync(default);
-        k.Enqueue("test:fake");
+        k.Enqueue(_game.Id);
         k.Enqueue("test:b");
         k.StartQueue();
         Assert.True(k.QueueRunning);
         await Until(() => warmer.Run != null);
         k.Enqueue("test:c");
         k.MoveInQueue("test:c", 0);
-        Assert.Equal(["test:fake", "test:c", "test:b"], k.Queue.Select(q => q.GameId));   // the running item stays first
+        Assert.Equal([_game.Id, "test:c", "test:b"], k.Queue.Select(q => q.GameId));   // the running item stays first
 
         k.StopQueue();
         await Until(() => k.Queue.Any(q => q.Stage == QueueStage.Stopped));
         Assert.False(k.QueueRunning);
         await Task.Delay(700);
-        Assert.Equal(["test:fake"], warmer.Started);                                         // nothing else started
-        Assert.Equal(["test:c", "test:b", "test:fake"], k.Queue.Select(q => q.GameId));   // waiting, then finished
+        Assert.Equal([_game.Id], warmer.Started);                                         // nothing else started
+        Assert.Equal(["test:c", "test:b", _game.Id], k.Queue.Select(q => q.GameId));   // waiting, then finished
 
         k.StartQueue();
         await Until(() => warmer.Started.Count == 2);
-        Assert.Equal(["test:fake", "test:c", "test:b"], k.Queue.Select(q => q.GameId));   // the stopped one continues first
+        Assert.Equal([_game.Id, "test:c", "test:b"], k.Queue.Select(q => q.GameId));   // the stopped one continues first
         Assert.Equal(10, warmer.Options!.StartAt);
         warmer.Run!.Finish();
         foreach (var n in new[] { 3, 4 })
@@ -5819,7 +6313,7 @@ public partial class AppTests : IDisposable
             warmer.Run!.Finish();
         }
         await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal(["test:fake", "test:fake", "test:c", "test:b"], warmer.Started);
+        Assert.Equal([_game.Id, _game.Id, "test:c", "test:b"], warmer.Started);
         Assert.False(k.QueueRunning);
     }
 
@@ -6682,7 +7176,7 @@ public partial class AppTests : IDisposable
     {
         var ea = _game with { Id = "ea:1", Store = Store.EA, InstallDir = _game.InstallDir.ToUpperInvariant() + @"\" };
         var k = new ScsKiller([new FakeSource([_game]), new FakeSource([ea])], new FakeVendor(Gpu), new FakeReader(null), new FakePlanner(),
-            new FakeWarmer(), Path.Combine(_root, "data"), _proxy);
+            new FakeWarmer(), Path.Combine(_root, "data"), _proxy) { Processes = Ours, ProcessNames = OurNames };
         Assert.Equal(_game.Id, Assert.Single(await k.ScanAsync(default)).Game.Id);
     }
 
@@ -7183,10 +7677,10 @@ public partial class AppTests : IDisposable
             var written = killed ? Path.Combine(workDir, "stage-1-1", "FakeGame", "Fake", "Binaries", "Win64", "scskiller.log") : log;
             Directory.CreateDirectory(Path.GetDirectoryName(written)!);
             File.WriteAllText(written, "device removed");
-            return new Run(new WarmResult(WarmOutcome.Failed, 3, 100, 0, TimeSpan.FromSeconds(1), 0, log, "scskiller_warm exited with code 5"));
+            return new Done(new WarmResult(WarmOutcome.Failed, 3, 100, 0, TimeSpan.FromSeconds(1), 0, log, "scskiller_warm exited with code 5"));
         }
 
-        sealed class Run(WarmResult result) : IWarmRun
+        public sealed class Done(WarmResult result) : IWarmRun
         {
             public Task<WarmResult> Completion { get; } = Task.FromResult(result);
             public void Pause() { }
@@ -7211,6 +7705,40 @@ public partial class AppTests : IDisposable
         var log = q.Error![(q.Error.IndexOf("(log: ") + 6)..^1];
         Assert.False(Directory.Exists(Path.Combine(k.Store.GameDir(_game.Id), "work")));
         Assert.Equal("device removed", File.ReadAllText(log));
+    }
+
+    sealed class RejectingWarmer : IWarmer
+    {
+        public long Failed;
+        public IWarmRun Start(Game game, string workDir, WarmOptions options, IProgress<WarmProgress>? progress)
+        {
+            foreach (var (stage, line) in new[] { ("stage-1-1", "retry"), ("stage-1-2", $"{Failed} rejected") })   // a retry's processes
+            {
+                Directory.CreateDirectory(Path.Combine(workDir, stage));
+                File.WriteAllText(Path.Combine(workDir, stage, "scskiller.log"), line);
+            }
+            var result = new WarmResult(WarmOutcome.Completed, 100, 100, Failed, TimeSpan.FromSeconds(1), 0, Path.Combine(workDir, "stage-1-2", "scskiller.log"), null);
+            return new FailingWarmer.Done(result);
+        }
+    }
+
+    [Fact]
+    public async Task A_completed_warm_with_rejections_keeps_its_logs_until_a_clean_one()
+    {
+        var warmer = new RejectingWarmer { Failed = 3 };
+        var k = Killer(new FakeReader(Unreal), warmer: warmer);
+        await k.ScanAsync(default);
+        await WarmOnce(k, _game.Id);
+        var kept = Path.Combine(k.Store.GameDir(_game.Id), "warm-rejects.log");
+        Assert.Equal(["retry", "3 rejected"], File.ReadAllLines(kept));
+
+        warmer.Failed = 5;
+        await WarmOnce(k, _game.Id);
+        Assert.Equal(["retry", "5 rejected"], File.ReadAllLines(kept));
+
+        warmer.Failed = 0;
+        await WarmOnce(k, _game.Id);
+        Assert.False(File.Exists(kept));
     }
 
     [Fact]
@@ -7362,7 +7890,7 @@ public partial class AppTests : IDisposable
     {
         var source = new FakeSource([_game with { Version = "1" }]);
         var reader = new UpdatedReader();
-        var k = new ScsKiller([source], new FakeVendor(Gpu), reader, new UpdatedPlanner(), new FakeWarmer(), Path.Combine(_root, "data"), _proxy) { LocalAppData = _root };
+        var k = new ScsKiller([source], new FakeVendor(Gpu), reader, new UpdatedPlanner(), new FakeWarmer(), Path.Combine(_root, "data"), _proxy) { LocalAppData = _root, Processes = Ours, ProcessNames = OurNames };
         await k.ScanAsync(default);
         Assert.Equal("5.4", k.Games.Single().Engine!.Version);
         source.Games = [_game with { Version = "2" }];   // the store updated the game while the app ran
@@ -7383,7 +7911,7 @@ public partial class AppTests : IDisposable
     {
         var source = new FakeSource([_game with { Version = "1" }]);
         var rt = new PlanStats(0, 40_000, 40_000, 100, true, RtLibraries: 12_000, RtUncovered: 12_000, RtInline: 0);
-        var k = new ScsKiller([source], new FakeVendor(Gpu), new UpdatedReader(), new UpdatedPlanner(rt), new FakeWarmer(), Path.Combine(_root, "data"), _proxy) { LocalAppData = _root };
+        var k = new ScsKiller([source], new FakeVendor(Gpu), new UpdatedReader(), new UpdatedPlanner(rt), new FakeWarmer(), Path.Combine(_root, "data"), _proxy) { LocalAppData = _root, Processes = Ours, ProcessNames = OurNames };
         await k.ScanAsync(default);
         await WarmOnce(k, _game.Id);   // everything but the ray tracing
         Assert.Equal(GameStatus.NeedsRecording, k.Games.Single().Status);
@@ -7399,7 +7927,7 @@ public partial class AppTests : IDisposable
     public async Task A_recording_another_process_imported_lets_a_compile_through_that_the_scan_found_needing_one()
     {
         var k = new ScsKiller([new FakeSource([_game])], new FakeVendor(Gpu), new FakeReader(Unreal), new UpdatedPlanner(recorded: true), new FakeWarmer(),
-            Path.Combine(_root, "data"), _proxy) { LocalAppData = _root };
+            Path.Combine(_root, "data"), _proxy) { LocalAppData = _root, Processes = Ours, ProcessNames = OurNames };
         await k.ScanAsync(default);
         Assert.Equal(GameStatus.NeedsRecording, k.Games.Single().Status);
 
@@ -7753,7 +8281,7 @@ public partial class AppTests : IDisposable
         k.StartQueue();
         await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));
         await k.SharingPass;   // after the compile's index
-        Assert.Contains("\"store_build_key\":\"test:fake@42\"", Assert.Single(uploads));
+        Assert.Contains($"\"store_build_key\":\"{_game.Id}@42\"", Assert.Single(uploads));
         Assert.Contains($"\"content_hash\":\"{hash}\"", uploads[0]);
         Assert.NotNull(k.Games.Single().RecordingSharedAt);
 
@@ -7763,7 +8291,7 @@ public partial class AppTests : IDisposable
     }
 
     [Fact]
-    public async Task A_recording_is_not_shared_while_a_shader_mod_adds_to_its_root_signatures()
+    public async Task A_recording_is_not_shared_while_a_blocking_shader_mod_is_in_the_install_root()
     {
         const string hash = "00112233445566778899aabbccddeeff00112233";
         var game = _game with { Version = "42" };
@@ -7780,10 +8308,10 @@ public partial class AppTests : IDisposable
         k.StartQueue();
         await k.WhenQueueIdle().WaitAsync(TimeSpan.FromSeconds(10));   // indexed, sharing off
 
-        var addon = Path.Combine(_exeDir, "renodx-ff7rebirth.addon64");
-        File.WriteAllBytes(Path.Combine(_exeDir, "dxgi.dll"), ReShadeDll);
+        var addon = Path.Combine(_game.InstallDir, "renodx-ff7rebirth.addon64");
+        File.WriteAllBytes(Path.Combine(_game.InstallDir, "dxgi.dll"), ReShadeDll);
         File.WriteAllBytes(addon, RenoDxAddon);
-        File.WriteAllBytes(Path.Combine(_exeDir, "scskiller.db"), SharingTests.LocalRecording(new string('b', 40)));   // recorded with the mod
+        File.WriteAllBytes(Path.Combine(_exeDir, "scskiller.db"), SharingTests.LocalRecording(new string('b', 40)));
         k.Settings = k.Settings with { ShareRecordings = true };   // a pass at once: the game's state is still unblocked
         await k.SharingPass;
         Assert.Equal(0, uploads());
@@ -7988,8 +8516,7 @@ public partial class AppTests : IDisposable
     [Fact]
     public async Task A_game_the_user_added_with_an_hdr_mod_gets_the_same_block()
     {
-        var (_, stub, shipping) = ManualGamesTests.UnrealLayout(Path.Combine(_root, "Added Game"));
-        var dir = Path.GetDirectoryName(shipping)!;
+        var (dir, stub, _) = ManualGamesTests.UnrealLayout(Path.Combine(_root, "Added Game"));   // ReShade in the install root
         File.WriteAllBytes(Path.Combine(dir, "dxgi.dll"), ReShadeDll);
         var addon = Path.Combine(dir, "renodx-ff7rebirth.addon64");   // listed: changes every pipeline
         File.WriteAllBytes(addon, RenoDxAddon);
@@ -8249,8 +8776,8 @@ public partial class AppTests : IDisposable
         await k.ScanAsync(default);
         k.InstallRecorder(game.Id);
         Assert.True(ScsKiller.IsOurProxy(dll));
-        File.WriteAllBytes(Path.Combine(dir, "dxgi.dll"), ReShadeDll);
-        File.WriteAllBytes(Path.Combine(dir, "renodx-ff7rebirth.addon64"), RenoDxAddon);   // listed: changes every pipeline
+        File.WriteAllBytes(Path.Combine(game.InstallDir, "dxgi.dll"), ReShadeDll);   // in the install root
+        File.WriteAllBytes(Path.Combine(game.InstallDir, "renodx-ff7rebirth.addon64"), RenoDxAddon);   // listed: changes every pipeline
         await k.ScanAsync(default);
         var s = k.Games.Single(x => x.Game.Id == game.Id);
         Assert.Equal((GameStatus.Unsupported, ScsKiller.SkipShaderMod), (s.Status, s.RecorderSkip));
@@ -8355,6 +8882,98 @@ public partial class AppTests : IDisposable
         k.FolderChanging = null;
         await k.CheckRecorderGames(true);   // after the change: the new folder's check arms it
         Assert.Contains("armed=1", File.ReadAllText(armed));
+    }
+
+    /// <summary>A sharing pass that starts before the first scan has published the games (an evaluation's import queues
+    /// one) still leaves out what any recording on this PC says a layer made: another game's 'W', read from disk.</summary>
+    [Fact]
+    public async Task Sharing_before_the_first_scan_leaves_out_what_another_recording_says_a_layer_made()
+    {
+        const string hash = "00112233445566778899aabbccddeeff00112233";
+        var game = _game with { Version = "42" };
+        var (layer, own) = (new string('a', 40), new string('b', 40));
+        var data = Path.Combine(_root, "data");
+        var store = new AppStore(data);
+        Directory.CreateDirectory(store.GameDir(game.Id));
+        File.WriteAllBytes(Path.Combine(store.GameDir(game.Id), "recording.db"), SharingTests.LocalRecording(layer, own));
+        var records = PsoDb.Read(Path.Combine(store.GameDir(game.Id), "recording.db")).Where(r => r.Tag == 'S').ToList();
+        var made = records.Single(r => PsoDb.Parse(r).Stages.ContainsValue(layer));
+        var rec = store.LoadGame(game.Id);
+        (rec.IndexContentHash, rec.IndexGameVersion) = (hash, "42");
+        store.SaveGame(game.Id, rec);
+        var other = store.GameDir("test:other");
+        Directory.CreateDirectory(other);
+        using (var f = File.Create(Path.Combine(other, "recording.db"))) PsoDb.Write(f, 'W', [.. Convert.FromHexString(made.Key), .. new byte[20]]);
+
+        var bodies = new List<byte[]>();
+        var fake = new CommunityTests.Fake(r =>
+        {
+            if (r.RequestUri!.AbsolutePath == "/v1/devices") return CommunityTests.Ours(HttpStatusCode.OK, """{"device_token":"sd1_anon","device_id":"d"}"""u8.ToArray());
+            lock (bodies) bodies.Add(r.Content!.ReadAsByteArrayAsync().Result);
+            return CommunityTests.Ours(HttpStatusCode.Accepted, """{"upload_id":"u","records":1,"new_records":1}"""u8.ToArray());
+        });
+        var k = Killer(new FakeReader(Unreal, hash), game: game);
+        k.Settings = k.Settings with { ShareRecordings = true };
+        k.Sharing = new Sharing(data, () => k.Settings.ShareRecordings, new RouteFailover(fake, [new("https://api.test.com/"), new("https://api.test.io/")]));
+        Assert.Empty(k.Games);
+        k.StartSharing([game]);
+        await k.SharingPass;
+        var sent = Assert.Single(bodies);
+        var keys = HashOnly.Decompress(sent).Where(r => r.Tag != 'B').Select(r => r.Key).ToList();
+        Assert.Equal([records.Single(r => r != made).Key], keys);
+    }
+
+    /// <summary>A recorder inbox whose 'W' records can't all be read (a torn tail while the game still records, or a
+    /// malformed 'W') holds every upload back, recordings and packs, without a problem; once it reads whole the pass shares,
+    /// leaving out what it names.</summary>
+    [Theory]
+    [InlineData("torn")]
+    [InlineData("malformed")]
+    public async Task A_torn_or_malformed_inbox_holds_sharing_back_until_it_reads_whole(string kind)
+    {
+        const string hash = "00112233445566778899aabbccddeeff00112233";
+        var game = _game with { Version = "42" };
+        var data = Path.Combine(_root, "data");
+        var store = new AppStore(data);
+        Directory.CreateDirectory(store.GameDir(game.Id));
+        File.WriteAllBytes(Path.Combine(store.GameDir(game.Id), "recording.db"), SharingTests.LocalRecording(new string('a', 40), new string('b', 40)));
+        var records = PsoDb.Read(Path.Combine(store.GameDir(game.Id), "recording.db")).Where(r => r.Tag == 'S').ToList();
+        var rec = store.LoadGame(game.Id);
+        (rec.IndexContentHash, rec.IndexGameVersion) = (hash, "42");
+        store.SaveGame(game.Id, rec);
+        var otherExe = Path.Combine(_root, "other-game", "Other.exe");
+        Directory.CreateDirectory(Path.GetDirectoryName(otherExe)!);
+        var other = store.LoadGame("test:other");
+        other.RecorderExe = otherExe;
+        store.SaveGame("test:other", other);
+        var inbox = Path.Combine(Path.GetDirectoryName(otherExe)!, "scskiller.db");
+        byte[] W(byte[] payload) => [(byte)'W', .. BitConverter.GetBytes(payload.Length), .. payload];
+        var whole = W([.. Convert.FromHexString(records[0].Key), .. new byte[20]]);
+        File.WriteAllBytes(inbox, kind == "torn" ? whole[..30] : [.. whole, .. W(new byte[39])]);
+
+        var bodies = new List<byte[]>();
+        var fake = new CommunityTests.Fake(r =>
+        {
+            if (r.RequestUri!.AbsolutePath == "/v1/devices") return CommunityTests.Ours(HttpStatusCode.OK, """{"device_token":"sd1_anon","device_id":"d"}"""u8.ToArray());
+            lock (bodies) bodies.Add(r.Content!.ReadAsByteArrayAsync().Result);
+            return CommunityTests.Ours(HttpStatusCode.Accepted, """{"upload_id":"u","records":1,"new_records":1}"""u8.ToArray());
+        });
+        var k = Killer(new FakeReader(Unreal, hash), game: game);
+        var log = new List<string>();
+        k.Log = new Progress<string>(l => { lock (log) log.Add(l); });
+        k.Settings = k.Settings with { ShareRecordings = true };
+        k.Sharing = new Sharing(data, () => k.Settings.ShareRecordings, new RouteFailover(fake, [new("https://api.test.com/"), new("https://api.test.io/")]));
+        k.StartSharing([game]);
+        await k.SharingPass;
+        Assert.Empty(bodies);
+        Assert.Null(k.Sharing.Problem);
+        Assert.Null(Sharing.Shared(store.GameDir(game.Id)));   // not marked: the next pass tries again
+
+        File.WriteAllBytes(inbox, whole);   // the game closed: the recorder's last write is whole
+        k.StartSharing([game]);
+        await k.SharingPass;
+        var sent = Assert.Single(bodies);
+        Assert.Equal([records[1].Key], HashOnly.Decompress(sent).Where(r => r.Tag != 'B').Select(r => r.Key));
     }
 
     sealed class FakeSource(Game[] games) : IGameSource

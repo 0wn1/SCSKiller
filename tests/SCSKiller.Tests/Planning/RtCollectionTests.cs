@@ -321,6 +321,28 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
 
     static readonly byte[] HitLib = Library((10, "MaterialCHS", 64), (9, "MaterialAHS", 64)), ShadowLib = Library((10, "ShadowCHS", 12)), RayGenLib = Library((7, "RayGen", 0));
 
+    /// <summary>Elden Ring's collection of a material pair (<see cref="SCSKiller.Core.FromSoft.SoulsRayTracing.Collection"/>):
+    /// the closest hit first whichever library the item names first, both root signatures, and the byte layout its recorded
+    /// collections have (pinned); null unless one library is a closest hit and the other an any hit.</summary>
+    [Fact]
+    public void EldenRingCollectionIsTheGamesShape()
+    {
+        byte[] ch = Library((10, "ClosestHit", 4)), ah = Library((9, "AnyHit", 4));
+        string chSha = Hex(System.Security.Cryptography.SHA1.HashData(ch)), ahSha = Hex(System.Security.Cryptography.SHA1.HashData(ah));
+        var souls = SCSKiller.Core.FromSoft.SoulsRayTracing.Shape;
+        var item = SCSKiller.Core.RedEngine.RedRayTracing.ParseItem(SCSKiller.Core.RedEngine.RedRayTracing.Item(ahSha, chSha, SCSKiller.Core.FromSoft.SoulsRayTracing.Local.Hash, souls, null));
+        var so = SCSKiller.Core.FromSoft.SoulsRayTracing.Collection(ah, item, ch, "Mat")!;
+        var parsed = ParseStateObject(new Rec('R', so));
+        Assert.Equal(0u, parsed.Type);
+        Assert.Equal([chSha, ahSha], parsed.Libraries);
+        Assert.Equal([souls.Global, item.Local], parsed.RootSignatures);
+        var text = System.Text.Encoding.Unicode.GetString(so);
+        Assert.Contains("Mat_RayTracing_[ClosestHit]_[AO]", text);
+        Assert.Contains("HitGroup_Mat_[AO]_[A]", text);
+        Assert.Equal("522e9ed9136b1272cc21459abeb883a4a24171e9", new Rec('R', so).Key);
+        Assert.Null(SCSKiller.Core.FromSoft.SoulsRayTracing.Collection(ch, item, ch));
+    }
+
     /// <summary>A collection whose one library exports a closest hit AND an any hit shader (Hogwarts Legacy: 290 of its 981)
     /// reads back as UE-shaped with every export.</summary>
     [Fact]
@@ -432,7 +454,7 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
     [Fact]
     public void HashOnlyKeepsNvapiStateWithItsRecord()
     {
-        var rs = RootSig.Serialize(RtCollections.EmptyLocal, []);
+        var rs = RootSig.Serialize(new RootSig.Desc(0x80, []), []);
         var rsSha = Hex(System.Security.Cryptography.SHA1.HashData(rs));
         var cs = new Rec('C', Compute(rsSha, Vs.Sha1));
         var kept = new NvState(cs.Key, 0, 1001, 3, 0).ToRec();
@@ -657,17 +679,14 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         public void ReadShaders(Game game, EngineInfo engine, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct) { if (sha1s.Contains(sha1)) sink(sha1, bytes); }
     }
 
-    /// <summary>Elden Ring (EasyAntiCheat: no recording). Its 4,281 lib_6_3 libraries carry no RDAT subobjects (no root
-    /// signatures, configs, hit groups or associations), one entry point each (closest hit and any hit in separate libraries),
-    /// so its plan GUESSES (<see cref="RtCollections.GuessedFamilies"/>): a global root signature from the libraries'
-    /// bindings, an empty local one, a collection and hit group per library, unverified in game. Offline: every library gets a
-    /// 'Y' (none uncovered); NVIDIA only. SCSKILLER_RT_ER=warp: the plan's collections, materialized from the install, all
+    /// <summary>Elden Ring: one collection per material's closest hit and any hit pair of one ray payload, in the game's
+    /// shape (<see cref="SCSKiller.Core.FromSoft.SoulsRayTracing"/>). Offline: an 'H' per pair (1,068 materials x 2 payloads),
+    /// none uncovered, no 'Y'; NVIDIA only. SCSKILLER_RT_ER=warp: the plan's collections, materialized from the install, all
     /// create on WARP; =gpu (NVIDIA; not while TestEnv.GpuBusyElsewhere; holds the GPU lock; throwaway name, never
-    /// eldenring.exe; its cache files deleted): a second process re-creating them hits the cache. Whether the game's own
-    /// objects would hit is unknowable without its root signatures and pipeline shape (not in its files).</summary>
+    /// eldenring.exe; its cache files deleted): a second process re-creating them hits the cache.</summary>
     [Trait("Needs", "Game")]
     [Fact]
-    public void EldenRingGuessedCollections()
+    public void EldenRingMaterialCollections()
     {
         var game = SCSKiller.Tests.FromSoft.FromSoftGameTests.Games["ER"].Game;
         if (!File.Exists(game.ExePath)) return;
@@ -675,14 +694,14 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         var reader = new SCSKiller.Core.FromSoft.FromSoftReader(Ff7.TempDir("rt-er-data"));
         var engine = reader.Detect(game)!;
         var index = reader.Index(game, engine, null, CancellationToken.None);
-        var libs = index.Shaders.Values.Count(s => s.Stage == Stage.Library);
+        var pairs = index.Maps.Count(SCSKiller.Core.FromSoft.SoulsRayTracing.IsPair);
         var dir = Ff7.TempDir("rt-er");
         var log = new List<string>();
         var plan = new Planner().Build(game, engine, index, null, Nvidia, Path.Combine(dir, "plan"), new Log(log.Add), CancellationToken.None);
         foreach (var l in log.Where(l => l.StartsWith("ray tracing"))) output.WriteLine(l);
         var body = PlanFile.Read(plan.FilePath).Records.ToList();
-        Assert.Equal(libs, body.Count(r => r.Tag == 'Y'));
-        Assert.Contains(log, l => l.Contains("guessed: RS + local RS from the library bindings, one collection per library; unverified in game"));
+        Assert.Equal((pairs, 0), (body.Count(r => r.Tag == 'H'), body.Count(r => r.Tag == 'Y')));
+        Assert.Contains(log, l => l.Contains($"{pairs} material collections synthesized") && l.Contains(", 0 uncovered"));
         Assert.Empty(Items(new Planner().Build(game, engine, index, null, Ff7.Amd, Path.Combine(dir, "amd"), null, CancellationToken.None)));
 
         var mode = Environment.GetEnvironmentVariable("SCSKILLER_RT_ER");
@@ -690,7 +709,7 @@ public class RtCollectionTests(Xunit.Abstractions.ITestOutputHelper output)
         if (mode is not ("warp" or "gpu") || !File.Exists(warm)) return;
         if (mode == "gpu" && TestEnv.GpuBusyElsewhere) { output.WriteLine("GPU busy (another tool's lock): not measured"); return; }
         var rt = plan with { FilePath = Path.Combine(dir, "rt.bin") };
-        PlanFile.Write(rt, body.Where(r => r.Tag is 'B' or 'Y'));
+        PlanFile.Write(rt, body.Where(r => r.Tag is 'B' or 'H'));
         var work = Path.Combine(dir, "work");
         new Planner().Materialize(rt, game, engine, reader, null, work, CancellationToken.None);
         Assert.Equal(0, Planner.SkippedIn(work));

@@ -28,12 +28,14 @@
 #include <d3d12shader.h>
 #include <dxgi1_4.h>
 #include <tlhelp32.h>
+#include <bcrypt.h>
 #include <dxcapi.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>  // third_party/vulkan: Khronos Vulkan-Headers vulkan-sdk-1.4.341.0 (Apache-2.0)
 #include "vk_spirv.h"
 #include "probe_util.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <deque>
@@ -45,6 +47,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #pragma comment(lib, "dxgi.lib")
@@ -2806,6 +2809,177 @@ static int chain_rows(const std::wstring& dir, unsigned seed, bool swap) {
     return SUCCEEDED(hr) ? 0 : 1;
 }
 
+// `selftest layer <seed> [old]`: fakenext.dll as a layer like ReShade as dxgi.dll with a RenoDX addon (FakeNext_Layer: the
+// system D3D12CreateDevice hands out a wrapper that adds a root constant to every root signature), loaded before the proxy,
+// on WARP. Through the proxy: a compute PSO (the game's create), then one created on the real device directly (the layer's
+// own, as a bind-time clone is). old: the wrapper doesn't answer IID_UnwrappedObject (ReShade before 6.8, other layers).
+// Prints "created 0x<hr>" and "own 0x<hr>".
+static int layer_rows(const std::wstring& dir, unsigned seed, bool old) {
+    SetEnvironmentVariableW(L"SCSKILLER_MODE", L"record");
+    HMODULE fake = LoadLibraryW((dir + L"fakenext.dll").c_str());
+    auto layer = fake ? (BOOL(WINAPI*)(BOOL))GetProcAddress(fake, "FakeNext_Layer") : nullptr;
+    CHECK(layer && layer(!old));
+    HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str());
+    CHECK(m);
+    auto create_device = (decltype(&D3D12CreateDevice))GetProcAddress(m, "D3D12CreateDevice");
+    auto ser = (decltype(&D3D12SerializeRootSignature))GetProcAddress(m, "D3D12SerializeRootSignature");
+    IDXGIFactory4* f = nullptr;
+    IDXGIAdapter* warp = nullptr;
+    CHECK(create_device && ser && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f))) && SUCCEEDED(f->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
+    ID3D12Device* dev = nullptr;
+    CHECK(SUCCEEDED(create_device(warp, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))));
+    D3D12_ROOT_PARAMETER up = {D3D12_ROOT_PARAMETER_TYPE_UAV};
+    D3D12_ROOT_SIGNATURE_DESC rd = {1, &up};
+    ID3DBlob *rb = nullptr, *err = nullptr;
+    ID3D12RootSignature* rs = nullptr;
+    CHECK(SUCCEEDED(ser(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err)) && SUCCEEDED(dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(&rs))));
+    auto cs_pso = [&](ID3D12Device* d, unsigned s) {
+        ID3DBlob* cs = compile("RWByteAddressBuffer b : register(u0); [numthreads(1,1,1)] void main() { b.Store(0, " + std::to_string(s) + "); }", "cs_5_0");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC c = {};
+        c.pRootSignature = rs, c.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+        ID3D12PipelineState* pso = nullptr;
+        return d->CreateComputePipelineState(&c, IID_PPV_ARGS(&pso));
+    };
+    HRESULT hr = cs_pso(dev, seed);
+    printf("created 0x%08x\n", (unsigned)hr);
+    ID3D12Device* real = nullptr;
+    CHECK(SUCCEEDED(rs->GetDevice(IID_PPV_ARGS(&real))));  // the layer doesn't wrap root signatures
+    HRESULT own = cs_pso(real, seed + 1);
+    printf("own 0x%08x\n", (unsigned)own);
+    return SUCCEEDED(hr) && SUCCEEDED(own) ? 0 : 1;
+}
+
+// `selftest layerwarm <kit dir> [n]`: on the GPU, under ReShade as dxgi.dll with a RenoDX addon that rewrites every root
+// signature (the kit: dxgi.dll, *.addon64 and ReShade.ini from reshade.me and RenoDX's releases, never in the repo). Each
+// phase runs this exe under its own throwaway name in its own folder, with the proxy and the kit: A records n compute PSOs
+// the game creates through the layer and n the layer creates on the device under it (as bind-time clones are, "own");
+// B is warmed by scskiller_warm from A's recording, C from it without what the layer changed (what the proxy recorded
+// before it hooked under a layer), E like C but with the layer in the warm (--layer), F like B with it, D not at all; then
+// each creates the same PSOs under the layer. Prints each one's create ms (median, max). The driver-cache files that
+// appeared during the run are deleted at the end.
+using Hash20 = std::array<uint8_t, 20>;
+static Hash20 sha1_of(char tag, const std::string& p) {
+    std::string s = tag + p;
+    Hash20 h{};
+    BCryptHash(BCRYPT_SHA1_ALG_HANDLE, nullptr, 0, (PUCHAR)s.data(), (ULONG)s.size(), h.data(), 20);
+    return h;
+}
+
+static std::string read_all(const std::wstring& path) {
+    std::string s;
+    if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+        char b[65536];
+        for (size_t n; (n = fread(b, 1, sizeof b, f)) > 0;) s.append(b, n);
+        fclose(f);
+    }
+    return s;
+}
+
+static int layerwarm_child(const std::wstring& dir, unsigned seed, int n) {
+    HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str());  // ReShade (dxgi.dll, imported by this exe) is loaded by now
+    CHECK(m);
+    auto create_device = (decltype(&D3D12CreateDevice))GetProcAddress(m, "D3D12CreateDevice");
+    auto ser = (decltype(&D3D12SerializeRootSignature))GetProcAddress(m, "D3D12SerializeRootSignature");
+    ID3D12Device* dev = nullptr;
+    CHECK(create_device && ser && SUCCEEDED(create_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))));
+    D3D12_ROOT_PARAMETER up = {D3D12_ROOT_PARAMETER_TYPE_UAV};
+    D3D12_ROOT_SIGNATURE_DESC rd = {1, &up};
+    ID3DBlob *rb = nullptr, *err = nullptr;
+    ID3D12RootSignature* rs = nullptr;
+    CHECK(SUCCEEDED(ser(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &err)) && SUCCEEDED(dev->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(&rs))));
+    ID3D12Device* real = nullptr;
+    CHECK(SUCCEEDED(rs->GetDevice(IID_PPV_ARGS(&real))));  // ReShade doesn't wrap root signatures
+    // the game's creates through the layer, then the layer's own on the device under it, as a bind-time clone is
+    for (auto [d, base, what] : {std::tuple{dev, seed, "ms"}, std::tuple{real, seed + 1000000, " own"}}) {
+        std::vector<double> t;
+        for (int i = 0; i < n; ++i) {
+            std::string K = std::to_string(base + i) + ".0";
+            ID3DBlob* cs = compile("RWByteAddressBuffer b : register(u0); [numthreads(64,1,1)] void main(uint i : SV_DispatchThreadID) {"
+                                   " float4 x = float4(asfloat(b.Load(i * 4)), " + K + ", i, 2); [unroll] for (int k = 0; k < 64; ++k) x = sin(x * 1.37 + float4(k, " + K +
+                                   ", x.y, x.w)) * cos(x.zxyw + " + K + "); b.Store(i * 4, asuint(dot(x, x))); }", "cs_5_0");
+            CHECK(cs);
+            D3D12_COMPUTE_PIPELINE_STATE_DESC c = {};
+            c.pRootSignature = rs, c.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+            ID3D12PipelineState* pso = nullptr;
+            HRESULT hr = S_OK;
+            t.push_back(ms([&] { hr = d->CreateComputePipelineState(&c, IID_PPV_ARGS(&pso)); }));
+            CHECK(SUCCEEDED(hr));
+            pso->Release(), cs->Release();
+        }
+        std::sort(t.begin(), t.end());
+        printf("%s %.2f %.2f", what, t[t.size() / 2], t.back());
+    }
+    printf("\n");
+    return 0;
+}
+
+static int layerwarm_phases(const std::wstring& dir, const std::wstring& kit, const std::wstring& run_dir, unsigned seed, int n, const std::function<int(wchar_t)>& create) {
+    if (int r = create(L'A')) return r;
+    std::string db = read_all(run_dir + L"A\\scskiller.db");
+    // A's records: what the layer changed is the 'C' records the 'W' records name first
+    std::set<Hash20> changed;
+    std::vector<std::pair<char, std::string>> recs;
+    for (size_t o = 0; o + 5 <= db.size();) {
+        uint32_t len;
+        memcpy(&len, db.data() + o + 1, 4);
+        recs.push_back({db[o], db.substr(o + 5, len)});
+        if (db[o] == 'W') changed.insert(*(const Hash20*)(db.data() + o + 5));
+        o += 5 + len;
+    }
+    // ReShade passes a desc it changed on as a pipeline stream ('S')
+    size_t cs = std::count_if(recs.begin(), recs.end(), [](auto& x) { return x.first == 'C'; });
+    printf("A recorded %zu compute PSOs as the game asked, %zu as the layer changed or made them\n", cs, changed.size());
+    CHECK(cs == 2 * (size_t)n && changed.size() == 2 * (size_t)n);  // the own ones are the layer's 'C' records
+    for (wchar_t p : {L'B', L'C', L'E', L'F'}) {
+        std::wstring work = run_dir + L"warm" + p + L"\\";
+        CreateDirectoryW(work.c_str(), nullptr);
+        FILE* f = _wfopen((work + L"scskiller.db").c_str(), L"wb");
+        CHECK(f);
+        for (auto& [tag, pl] : recs)
+            if (p == L'B' || p == L'F' || (tag != 'W' && !changed.count(sha1_of(tag, pl)))) {
+                uint32_t len = (uint32_t)pl.size();
+                fputc(tag, f), fwrite(&len, 4, 1, f), fwrite(pl.data(), 1, len, f);
+            }
+        fclose(f);
+        std::wstring layer = p == L'E' || p == L'F' ? L" --layer \"" + kit + L"\"" : L"";
+        if (int r = run(dir + L"scskiller_warm.exe", L"\"" + work + L".\" scsklw" + std::to_wstring(seed) + p + L".exe --threads 4" + layer)) return r;
+    }
+    for (wchar_t p : {L'B', L'C', L'E', L'F', L'D'})
+        if (int r = create(p)) return r;
+    return 0;
+}
+
+static int layerwarm_parent(const std::wstring& a, const std::wstring& dir, const std::wstring& kit, int n) {
+    namespace fs = std::filesystem;
+    std::wstring lock = gpu_lock("selftest layerwarm");
+    if (lock.empty()) return 1;
+    std::vector<fs::path> kit_files;
+    std::error_code ec;
+    for (auto& e : fs::directory_iterator(kit, ec))
+        if (e.is_regular_file()) kit_files.push_back(e.path());
+    CHECK(fs::exists(fs::path(kit) / L"dxgi.dll") && kit_files.size() >= 2);
+    RunDir run_dir(dir, L"layerwarm");
+    CHECK(!run_dir.path.empty());
+    std::random_device rd;
+    unsigned seed = 100000 + rd() % 8000000;
+    DxrSnap start = dxr_snap();
+    auto create = [&](wchar_t p) {  // in its own folder: this exe under a throwaway name, the proxy recording, the kit
+        std::wstring d = run_dir.path + p + L"\\", exe = d + L"scsklw" + std::to_wstring(seed) + p + L".exe";
+        CreateDirectoryW(d.c_str(), nullptr);
+        CopyFileW(a.c_str(), exe.c_str(), FALSE), CopyFileW((dir + L"d3d12.dll").c_str(), (d + L"d3d12.dll").c_str(), FALSE);
+        for (auto& f : kit_files) CopyFileW(f.c_str(), (d + f.filename().wstring()).c_str(), FALSE);
+        if (FILE* ini = _wfopen((d + L"scskiller.ini").c_str(), L"w")) fputs("[scskiller]\nmode=record\n", ini), fclose(ini);
+        printf("%lc: ", p);
+        return run(exe, L"layerwarmchild " + std::to_wstring(seed) + L" " + std::to_wstring(n));
+    };
+    int r = layerwarm_phases(dir, kit, run_dir.path, seed, n, create);
+    // only files that weren't there when the run started; no other process uses these names
+    for (auto& [path, v] : dxr_snap())
+        if (!start.count(path) && path.find(L"\\D3DSCache\\") == std::wstring::npos && DeleteFileW(path.c_str())) printf("deleted %ls\n", path.c_str());
+    if (r) run_dir.keep = true, printf("kept %ls\n", run_dir.path.c_str());
+    return r;
+}
+
 // `selftest dxcfill <count> <unroll> <seed> [hold s]`: grows the D3D12 driver cache under this exe's name (copy it to a
 // throwaway name first) with <count> distinct compute PSOs; on AMD, unroll 250 adds about 78 KB each. hold: keeps the
 // device, and so its cache files, open that long (-1: until Enter). System d3d12.dll, no proxy.
@@ -3199,6 +3373,9 @@ int wmain(int argc, wchar_t** argv) {
     if (argc > 2 && !wcscmp(argv[1], L"anticheat")) return anticheat_rows(dir, argv[2]);
     if (argc > 1 && !wcscmp(argv[1], L"factoryrejected")) return factory_rejected_rows(dir);
     if (argc > 2 && !wcscmp(argv[1], L"chain")) return chain_rows(dir, (unsigned)_wtoi(argv[2]), argc > 3 && !wcscmp(argv[3], L"swap"));
+    if (argc > 2 && !wcscmp(argv[1], L"layer")) return layer_rows(dir, (unsigned)_wtoi(argv[2]), argc > 3 && !wcscmp(argv[3], L"old"));
+    if (argc > 2 && !wcscmp(argv[1], L"layerwarm")) return layerwarm_parent(a, dir, argv[2], argc > 3 ? std::max(1, _wtoi(argv[3])) : 24);
+    if (argc > 3 && !wcscmp(argv[1], L"layerwarmchild")) return layerwarm_child(dir, (unsigned)_wtoi(argv[2]), _wtoi(argv[3]));
     if (argc > 1 && !wcscmp(argv[1], L"warpluid")) {  // for scskiller_warm --adapter-luid: WARP (the runtime's checks, no GPU cache)
         IDXGIFactory4* f = nullptr;
         IDXGIAdapter* w = nullptr;

@@ -151,7 +151,7 @@ public class FromSoftGameTests(ITestOutputHelper output)
     }
 
     /// <summary>The Basic Render Driver's LUID (the software adapter DXGI lists), as scskiller_warm's --adapter-luid takes it.</summary>
-    static unsafe long WarpLuid()
+    internal static unsafe long WarpLuid()
     {
         var iid = new Guid("770aae78-f26f-4dba-a829-253c83d1b387");   // IDXGIFactory1
         Assert.True(CreateDXGIFactory1(&iid, out var factory) >= 0);

@@ -220,7 +220,7 @@ public sealed class MiddlewarePack
     public void Write(string path)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        var tmp = path + ".tmp";
+        var tmp = $"{path}.{Guid.NewGuid():N}.tmp";
         using (var f = File.Create(tmp))
         {
             PlanFile.WriteHeader(f, "SCSKPACK"u8, Version, Header);
@@ -328,9 +328,53 @@ public sealed class MiddlewarePacks(string dir)
     }
 
     /// <summary>A pack as a canonical hash-only recording: its root signatures as 'B' records and its PSOs (an upload's body).</summary>
-    public static List<Rec> Records(MiddlewarePack pack) =>
-        HashOnly.CheckPack(HashOnly.Canonical([.. pack.RootSignatures.Select(r => new Rec('B', [.. Convert.FromHexString(r.Key), .. r.Value])), .. pack.Entries],
-            local: false, out _));
+    /// <summary>A pack's records as shared, without the records a layer made (<paramref name="layered"/>,
+    /// <see cref="LayerMade"/>) and the root signatures only they named.</summary>
+    public static List<Rec> Records(MiddlewarePack pack, IReadOnlySet<string>? layered = null) =>
+        HashOnly.CheckPack(HashOnly.Canonical([.. pack.RootSignatures.Select(r => new Rec('B', [.. Convert.FromHexString(r.Key), .. r.Value])),
+            .. pack.Entries.Where(e => layered?.Contains(e.Key) != true)], local: false, out _));
+
+    string LayerFile => Path.Combine(Dir, "layer-made.keys");
+
+    /// <summary>One pack writer at a time across processes: promotions and pruning read, change and rewrite whole packs.</summary>
+    IDisposable Lock() => App.Recordings.Lock(Path.Combine(Dir, "packs"));
+
+    /// <summary>The keys of every record a layer wrapping the device made, from every recording imported on this PC
+    /// (<see cref="Exclude"/>): never promoted, never shared, whichever recording brings them. A list that is there but
+    /// can't be read throws: nothing is promoted or shared without it.</summary>
+    public HashSet<string> LayerMade()
+    {
+        string[] lines;
+        try { lines = File.ReadAllLines(LayerFile); }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException) { return []; }   // only a missing one is empty
+        // written whole (a temp file moved in): any other line is damage, not a key to drop
+        if (lines.FirstOrDefault(l => l.Length != 40 || !l.All(char.IsAsciiHexDigitLower)) is { } bad)
+            throw new InvalidDataException($"{LayerFile}: not a record key: {bad}");
+        return [.. lines];
+    }
+
+    /// <summary>Adds <paramref name="keys"/> (a recording's 'W' targets) to <see cref="LayerMade"/> and takes them out of
+    /// the packs here.</summary>
+    public void Exclude(IEnumerable<string> keys)
+    {
+        using var _ = Lock();
+        var all = LayerMade();
+        if (Persist(all, keys)) PruneLocked(all);
+    }
+
+    /// <summary>Under the lock: <paramref name="keys"/> added to <paramref name="all"/> (<see cref="LayerMade"/>) and the file;
+    /// false = nothing new.</summary>
+    bool Persist(HashSet<string> all, IEnumerable<string> keys)
+    {
+        var n = all.Count;
+        all.UnionWith(keys);
+        if (all.Count == n) return false;
+        Directory.CreateDirectory(Dir);
+        var tmp = $"{LayerFile}.{Guid.NewGuid():N}.tmp";
+        File.WriteAllLines(tmp, all.Order(StringComparer.Ordinal));
+        File.Move(tmp, LayerFile, true);
+        return true;
+    }
 
     public sealed record Promoted(MiddlewareDll Dll, string ContentHash, int Records, int New, string PackPath);
 
@@ -340,15 +384,23 @@ public sealed class MiddlewarePacks(string dir)
     /// <paramref name="gpu"/>: this GPU's vendor ("nvidia", "amd"), kept in the pack (<see cref="PackHeader.Gpu"/>), so a pack
     /// holds one vendor's pipelines: a PSO whose wave size this GPU doesn't run is left out (the recording may hold another
     /// vendor's, from a community recording merged in), another vendor's pack starts over (a GPU change), and a pack from
-    /// before packs kept their GPU is adopted by this one without the PSOs it doesn't run.</summary>
+    /// before packs kept their GPU is adopted by this one without the PSOs it doesn't run. <paramref name="layered"/>: this
+    /// recording's records a layer wrapping the device made ('W'); with every recording's (<see cref="LayerMade"/>) they are
+    /// never promoted, and come out of a pack an earlier promotion put them in, with the root signatures only they named.</summary>
     public List<Promoted> Promote(IEnumerable<Rec> records, IReadOnlyDictionary<string, byte[]> blobs, IReadOnlyDictionary<string, ShaderInfo> index,
-        IEnumerable<MiddlewareDll> dlls, string source, string? gpu = null)
+        IEnumerable<MiddlewareDll> dlls, string source, string? gpu = null, IReadOnlySet<string>? layered = null)
     {
+        using var _ = Lock();
+        HashSet<string> excluded;
+        try { excluded = LayerMade(); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidDataException) { return []; }   // no promotion without the list
+        Persist(excluded, layered ?? new HashSet<string>());
+        PruneLocked(excluded);
         bool? amd = gpu == null ? null : gpu == "amd";
         var candidates = new List<(Rec R, Pso P)>();
         foreach (var r in records)
         {
-            if (r.Tag is not ('C' or 'G' or 'S')) continue;
+            if (r.Tag is not ('C' or 'G' or 'S') || excluded.Contains(r.Key)) continue;
             Pso p;
             try { p = Parse(r); } catch (Exception e) when (e is InvalidDataException or ArgumentException or KeyNotFoundException or ArgumentOutOfRangeException) { continue; }
             if (p.Stages.Count > 0 && !p.Stages.Values.Any(index.ContainsKey)) candidates.Add((r, p));
@@ -361,6 +413,7 @@ public sealed class MiddlewarePacks(string dir)
             var mine = candidates.Where(c => c.P.Stages.Values.All(h => image.Containers.ContainsKey(h) && (amd is not { } a || image.Runs(h, a)))).ToList();
             if (mine.Count == 0) continue;
             var pack = Load(dll, image);
+            var path = PathOf(dll.Vendor, dll.Name, image.ContentHash);
             var reset = false;
             if (gpu != null && pack != null && pack.Header.Gpu != gpu)
             {
@@ -383,11 +436,37 @@ public sealed class MiddlewarePacks(string dir)
                 }
                 if (pack.Add(r, source)) added++;
             }
-            var path = PathOf(dll.Vendor, dll.Name, image.ContentHash);
             if (added > 0 || reset) pack.Write(path);
             result.Add(new Promoted(dll, image.ContentHash, mine.Count, added, path));
         }
         return result;
+    }
+
+    /// <summary>Takes the records a layer made (<paramref name="layered"/>, by key) out of every pack here that has them,
+    /// with the root signatures only they named: packs are shared, and an earlier promotion may have put them in before
+    /// their 'W' was known. Returns how many packs changed.</summary>
+    public int Prune(IReadOnlySet<string> layered)
+    {
+        using var _ = Lock();
+        return PruneLocked(layered);
+    }
+
+    int PruneLocked(IReadOnlySet<string> layered)
+    {
+        if (layered.Count == 0 || !Directory.Exists(Dir)) return 0;
+        var changed = 0;
+        foreach (var path in Directory.EnumerateFiles(Dir, "*.pack", SearchOption.AllDirectories).ToList())
+        {
+            MiddlewarePack pack;
+            try { pack = MiddlewarePack.Read(path); }
+            catch (Exception e) when (e is InvalidDataException or IOException or JsonException or UnauthorizedAccessException) { continue; }
+            if (pack.Entries.RemoveAll(e => layered.Contains(e.Key)) == 0) continue;
+            var named = pack.Entries.Select(e => Parse(e).Rs).ToHashSet();
+            foreach (var h in pack.RootSignatures.Keys.Where(h => !named.Contains(h)).ToList()) pack.RootSignatures.Remove(h);
+            pack.Write(path);
+            changed++;
+        }
+        return changed;
     }
 
     public sealed record Seeded(MiddlewareDll Dll, string ContentHash, MiddlewarePack Pack);

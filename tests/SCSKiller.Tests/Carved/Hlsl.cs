@@ -25,10 +25,12 @@ static class Hlsl
 
     public static byte[] RootSignature(string rs) => Compile($"#define RS \"{rs}\"\n", "RS", "rootsig_1_1"); // SM5.1's [RootSignature] is 1.1 too
 
-    public static byte[] Compile(string src, string entry, string target)
+    public const uint UnboundedTables = 1 << 20; // D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES
+
+    public static byte[] Compile(string src, string entry, string target, uint flags = 0)
     {
         var bytes = Encoding.ASCII.GetBytes(src);
-        var hr = D3DCompile(bytes, bytes.Length, null, 0, 0, entry, target, 0, 0, out var code, out var errors);
+        var hr = D3DCompile(bytes, bytes.Length, null, 0, 0, entry, target, flags, 0, out var code, out var errors);
         if (hr < 0) throw new InvalidOperationException($"D3DCompile {target} 0x{hr:x8}: {(errors != 0 ? Encoding.ASCII.GetString(Blob(errors)) : "")}");
         if (errors != 0) Blob(errors);
         return Blob(code);

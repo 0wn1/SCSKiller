@@ -41,29 +41,18 @@ jobs:
           at=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.commit.committer.date | fromdate')
           if (( $(date +%s) - at > 90000 )); then echo "unchanged=yes" >> "$GITHUB_OUTPUT"; fi
 
-  # The server (server/, scsk-origin) runs on Linux in production: on the public repo its tests run there; the private
-  # repo runs them on the self-hosted Windows runner.
-  # The public repo has no server/ (build/public-allowlist.txt): the steps skip themselves there (hashFiles needs the
-  # checkout, so the condition is per step, not on the job).
-  server:
+  # tools/measure.py's self-test (Linux on the public repo, the self-hosted runner on the private one). The public repo
+  # has no tools/measure.py (build/public-allowlist.txt): the step skips itself there (hashFiles needs the checkout, so
+  # the condition is per step, not on the job).
+  tools:
     needs: changed
     if: >-
       !cancelled() && needs.changed.outputs.unchanged != 'yes' &&
       (!github.event.repository.private || github.event_name != 'push' || github.ref_type == 'tag')
     runs-on: ${{ vars.SCSK_RUNNER && fromJSON(vars.SCSK_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 15
-    env:
-      DOTNET_NOLOGO: 'true'
-      DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68   # v6.0.0
-        if: hashFiles('server/**') != ''
-        with:
-          dotnet-version: 10.0.x
-      - name: Test
-        if: hashFiles('server/**') != ''
-        run: dotnet test tests/SCSKiller.Server.Tests -c Release
       - name: Test tools/measure.py
         if: hashFiles('tools/test_measure.py') != ''
         shell: bash

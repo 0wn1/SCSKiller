@@ -113,7 +113,7 @@ public sealed class WarmPasses
             foreach (var (tag, payload) in Records(Path.Combine(workDir, db)))
                 switch (tag)
                 {
-                    case 'B' or 'N': break;
+                    case 'B' or 'N' or 'W': break;
                     case '1' or '2': items11++; break;
                     case 'P': plans.Add(payload!); break;
                     default:

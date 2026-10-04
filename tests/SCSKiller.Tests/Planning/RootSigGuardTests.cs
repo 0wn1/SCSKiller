@@ -70,6 +70,40 @@ public class RootSigGuardTests(ITestOutputHelper output)
         }
     }
 
+    /// <summary>An unbounded texture array needs a descriptor table: a root SRV at its first register doesn't serve it (the
+    /// runtime rejects that), a bounded table holding it does. A (root SRV t0) and B (a table of 8 from t0) have the same
+    /// counts; C, unrecorded with t0 unbounded, gets B's whichever was recorded last, and with only A's recorded none.</summary>
+    [Fact]
+    public void AnUnboundedRangeNeedsATableNotARootDescriptor()
+    {
+        ShaderInfo Cs(string name, int count) => Shader(name, Stage.Compute, []) with { ShaderModel = "cs_5_1", Counts = new(0, 1, 0, 0), Bindings = [new("srv", 0, 0, count)] };
+        var (a, b, c) = (Cs("ub-a", 1), Cs("ub-b", 1), Cs("ub-c", -1));
+        (string Sha, byte[] Blob) Rs(uint[] row) { var x = RootSig.Serialize(new RootSig.Desc(0, [row]), []); return (PsoDb.Hex(System.Security.Cryptography.SHA1.HashData(x)), x); }
+        var (root, table) = (Rs([3, 0, 0, 0, 0]), Rs([0, 0, 0, 8, 0, 0, 0]));
+        Assert.NotNull(RootSig.Uncovered(RootSig.Parse(root.Blob), Stage.Compute, c));
+        Assert.Null(RootSig.Uncovered(RootSig.Parse(table.Blob), Stage.Compute, c));
+        var index = new ShaderIndex("synthetic", ["PCD3D_SM5"], new[] { a, b, c }.ToDictionary(s => s.Sha1), [new ShaderMap("m", "Game", "PCD3D_SM5", [a.Sha1, b.Sha1, c.Sha1])]);
+        foreach (var order in new[] { new[] { (a, root), (b, table) }, [(b, table), (a, root)], [(a, root)] })
+        {
+            var dir = Ff7.TempDir("rs-unbounded");
+            var path = Path.Combine(dir, "recording.db");
+            using (var f = File.Create(path))
+                foreach (var (cs, rs) in order)
+                {
+                    PsoDb.WriteBlob(f, rs.Sha, rs.Blob);
+                    PsoDb.Write(f, 'C', PsoDb.Compute(rs.Sha, cs.Sha1));
+                }
+            var plan = new Planner().Build(Ff7.Game, Ue427, index, new Recording(path), Ff7.Nvidia, Path.Combine(dir, "plan"), null, CancellationToken.None);
+            var items = PlanFile.Read(plan.FilePath).Records.Where(r => r.Tag == 'P').Select(r => PsoDb.ParseItem(r.Payload)).ToList();
+            if (order.Length == 1)
+            {
+                Assert.DoesNotContain(items, i => i.Stages.ContainsValue(c.Sha1));
+                Assert.Equal(1, plan.Stats.Uncovered);
+            }
+            else Assert.Equal(table.Sha, Assert.Single(items, i => i.Stages.ContainsValue(c.Sha1)).Rs);
+        }
+    }
+
     /// <summary>DXBC links by register: a VS writing SV_RenderTargetArrayIndex in r0 and SV_POSITION in r1 can't feed a PS reading
     /// SV_Position from r0 (the runtime's linkage error; Hogwarts: 9 PSOs), so the pair isn't planned; the same pair in DXIL
     /// (linked by semantic) and a VS with SV_POSITION in r0 are.</summary>

@@ -29,9 +29,10 @@ public class WelcomeTests
         Assert.StartsWith("Help improve the community shader hash database", WelcomeContent.Default.Share);
         var root = new DirectoryInfo(AppContext.BaseDirectory);
         while (!File.Exists(Path.Combine(root.FullName, "SCSKiller.slnx"))) root = root.Parent!;
-        if (!Directory.Exists(Path.Combine(root.FullName, "server"))) return;   // the public source has no server/
+        var served = Path.Combine(root.FullName, "server-rs", "content", "welcome.json");
+        if (!Directory.Exists(Path.Combine(root.FullName, "server-rs"))) return;   // the public source has no server-rs/
         Assert.Equal(File.ReadAllBytes(Path.Combine(root.FullName, "src", "SCSKiller.Core", "App", "welcome.json")),
-                     File.ReadAllBytes(Path.Combine(root.FullName, "server", "content", "welcome.json")));
+                     File.ReadAllBytes(served));
     }
 
     [Theory]

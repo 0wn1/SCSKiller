@@ -227,4 +227,98 @@ public class UnrealReaderTests(ITestOutputHelper output)
             .. BitConverter.GetBytes(3), .. BitConverter.GetBytes(32), .. BitConverter.GetBytes(1_000_000), .. BitConverter.GetBytes(0), .. new byte[24]];   // resources, stride 0
         Assert.Empty(ShaderContainer.Rdat(Container(("DXIL", BitConverter.GetBytes(6u << 16 | 0x63)), ("RDAT", rdat))).Resources);
     }
+
+    /// <summary>An IoStore shader library with 8-byte (5.8) or 20-byte hashes reads whichever UE5 version was detected; bytes
+    /// that are no library name the file instead of an overflow.</summary>
+    [Theory]
+    [InlineData(8, CUE4Parse.UE4.Versions.EGame.GAME_UE5_6)]
+    [InlineData(20, CUE4Parse.UE4.Versions.EGame.GAME_UE5_8)]
+    [InlineData(8, CUE4Parse.UE4.Versions.EGame.GAME_UE5_8)]
+    public void ShaderLibraryHashWidthFollowsTheFile(int width, CUE4Parse.UE4.Versions.EGame detected)
+    {
+        var o = new MemoryStream();
+        var w = new BinaryWriter(o);
+        w.Write(1);                                                     // version 1: IoStore
+        w.Write(1); w.Write(Enumerable.Repeat((byte)0xAB, width).ToArray()); // shader map hashes
+        w.Write(1); w.Write(Enumerable.Repeat((byte)0xCD, width).ToArray()); // shader hashes
+        w.Write(1); w.Write(new byte[12]);                              // group chunk ids
+        w.Write(1); w.Write(0); w.Write(1);                             // map entries
+        w.Write(1); w.Write(0L);                                        // shader entries
+        w.Write(1); w.Write(0); w.Write(1); w.Write(64); w.Write(64);    // group entries
+        w.Write(1); w.Write(0);                                         // shader indices
+        var lib = (CUE4Parse.UE4.Shaders.FIoStoreShaderCodeArchive)UnrealReader.ReadLibrary("x.ushaderbytecode", o.ToArray(), detected).SerializedShaders;
+        Assert.Equal(string.Concat(Enumerable.Repeat("ab", width)).PadRight(40, '0'), lib.ShaderMapHashes.Single().ToString().ToLowerInvariant());
+        Assert.Equal(64u, lib.ShaderGroupEntries.Single().UncompressedSize);
+
+        var e = Assert.Throws<InvalidDataException>(() => UnrealReader.ReadLibrary("Game/x.ushaderbytecode", [1, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF], detected));
+        Assert.StartsWith("Game/x.ushaderbytecode: not a shader library", e.Message);
+    }
+
+    /// <summary>A 20-byte library read as 5.8 takes hash bytes 8-11 for the next count (0x40000000 here): the counts are
+    /// bounded by the file before CUE4Parse allocates (it would ask for gigabytes), and the 20-byte layout is read.</summary>
+    [Fact]
+    public void ShaderLibraryCountsAreBoundedBeforeAllocating()
+    {
+        byte[] hash = [.. Enumerable.Repeat((byte)0xAB, 8), 0, 0, 0, 0x40, .. Enumerable.Repeat((byte)0xAB, 8)];
+        var o = new MemoryStream();
+        var w = new BinaryWriter(o);
+        w.Write(1);
+        w.Write(1); w.Write(hash);
+        w.Write(0); w.Write(0); w.Write(0); w.Write(0); w.Write(0); w.Write(0);
+        Assert.Null(UnrealReader.LibraryEnd(o.ToArray(), 8, ioStore: true));
+        var lib = (CUE4Parse.UE4.Shaders.FIoStoreShaderCodeArchive)UnrealReader.ReadLibrary("x", o.ToArray(), CUE4Parse.UE4.Versions.EGame.GAME_UE5_8).SerializedShaders;
+        Assert.Equal(Convert.ToHexStringLower(hash), lib.ShaderMapHashes.Single().ToString().ToLowerInvariant());
+    }
+
+    /// <summary>Fortnite (anti-cheat: its exe isn't read) writes .utoc version 10 and 8-byte shader library hashes: detected as
+    /// 5.8 from its containers, its libraries read, and no stock rule claims it.</summary>
+    [Trait("Needs", "Game")]
+    [Fact]
+    public void FortniteDetectsAs58FromItsContainers()
+    {
+        if (new SCSKiller.Core.Games.EpicSource().Discover().FirstOrDefault(g => g.Id == "epic:Fortnite") is not { } game) return;
+        var r = new UnrealReader(Ff7.TempDir("fortnite"));
+        var e = r.Detect(game)!;
+        Assert.Equal("5.8", e.Version);
+        Assert.Null(SCSKiller.Core.Planning.RootSig.RuleFor(e));
+        var index = r.Index(game, e, new Progress<string>(output.WriteLine), CancellationToken.None);
+        Assert.NotEmpty(index.Shaders);
+        output.WriteLine($"{index.Shaders.Count} shaders, {index.Maps.Count} maps");
+    }
+
+    /// <summary>A pak-era (version 2) library ends with its shaders' code, back to back after the header.</summary>
+    [Fact]
+    public void PakEraShaderLibraryEndsAfterItsCode()
+    {
+        var o = new MemoryStream();
+        var w = new BinaryWriter(o);
+        w.Write(2);
+        w.Write(1); w.Write(new byte[20]);                                                  // shader map hashes
+        w.Write(2); w.Write(new byte[40]);                                                  // shader hashes
+        w.Write(1); w.Write(0); w.Write(2); w.Write(0); w.Write(0);                         // map entries
+        w.Write(2); w.Write(0L); w.Write(3); w.Write(3); w.Write((byte)1); w.Write(3L); w.Write(5); w.Write(5); w.Write((byte)0);   // code entries
+        w.Write(0);                                                                         // preloads
+        w.Write(2); w.Write(0); w.Write(1);                                                 // indices
+        w.Write(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 });                                     // code
+        var b = o.ToArray();
+        Assert.Equal(b.Length, UnrealReader.LibraryEnd(b, 20, ioStore: false));
+        var arc = UnrealReader.ReadLibrary("x", b, CUE4Parse.UE4.Versions.EGame.GAME_UE5_6);
+        Assert.Equal([4, 5, 6, 7, 8], arc.ShaderCode[1]);
+    }
+
+    /// <summary>Shader code no codec decompresses throws InvalidDataException, which indexing counts and skips, with the
+    /// block's first bytes: they tell the format apart (Oodle 8C, zlib 78, zstd 28B52FFD).</summary>
+    [Fact]
+    public void UndecodableShaderCodeSaysWhatItStartsWith()
+    {
+        byte[] code = [0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4, 5, 6];
+        var o = new MemoryStream();
+        var w = new BinaryWriter(o);
+        w.Write(1u); w.Write(1);                                    // version 1, one entry
+        w.Write(new byte[20]); w.Write(0L); w.Write(code.Length); w.Write(64); w.Write((byte)0);   // hash, offset, size, uncompressed size, frequency
+        w.Write(code);
+        var arc = UnrealReader.OpenV1(o.ToArray())!;
+        var e = Assert.Throws<InvalidDataException>(() => arc.Codes[0]().ToList());
+        Assert.EndsWith("(starts DEADBEEF01020304)", e.Message);
+    }
 }

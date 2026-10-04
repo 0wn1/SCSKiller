@@ -315,6 +315,25 @@ public class SharedPackTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void The_key_cache_drops_every_set_once_none_was_asked_for_in_its_idle_time()
+    {
+        var x = Make("sp-keyidle");
+        var path = Path.Combine(x.Root, "keys");
+        File.WriteAllText(path, "keys");
+        var reads = 0;
+        HashSet<string> Read(string _) { reads++; return ["a"]; }
+        KeyFiles.Keys(path, Read);
+        Assert.False(KeyFiles.DropIdle(TimeSpan.FromHours(1)));   // just asked for
+        KeyFiles.Keys(path, Read);
+        Assert.Equal(1, reads);
+        Assert.True(KeyFiles.DropIdle(TimeSpan.Zero));
+        Assert.Equal(0, KeyFiles.CachedKeys);
+        Assert.False(KeyFiles.DropIdle(TimeSpan.Zero));   // nothing left
+        KeyFiles.Keys(path, Read);
+        Assert.Equal(2, reads);
+    }
+
+    [Fact]
     public void A_damaged_key_file_reads_as_unknown_and_is_written_again()
     {
         var x = Make("sp-damaged");

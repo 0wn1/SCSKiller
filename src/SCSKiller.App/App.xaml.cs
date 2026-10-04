@@ -58,9 +58,8 @@ public partial class App : Application
             real.Community = new Community(AppStore.DefaultDir, Account.GetDbTokenAsync);
             real.Sharing = new Sharing(AppStore.DefaultDir, () => real.Settings.ShareRecordings);   // anonymous: never the Patreon sign-in
             real.ContentRoutes = RouteFailover.Default;
-            // the entitlements first: the update check picks the channel they allow. Only the feed: a package download
-            // (the edge allows 3 full packages a day per device) waits for the 6 h check.
-            real.UserFetch = async () => { await Account.RefreshAsync(); await Updater.CheckAsync(download: false); };
+            // the entitlements first: the update check picks the channel they allow
+            real.UserFetch = async () => { await Account.RefreshAsync(); await Updater.CheckAsync(); };
             // not before the welcome, which says it is sent and where to turn it off
             real.ActiveCheck = new ActiveCheck(AppStore.DefaultDir, () => real.Settings is { ActiveCheck: true, WelcomeSeen: true }, real.Vendor.Vendor);
             // not in the unattended --driver-updated launch: nobody at the PC, no game folder is written
@@ -72,6 +71,8 @@ public partial class App : Application
             watcher = real.WatchGames(stopWatching.Token);
         }
         Main = new MainWindow();
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(Main);
+        if (Core is ScsKiller seen) seen.Unseen = () => !IsWindowVisible(hwnd) || IsIconic(hwnd);
 
         var activation = AppInstance.GetCurrent().GetActivatedEventArgs();
         string? toastError = null;
@@ -471,6 +472,8 @@ public partial class App : Application
     static string? ActionOf(IDictionary<string, string> args) => args.TryGetValue("action", out var a) ? a : null;
 
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(nint hwnd);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(nint hwnd);
+    [DllImport("user32.dll")] static extern bool IsIconic(nint hwnd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool ShutdownBlockReasonCreate(nint hwnd, string reason);
     [DllImport("user32.dll")] static extern bool ShutdownBlockReasonDestroy(nint hwnd);
 }

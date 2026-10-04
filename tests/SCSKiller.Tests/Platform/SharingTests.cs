@@ -130,6 +130,48 @@ public class SharingTests : IDisposable
         Assert.DoesNotContain(records, r => r.Payload.AsSpan().IndexOf(Shader) >= 0);
     }
 
+    /// <summary>Under a layer wrapping the device (a mod), only the game's records are shared: neither the 'W' records, nor
+    /// the records the driver got from the layer (changed or its own, with their 'N'), nor root signatures only those name.
+    /// The server's check still refuses a 'W'.</summary>
+    [Fact]
+    public async Task A_layer_s_records_are_never_uploaded()
+    {
+        var (rs, layerRs) = (RootSignature(), SCSKiller.Tests.Planning.MiddlewarePackTests.Container("RTS0", "layer root signature"));
+        var mod = "DXBC the layer's replacement shader"u8.ToArray();
+        PsoDb.Rec Vs(byte[] root, byte[] vs) => new('S', PsoDb.Stream(Sha1(root), new Dictionary<int, string> { [(int)Stage.Vertex] = Sha1(vs) }, [], 3, [PsoDb.R16G16B16A16Float], 0));
+        var (game, driver, own) = (Vs(rs, Shader), Vs(layerRs, mod), new PsoDb.Rec('C', PsoDb.Compute(Sha1(layerRs), Sha1(mod))));
+        using (var f = File.Create(Path.Combine(GameDir, "recording.db")))
+            foreach (var r in new[] { Blob(rs), Blob(Shader), game, Blob(layerRs),
+                         Blob(mod), driver, new PsoDb.NvState(driver.Key, 0, 1001, 3, 0).ToRec(), RecordingsTests.W(driver, game), own, RecordingsTests.W(own, null) })
+                PsoDb.Write(f, r.Tag, r.Payload);
+
+        Assert.NotNull(await Make().ShareAsync(GameDir, Content, Meta));
+        var records = Core.Planning.HashOnly.Decompress(_sent.Single(s => s.Line.Contains("/v1/upload")).Body);
+        Assert.Equal([Sha1(rs), game.Key], records.Select(r => r.Tag == 'B' ? PsoDb.Hex(r.Payload.AsSpan(0, 20)) : r.Key));
+        Assert.Throws<InvalidDataException>(() => Core.Planning.HashOnly.Canonical([.. records, RecordingsTests.W(game, null)], local: false, out _));
+    }
+
+    /// <summary>A 'W' names pipeline and state object records only (the recorder writes one per create the layer changed);
+    /// root signatures go by what names them. One only the layer's records name is dropped with them; one a game's record
+    /// names too is the game's (the layer passed it on unchanged) and is shared; a 'W' naming a root signature's hash names
+    /// no record and changes nothing.</summary>
+    [Fact]
+    public void A_layer_s_root_signatures_go_by_the_records_naming_them()
+    {
+        var (rs, layerRs) = (RootSignature(), SCSKiller.Tests.Planning.MiddlewarePackTests.Container("RTS0", "layer root signature"));
+        PsoDb.Rec Cs(byte[] root, string cs) => new('C', PsoDb.Compute(Sha1(root), Sha1(System.Text.Encoding.UTF8.GetBytes(cs))));
+        var (game, driver, passed) = (Cs(rs, "game"), Cs(layerRs, "game"), Cs(rs, "the layer's own on the game's root signature"));
+        List<string> Shared(params PsoDb.Rec[] recs) =>
+            [.. Core.Planning.HashOnly.Canonical(recs, local: true, out _).Select(r => r.Tag == 'B' ? PsoDb.Hex(r.Payload.AsSpan(0, 20)) : r.Key)];
+
+        Assert.Equal([Sha1(rs), game.Key], Shared(Blob(rs), Blob(layerRs), game, driver, RecordingsTests.W(driver, game)));
+        Assert.Equal([Sha1(rs), game.Key], Shared(Blob(rs), game, passed, RecordingsTests.W(passed, null)));
+        var named = new PsoDb.Rec('W', [.. Convert.FromHexString(Sha1(rs)), .. new byte[20]]);
+        Assert.Equal([Sha1(rs), game.Key], Shared(Blob(rs), game, named));
+    }
+
+    static PsoDb.Rec Blob(byte[] b) => new('B', [.. System.Security.Cryptography.SHA1.HashData(b), .. b]);
+
     /// <summary>With the build's shader list (the index's, <see cref="Sharing.ShippedFile"/>), a pipeline naming a shader
     /// neither it nor a middleware DLL ships is flagged 'L' in the upload; one the DLLs ship isn't. Without the list (or for
     /// another build) nothing is flagged, and the list arriving re-examines the recording.</summary>
@@ -266,6 +308,41 @@ public class SharingTests : IDisposable
 
     /// <summary>Past one upload's 20k records: several uploads, each valid on its own; a pass cut short by a 429 resumes with
     /// the ones the server doesn't have yet.</summary>
+    /// <summary>What a layer made is read again before each upload of a long session: a record learned as a layer's during
+    /// the first upload is left out of the second; a list that can't be read then stops the rest, which stays unmarked.</summary>
+    [Fact]
+    public async Task Each_upload_of_a_long_session_reads_what_a_layer_made_again()
+    {
+        Record(BigRecording(25_000));
+        var last = PsoDb.Read(Path.Combine(GameDir, "recording.db")).Where(r => r.Tag == 'S').Select(r => r.Key).Max(StringComparer.Ordinal)!;   // in the second upload
+        var known = new HashSet<string>();
+        _upload = _ => { lock (known) known.Add(last); return null!; };
+        Assert.NotNull(await Make().ShareAsync(GameDir, Content, Meta, layerMade: () => { lock (known) return new HashSet<string>(known); }));
+        var chunks = _sent.Where(s => s.Line.Contains("/v1/upload")).Select(s => Core.Planning.HashOnly.Decompress(s.Body)).ToList();
+        Assert.Equal(2, chunks.Count);
+        Assert.DoesNotContain(chunks[1], r => r.Key == last);
+        Assert.Equal(24_999, chunks.Sum(c => c.Count(r => r.Tag == 'S')));
+
+        File.Delete(Path.Combine(GameDir, "shared.json"));
+        _sent.Clear();
+        var reads = 0;
+        var sharing = Make();
+        Assert.Null(await sharing.ShareAsync(GameDir, Content, Meta, layerMade: () => ++reads <= 2 ? new HashSet<string>() : throw new IOException("locked")));
+        Assert.Single(_sent, s => s.Line.Contains("/v1/upload"));
+        Assert.Contains("locked", sharing.Problem);
+        Assert.Single(Sharing.Shared(GameDir)!.Sent!);   // the first upload, kept; the recording isn't marked shared
+
+        File.Delete(Path.Combine(GameDir, "shared.json"));   // a damaged recording behind the list: the same
+        _sent.Clear();
+        reads = 0;
+        sharing = Make();
+        Assert.Null(await sharing.ShareAsync(GameDir, Content, Meta, layerMade: () => ++reads <= 2 ? new HashSet<string>() : throw new InvalidDataException("damaged")));
+        Assert.Single(_sent, s => s.Line.Contains("/v1/upload"));
+        Assert.Contains("damaged", sharing.Problem);
+        Assert.Single(Sharing.Shared(GameDir)!.Sent!);
+        Assert.Equal("", Sharing.Shared(GameDir)!.Stamp);   // not marked shared
+    }
+
     [Fact]
     public async Task A_long_session_goes_in_several_uploads_and_a_pass_cut_short_resumes()
     {
@@ -355,6 +432,61 @@ public class SharingTests : IDisposable
         Assert.Empty(_sent);
         Assert.False(File.Exists(Path.Combine(_dir, "upload.dat")));
         Assert.Null(Sharing.Shared(GameDir));
+    }
+
+    /// <summary>A recording that has a layer's pipeline without its 'W' (from before the recorder wrote one) uploads without
+    /// it once another recording's 'W' named it (<see cref="MiddlewarePacks.LayerMade"/>), and without its root signature.</summary>
+    [Fact]
+    public async Task A_recording_upload_leaves_out_what_another_recording_knows_a_layer_made()
+    {
+        var (rs, layerRs) = (RootSignature(), SCSKiller.Tests.Planning.MiddlewarePackTests.Container("RTS0", "layer root signature"));
+        var (game, layer) = (new PsoDb.Rec('C', PsoDb.Compute(Sha1(rs), Sha1(Shader))), new PsoDb.Rec('C', PsoDb.Compute(Sha1(layerRs), Sha1(Shader))));
+        using (var f = File.Create(Path.Combine(GameDir, "recording.db")))
+            foreach (var r in new[] { Blob(rs), Blob(Shader), game, Blob(layerRs), layer })
+                PsoDb.Write(f, r.Tag, r.Payload);
+
+        await Assert.ThrowsAsync<IOException>(() => Make().ShareAsync(GameDir, Content, Meta, layerMade: () => throw new IOException("locked")));
+        Assert.Empty(_sent.Where(s => s.Line.Contains("/v1/upload")));   // the list unreadable: nothing shared, and not marked shared
+        Assert.NotNull(await Make().ShareAsync(GameDir, Content, Meta, layerMade: () => new HashSet<string> { layer.Key }));
+        var records = Core.Planning.HashOnly.Decompress(_sent.Single(s => s.Line.Contains("/v1/upload")).Body);
+        Assert.Equal([Sha1(rs), game.Key], records.Select(r => r.Tag == 'B' ? PsoDb.Hex(r.Payload.AsSpan(0, 20)) : r.Key));
+    }
+
+    /// <summary>A pack's upload leaves out the records a layer made and the root signature only they name, whatever the pack
+    /// file still holds (a share between a recording's import and the packs' exclusion, or after a crash there). The list is
+    /// read again before each pack's payload: one learned during the pass applies to the next pack. A list that can't be read
+    /// ends the pass with nothing shared.</summary>
+    [Fact]
+    public async Task A_pack_upload_leaves_out_a_layer_s_records_the_pack_still_holds()
+    {
+        var packs = Path.Combine(_dir, "packs");
+        var (rs, layerRs) = (RootSignature(), SCSKiller.Tests.Planning.MiddlewarePackTests.Container("RTS0", "layer root signature"));
+        var (game, layer) = (new PsoDb.Rec('C', PsoDb.Compute(Sha1(rs), Sha1(Shader))), new PsoDb.Rec('C', PsoDb.Compute(Sha1(layerRs), Sha1(Shader))));
+        List<string> paths = [];
+        foreach (var dllSha in new[] { new string('d', 40), new string('e', 40) })
+        {
+            var fsr = new MiddlewarePack("amd", "amd_fidelityfx_dx12.dll", dllSha, 1000, gpu: "nvidia");
+            (fsr.RootSignatures[Sha1(rs)], fsr.RootSignatures[Sha1(layerRs)]) = (rs, layerRs);
+            fsr.Add(game, "steam:480");
+            fsr.Add(layer, "steam:480");
+            paths.Add(Path.Combine(packs, "amd", MiddlewarePack.FileName(fsr.Header.Dll, dllSha)));
+            fsr.Write(paths[^1]);
+        }
+        var sharing = Make();
+        var known = new HashSet<string>();
+        IReadOnlySet<string> Known() { var now = new HashSet<string>(known); known.Add(layer.Key); return now; }   // learned after the first read
+        Assert.Equal(2, (await sharing.SharePacksAsync(packs, "nvidia", "1.4.0", Known)).Count);
+        var bodies = _sent.Where(s => s.Line.Contains("/v1/upload")).Select(s => Core.Planning.HashOnly.Decompress(s.Body)
+            .Select(r => r.Tag == 'B' ? PsoDb.Hex(r.Payload.AsSpan(0, 20)) : r.Key).ToList()).ToList();
+        Assert.Equal(3 + 1, bodies[0].Count);   // the first pack: both root signatures and both pipelines
+        Assert.Equal([Sha1(rs), game.Key], bodies[1]);
+
+        var more = MiddlewarePack.Read(paths[0]);
+        more.Add(new PsoDb.Rec('C', PsoDb.Compute(Sha1(rs), Sha1("another"u8.ToArray()))), "steam:480");
+        more.Write(paths[0]);
+        Assert.Empty(await sharing.SharePacksAsync(packs, "nvidia", "1.4.0", () => throw new IOException("locked")));
+        Assert.Equal(2, _sent.Count(s => s.Line.Contains("/v1/upload")));
+        Assert.Equal("locked", sharing.Problem);
     }
 
     [Fact]

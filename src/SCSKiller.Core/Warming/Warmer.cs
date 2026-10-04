@@ -51,6 +51,11 @@ public sealed class Warmer(IGpuVendorBackend vendor, string? warmExe = null) : I
     /// <summary>The game's AGS registration (<see cref="AmdAgs.Of"/>); null or returning null: a plain device.</summary>
     public Func<Game, AgsRegistration?>? Ags { get; set; }
 
+    /// <summary>A folder holding a copy of the game's layer (ReShade's dll, its ini, the add-ons), staged next to the warm's
+    /// exe (scskiller_warm --layer) so the layer changes the warm's pipelines as it changes the game's; null or returning
+    /// null: none. Called with the run's work folder.</summary>
+    public Func<Game, string, string?>? Layer { get; set; }
+
     /// <summary>The warm exe for a vendor, relative to native\: NVIDIA's runs on the segment heap (ARCHITECTURE.md), the
     /// others on the NT heap. Both are named scskiller_warm.exe and stage themselves under the game's name.</summary>
     public static string ExeFor(GpuVendor vendor) => vendor == GpuVendor.Nvidia ? @"segheap\scskiller_warm.exe" : "scskiller_warm.exe";
@@ -70,6 +75,7 @@ public sealed class Warmer(IGpuVendorBackend vendor, string? warmExe = null) : I
         var reg = vendor.Vendor == GpuVendor.Amd ? Ags?.Invoke(game) : null;
         var ags = AgsArgs(vendor.Vendor, game, reg, reg == null ? null : AmdAgs.DllFor(game, NativeTools.Find(AmdAgs.DllName)), out var agsWhy);
         if (agsWhy != null) Log?.Report($"{game.Name}: {agsWhy}");
+        if (Layer?.Invoke(game, workDir) is { } layer) ags = [.. ags, "--layer", layer];
         return new WarmRun(vendor, gpu, exe, game, workDir, options, progress, StuckAfter, stagePath, MaxRecoveries, Environment, ags, Log);
     }
 
@@ -136,7 +142,7 @@ sealed class WarmRun : IWarmRun
     public Task<WarmResult> Completion { get; }
 
     public WarmRun(IGpuVendorBackend vendor, GpuInfo gpu, string exe, Game game, string workDir, WarmOptions o, IProgress<WarmProgress>? progress, TimeSpan stuckAfter, string? stagePath,
-        int maxRecoveries, IReadOnlyDictionary<string, string>? env, string[]? ags = null, IProgress<string>? log = null)
+        int maxRecoveries, IReadOnlyDictionary<string, string>? env, string[]? extra = null, IProgress<string>? log = null)
     {
         _stuckAfter = stuckAfter;
         var stopName = $"Local\\SCSKiller.Stop.{Guid.NewGuid():N}";
@@ -165,7 +171,7 @@ sealed class WarmRun : IWarmRun
             if (rtThreads > 0) { psi.ArgumentList.Add("--rt-threads"); psi.ArgumentList.Add(rtThreads.ToString()); }
             if (skip.Count > 0) { psi.ArgumentList.Add("--skip"); psi.ArgumentList.Add(string.Join(',', skip)); }
             if (stagePath != null) { psi.ArgumentList.Add("--stage-path"); psi.ArgumentList.Add(stagePath); }
-            foreach (var a in ags ?? []) psi.ArgumentList.Add(a);
+            foreach (var a in extra ?? []) psi.ArgumentList.Add(a);
             if (vendor.Caps.PackageKeyed && Games.XboxSource.AppUserModelId(game) is { } app) { psi.ArgumentList.Add("--package"); psi.ArgumentList.Add(app); }
             if (skipKeys.Count > 0) { psi.ArgumentList.Add("--skip-keys"); psi.ArgumentList.Add(string.Join(',', skipKeys.Order(StringComparer.Ordinal))); }
             if (isolate.Count > 0) { psi.ArgumentList.Add("--isolate"); psi.ArgumentList.Add(string.Join(',', isolate)); }
@@ -474,6 +480,44 @@ static class ProcessTree
         return tree.Select(t => t.Pid).ToList();
     }
 
+    /// <summary>The process's image path, without opening the process (no handle to it: nothing an anti-cheat driver's handle
+    /// callbacks see): NtQuerySystemInformation(SystemProcessIdInformation) gives its NT path, mapped to a drive letter.
+    /// Null when it has exited or its volume has no drive letter.</summary>
+    public static unsafe string? ImagePath(int pid)
+    {
+        const int SystemProcessIdInformation = 88;
+        var name = new char[32768];
+        fixed (char* buffer = name)
+        {
+            // SYSTEM_PROCESS_ID_INFORMATION (x64): ProcessId, then UNICODE_STRING { u16 Length, u16 MaximumLength, PWSTR Buffer at 8 }
+            var info = stackalloc byte[24];
+            *(nint*)info = pid;
+            *(ushort*)(info + 8) = 0;
+            *(ushort*)(info + 10) = (ushort)(name.Length * 2 - 2);
+            *(char**)(info + 16) = buffer;
+            if (NtQuerySystemInformation(SystemProcessIdInformation, info, 24, out _) < 0) return null;
+            return DosPath(new string(buffer, 0, *(ushort*)(info + 8) / 2), DosDevices());
+        }
+    }
+
+    /// <summary>An NT path (\Device\HarddiskVolume3\...) on a drive letter's device, as a DOS path; null when no drive maps it.</summary>
+    internal static string? DosPath(string nt, IEnumerable<(string Drive, string Device)> devices)
+    {
+        foreach (var (drive, device) in devices)
+            if (nt.StartsWith(device + "\\", StringComparison.OrdinalIgnoreCase)) return drive + nt[device.Length..];
+        return null;
+    }
+
+    static IEnumerable<(string Drive, string Device)> DosDevices()
+    {
+        var target = new char[1024];
+        foreach (var root in Environment.GetLogicalDrives())
+        {
+            var drive = root.TrimEnd(Path.DirectorySeparatorChar);
+            if (QueryDosDeviceW(drive, target, target.Length) > 0) yield return (drive, new string(target).Split((char)0)[0]);
+        }
+    }
+
     /// <summary>The process's creation time (FILETIME); null when it can't be opened or has exited.</summary>
     static long? Created(int pid)
     {
@@ -497,6 +541,8 @@ static class ProcessTree
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32NextW(nint snap, ref ProcessEntry32 e);
     [DllImport("kernel32.dll")] static extern nint OpenProcess(uint access, bool inherit, int pid);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(nint h);
+    [DllImport("ntdll.dll")] static extern unsafe int NtQuerySystemInformation(int infoClass, void* info, int length, out int returned);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern int QueryDosDeviceW(string device, char[] target, int max);
     [DllImport("kernel32.dll")] static extern bool GetProcessTimes(nint h, out long created, out long exited, out long kernel, out long user);
     [DllImport("ntdll.dll")] static extern int NtSuspendProcess(nint h);
     [DllImport("ntdll.dll")] static extern int NtResumeProcess(nint h);

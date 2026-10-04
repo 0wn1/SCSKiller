@@ -194,6 +194,8 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
         var byKey = new Dictionary<string, (string Sha, string Platform)>(); // version-1 archives: archive hash -> shader
         var lanes = new ConcurrentDictionary<string, string>(); // shader -> its [WaveSize] platform suffix
         var byHash = new Dictionary<string, (string Sha, string Platform)>(); // library hash -> shader
+        var undecodable = 0;
+        string? why = null;
         using var content = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
         foreach (var lib in Libraries(provider))
         {
@@ -201,10 +203,13 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
             var arc = Open(provider, lib.File);
             if (arc == null) { log?.Report($"{lib.File.Path}: unsupported shader archive layout, skipped"); continue; }
             var sha = new string[arc.Count];
-            var bad = 0;
+            var (bad, failed) = (0, 0);
             Parallel.ForEach(arc.Codes, new ParallelOptions { CancellationToken = ct }, work =>
             {
-                foreach (var (i, code) in work())
+                IEnumerable<(int, byte[])> codes;
+                try { codes = work(); }
+                catch (InvalidDataException e) { Interlocked.Increment(ref failed); Interlocked.CompareExchange(ref why, e.Message, null); return; }
+                foreach (var (i, code) in codes)
                 {
                     var (h, container) = Hash(code);
                     sha[i] = h;
@@ -217,6 +222,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
                     catch (ArgumentOutOfRangeException) { Interlocked.Increment(ref bad); } // malformed container: not usable anyway
                 }
             });
+            undecodable += failed;
             if (!platforms.Contains(lib.Platform)) platforms.Add(lib.Platform);
             content.AppendData(Encoding.UTF8.GetBytes($"{lib.Name}/{lib.Platform}\n"));
             if (arc.Keys is { } keys)
@@ -227,7 +233,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
                     if (sha[i] != null && shaders.ContainsKey(sha[i])) byHash[hashes[i]] = (sha[i], lib.Platform);
             for (var m = 0; m < arc.MapHashes.Length; m++)
             {
-                var list = Enumerable.Range(arc.Maps[m].Off, arc.Maps[m].Num).Select(k => sha[arc.Indices[k]]).ToList();
+                var list = Enumerable.Range(arc.Maps[m].Off, arc.Maps[m].Num).Select(k => sha[arc.Indices[k]]).Where(h => h != null).ToList();
                 bool Wave(string? h) => h != null && lanes.ContainsKey(h);
                 maps.Add(new ShaderMap(arc.MapHashes[m], lib.Name, lib.Platform, list.Where(h => !Wave(h)).ToList()));
                 foreach (var g in list.Where(Wave).GroupBy(h => lib.Platform + lanes[h!]))
@@ -237,8 +243,9 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
                 }
                 content.AppendData(Encoding.UTF8.GetBytes($"{arc.MapHashes[m]}:{string.Join(',', list)}\n"));
             }
-            log?.Report($"{lib.File.Name}: {(arc.Keys != null ? "version 1 (no maps)" : $"{arc.MapHashes.Length} shader maps")}, {arc.Count} shaders{(bad > 0 ? $", {bad} unparseable" : "")} ({sw.Elapsed.TotalSeconds:F1}s)");
+            log?.Report($"{lib.File.Name}: {(arc.Keys != null ? "version 1 (no maps)" : $"{arc.MapHashes.Length} shader maps")}, {arc.Count} shaders{(bad > 0 ? $", {bad} unparseable" : "")}{(failed > 0 ? $", {failed} code blocks that don't decompress, skipped" : "")} ({sw.Elapsed.TotalSeconds:F1}s)");
         }
+        if (shaders.IsEmpty && undecodable > 0) throw new InvalidDataException($"none of the game's shader code decompresses ({undecodable} blocks): {why}");
         if (byKey.Count > 0) // version-1 archives: maps from the packages that reference their shaders
         {
             var sw = Stopwatch.StartNew();
@@ -292,7 +299,10 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
             if (Open(provider, lib.File) is not { } arc) continue;
             Parallel.ForEach(arc.Codes, new ParallelOptions { CancellationToken = ct }, work =>
             {
-                foreach (var (_, code) in work())
+                IEnumerable<(int, byte[])> codes;
+                try { codes = work(); }
+                catch (InvalidDataException) { return; } // skipped at indexing too
+                foreach (var (_, code) in codes)
                 {
                     var (h, container) = Hash(code);
                     if (left.TryRemove(h, out _))
@@ -456,9 +466,49 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
             return new Library(f, string.Join('-', parts[1..].Reverse().SkipWhile(p => p == platform).Reverse()), platform);
         });
 
+    /// <summary>A library as the detected engine reads it, else (UE5) with the other shader hash width: 5.8 cut them from 20
+    /// to 8 bytes, and a fork or an engine version told from the containers alone may not match. Each layout's counts are
+    /// bounded by the file first (<see cref="LibraryEnd"/>): CUE4Parse allocates an array before it reads it, and a hash taken
+    /// for a count asks for gigabytes. The layout that ends exactly at the file's end wins, else one that fits in it. Throws
+    /// <see cref="InvalidDataException"/> naming the file when none fits or CUE4Parse rejects it.</summary>
+    internal static FShaderCodeArchive ReadLibrary(string path, byte[] bytes, EGame game)
+    {
+        var version = bytes.Length >= 4 ? BitConverter.ToUInt32(bytes) : 0;
+        var ue5 = game >= EGame.GAME_UE5_0;
+        EGame[] layouts = ue5 ? [game, game >= EGame.GAME_UE5_8 ? EGame.GAME_UE5_7 : EGame.GAME_UE5_8] : [game];
+        long? End(EGame g) => LibraryEnd(bytes, g >= EGame.GAME_UE5_8 ? 8 : 20, ioStore: version == 1);
+        // pre-4.25 version 1 (OpenV1 parses it), versions CUE4Parse skips, and forks with their own header: as detected
+        var pick = version is not (1 or 2) || version == 1 && !ue5 || game is EGame.GAME_MarvelRivals or EGame.GAME_ArenaBreakoutMobile ? game
+            : layouts.Where(g => End(g) == bytes.Length).Concat(layouts.Where(g => End(g) != null)).Cast<EGame?>().FirstOrDefault()
+              ?? throw new InvalidDataException($"{path}: not a shader library this reads as UE {VersionOf(game)}{(ue5 ? $" or {VersionOf(layouts[1])}" : "")} (its counts run past the file)");
+        try { return new FShaderCodeArchive(new FByteArchive(path, bytes, new VersionContainer(pick))); }
+        catch (Exception e) when (e is not OutOfMemoryException) { throw new InvalidDataException($"{path}: not a shader library this reads as UE {VersionOf(pick)} ({e.Message})", e); }
+    }
+
+    /// <summary>Where a version-2 (pak era: header, then the code) or IoStore (header only) shader library with
+    /// <paramref name="width"/>-byte hashes ends; null when an array count is negative or runs past the file.</summary>
+    internal static long? LibraryEnd(byte[] b, int width, bool ioStore)
+    {
+        // element sizes: hashes, hashes, then IoStore: chunk ids, map entries, code entries, group entries, indices;
+        // pak era: map entries, code entries (FShaderCodeEntry, packed: u64 offset, u32 size, u32 uncompressed size, u8), preloads, indices
+        int[] sizes = ioStore ? [width, width, 12, 8, 8, 16, 4] : [width, width, 16, 17, 16, 4];
+        long p = 4, code = 0;
+        for (var i = 0; i < sizes.Length; i++)
+        {
+            if (p + 4 > b.Length) return null;
+            var n = BitConverter.ToInt32(b, (int)p);
+            var start = p + 4;
+            if (n < 0 || (long)n * sizes[i] > b.Length - start) return null;
+            p = start + (long)n * sizes[i];
+            if (!ioStore && i == 3)
+                for (var e = start; e < p; e += 17) code += BitConverter.ToUInt32(b, (int)e + 8);
+        }
+        return p + code;
+    }
+
     static Archive? Open(AbstractVfsFileProvider provider, GameFile file)
     {
-        var arc = new FShaderCodeArchive(file.CreateReader());
+        var arc = ReadLibrary(file.Path, file.Read(), provider.Versions.Game);
         switch (arc.SerializedShaders)
         {
             case null: // version 1 (UE 4.2x before 4.25), which CUE4Parse doesn't parse
@@ -568,7 +618,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
     {
         foreach (var m in new[] { CompressionMethod.Oodle, CompressionMethod.LZ4, CompressionMethod.Zlib })
             try { return Compression.Decompress(src, size, m); } catch { }
-        throw new InvalidDataException($"cannot decompress {src.Length} -> {size} bytes with Oodle/LZ4/Zlib");
+        throw new InvalidDataException($"cannot decompress {src.Length} -> {size} bytes with Oodle/LZ4/Zlib (starts {Convert.ToHexString(src.AsSpan(0, Math.Min(8, src.Length)))})");
     }
 
     static void InitCodecs() => Codecs.Load();
@@ -606,9 +656,10 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
         if (File.Exists(exePath) && GameFiles.DetectAntiCheat(game) == AntiCheat.None && BuildString(exePath) is { } built) return built;
         var toc = Directory.EnumerateFiles(paks, "*.utoc").Select(TocVersion).DefaultIfEmpty(0).Max();
         // EIoStoreTocVersion (IoStore.h, Latest at each release tag): 2 = 4.26, 3 = 4.27 (High on Life), 5 = 5.0-5.3 (the UE5
-        // default: 5.1), 6 = 5.4 (REANIMAL, Darwin's Paradox: their shaders use 5.4's root constants), 8 = 5.5+ (Detect tells 5.6)
+        // default: 5.1), 6 = 5.4 (REANIMAL, Darwin's Paradox: their shaders use 5.4's root constants), 8 = 5.5-5.7 (Detect tells 5.6),
+        // 9 (AddedSourceHashes) and 10 (ContainerEncryptionMethod) = 5.8+ (Fortnite: 10, 8-byte shader library hashes)
         if (toc > 0)
-            return toc switch { <= 2 => EGame.GAME_UE4_26, 3 => EGame.GAME_UE4_27, <= 5 => EGame.GAME_UE5_1, 6 => EGame.GAME_UE5_4, _ => EGame.GAME_UE5_5 };
+            return toc switch { <= 2 => EGame.GAME_UE4_26, 3 => EGame.GAME_UE4_27, <= 5 => EGame.GAME_UE5_1, 6 => EGame.GAME_UE5_4, <= 8 => EGame.GAME_UE5_5, _ => EGame.GAME_UE5_8 };
         var pak = Directory.EnumerateFiles(paks, "*.pak").Select(PakVersion).DefaultIfEmpty(0).Max();
         if (pak is > 0 and < 11) // EPakFileVersion: 7 = 4.21, 8 = 4.22-4.24, 9 = 4.25, 10 = 4.26; 11 = 4.26.2 to 5.x: the PE version below
             return pak switch { <= 7 => EGame.GAME_UE4_21, 8 => EGame.GAME_UE4_24, 9 => EGame.GAME_UE4_25, _ => EGame.GAME_UE4_26 };

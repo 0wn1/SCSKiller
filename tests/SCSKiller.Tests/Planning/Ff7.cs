@@ -245,6 +245,7 @@ static class Ff7
         {
             try { using var p = System.Diagnostics.Process.GetProcessById(pid); return !p.HasExited; }
             catch (ArgumentException) { return false; }
+            catch (System.ComponentModel.Win32Exception) { return true; }   // a pid reused by a process this user can't open: leave the folder
         }
     }
 }

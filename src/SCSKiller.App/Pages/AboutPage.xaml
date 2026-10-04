@@ -19,6 +19,12 @@
                         <TextBlock Text="SCSKiller" Style="{StaticResource Section}" FontSize="20" />
                         <TextBlock Text="Shader Compilation Stutter Killer" Style="{StaticResource Secondary}" />
                         <TextBlock Text="{x:Bind Vm.Version}" Style="{StaticResource Caption}" IsTextSelectionEnabled="True" />
+                        <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,4,0,0" Visibility="{x:Bind Vm.ShowsCheck}">
+                            <Button Content="Check for updates" Click="OnCheckForUpdates" IsEnabled="{x:Bind Vm.CanCheck, Mode=OneWay}" />
+                            <TextBlock Text="{x:Bind Vm.UpdateNote, Mode=OneWay}" Style="{StaticResource Caption}" VerticalAlignment="Center" TextWrapping="Wrap" />
+                        </StackPanel>
+                        <InfoBar IsOpen="{x:Bind Vm.HasUpdateProblem, Mode=OneWay}" Visibility="{x:Bind Vm.HasUpdateProblem, Mode=OneWay}"
+                                 Message="{x:Bind Vm.UpdateProblem, Mode=OneWay}" Severity="Warning" IsClosable="False" />
                         <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,4,0,0" Visibility="{x:Bind Vm.ShowsSource}">
                             <Button Content="Download source code" Click="OnSource" IsEnabled="{x:Bind Vm.SourceIdle, Mode=OneWay}" />
                             <TextBlock Text="{x:Bind Vm.SourceStatus, Mode=OneWay}" Style="{StaticResource Caption}" VerticalAlignment="Center" TextWrapping="Wrap" IsTextSelectionEnabled="True" />

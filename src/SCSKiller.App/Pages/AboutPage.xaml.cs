@@ -8,7 +8,15 @@ namespace SCSKiller.App.Pages;
 public sealed partial class AboutPage : Page
 {
     public AboutVm Vm { get; } = new();
-    public AboutPage() => InitializeComponent();
+    public AboutPage()
+    {
+        InitializeComponent();
+        Loaded += (_, _) => Vm.Watch(true);
+        Unloaded += (_, _) => Vm.Watch(false);
+    }
+
+    // Checking and downloading never wait for the queue or an offline session: only applying does (Updater.ApplyAsync).
+    void OnCheckForUpdates(object _, Microsoft.UI.Xaml.RoutedEventArgs __) { if (!Updater.Restarting) _ = Updater.CheckNowAsync(); }
 
     async void OnSource(object _, Microsoft.UI.Xaml.RoutedEventArgs __) => await Vm.GetSourceAsync();
 
@@ -81,11 +89,32 @@ public sealed class AboutVm : Bindable
         Changed();
     }
 
+    // "Check for updates": every installed build (the design data shows it too); the state of the update next to it.
+    public bool ShowsCheck { get; } = Updater.Installed || App.Core is Design.FakeScsKiller;
+    public bool CanCheck => !Updater.Checking && !Updater.Restarting;
+    public string UpdateNote => Updater.Downloading is { } d ? $"Downloading SCSKiller {d}…"
+        : Updater.Checking ? "Checking for updates…"
+        : Updater.Ready is { } v ? $"SCSKiller {v} is ready: it installs when you quit, or use Restart to update at the top."
+        : Updater.UpToDate ? "SCSKiller is up to date." : "";
+    public string? UpdateProblem => Updater.Problem;
+    public bool HasUpdateProblem => Updater.Problem != null;
+
+    readonly Coalesced changed;
+    /// <summary>While the page is shown.</summary>
+    public void Watch(bool on)
+    {
+        Updater.Changed -= changed.Request;
+        if (!on) return;
+        Updater.Changed += changed.Request;
+        Changed();
+    }
+
     public List<Notice> Components { get; }
     public string Trademarks { get; }
 
     public AboutVm()
     {
+        changed = new(App.Main.DispatcherQueue, Changed);
         using var s = typeof(AboutVm).Assembly.GetManifestResourceStream("THIRD-PARTY-NOTICES.md")!;
         (Components, Trademarks) = Parse(new StreamReader(s).ReadToEnd());
     }

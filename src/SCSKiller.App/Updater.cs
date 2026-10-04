@@ -7,12 +7,11 @@ using Velopack.Sources;
 
 namespace SCSKiller.App;
 
-/// <summary>Velopack in the app (docs/patreon-and-updates.md §4.5). Checks at start and every 6 h and downloads in the
+/// <summary>Velopack in the app (docs/patreon-and-updates.md §4.5). Checks at start and every hour and downloads in the
 /// background (nothing touches the install); applies only while no queue item runs anywhere (<see cref="Busy"/>): at
 /// exit, at the next start, or on "Restart to update". A build Velopack didn't install (dev, the zip) never checks.</summary>
 public static class Updater
 {
-    static readonly TimeSpan Every = TimeSpan.FromHours(6);
     static readonly SemaphoreSlim One = new(1, 1);
     static readonly string DataDir = AppStore.DefaultDir;
     static readonly FeedTrust Trust = new(new AppStore(DataDir), FeedTrust.ReleaseKeys);
@@ -24,8 +23,10 @@ public static class Updater
     static Timer? timer;
     static int failures;   // consecutive checks that couldn't reach the feed
     static long retryAt;   // a 429's Retry-After, on Environment.TickCount64: no check before (a clock change doesn't move it)
+    static volatile bool asked;   // "Check for updates" was clicked: the running or next check shows its failure at once
 
-    /// <summary>Raised on any thread after <see cref="Ready"/>, <see cref="Checking"/> or <see cref="Problem"/> changed.</summary>
+    /// <summary>Raised on any thread after <see cref="Ready"/>, <see cref="Checking"/>, <see cref="Downloading"/>,
+    /// <see cref="UpToDate"/> or <see cref="Problem"/> changed.</summary>
     public static event Action? Changed;
     public static string? Ready => Usable(ready) is { } d ? d.R.Version.ToString() : null;
 
@@ -34,6 +35,10 @@ public static class Updater
     /// <summary>A download is installed only while its channel is still the chosen one.</summary>
     static Download? Usable(Download? d) => d != null && d.Channel == Chosen() ? d : null;
     public static bool Checking { get; private set; }
+    /// <summary>While <see cref="Checking"/>: the version whose package is being downloaded.</summary>
+    public static string? Downloading { get; private set; }
+    /// <summary>The last check reached the feed and found nothing newer.</summary>
+    public static bool UpToDate { get; private set; }
     public static string? Problem { get; private set; }
     /// <summary>"Restart to update" waits for the compile: the channel stays as it is meanwhile.</summary>
     public static bool Restarting { get; private set; }
@@ -133,13 +138,13 @@ public static class Updater
 
     public static bool Installed { get; } = Manager(UpdateChannels.Stable, false).IsInstalled;
 
-    /// <summary>At app start (real data only): check soon and every 6 h. A package downloaded before isn't ready by itself:
+    /// <summary>At app start (real data only): check soon and every hour. A package downloaded before isn't ready by itself:
     /// Velopack keeps the newest one whatever its channel, so only the chosen channel's feed makes it ready, when it offers
     /// that version (its download then finds the package on disk and fetches nothing).</summary>
     public static void Start()
     {
         if (!Installed) return;
-        timer = new Timer(_ => _ = CheckAsync(), null, TimeSpan.FromSeconds(30), Every);   // not in the start's busy first seconds
+        timer = new Timer(_ => _ = CheckAsync(), null, TimeSpan.FromSeconds(30), UpdateFeeds.CheckEvery);   // not in the start's busy first seconds
     }
 
     /// <summary>App start (a launch, not a toast: its activation wouldn't survive the restart): an update downloaded in an
@@ -159,6 +164,20 @@ public static class Updater
         static bool Untouched() => !App.Quitting && !App.Core.Queue.Any(q => q.Stage is not (Core.QueueStage.Done or Core.QueueStage.Failed) && !q.PlanCheck);
     }
 
+    /// <summary>About's "Check for updates": checks and downloads now. A click while a check runs joins it, and that
+    /// check's failure shows at once.</summary>
+    public static Task CheckNowAsync()
+    {
+        asked = true;
+        if (Installed && Environment.TickCount64 < Volatile.Read(ref retryAt))
+        {
+            (Problem, asked) = ("The update server asked SCSKiller to wait. It checks again by itself later.", false);
+            Changed?.Invoke();
+            return Task.CompletedTask;
+        }
+        return CheckAsync();
+    }
+
     /// <summary>Checks the effective channel's signed feed and downloads a newer version. <paramref name="backToStable"/>:
     /// "Go back to stable now", the stable feed with a downgrade allowed once. Not <paramref name="download"/>: a newer
     /// version is made ready only when its package is already on disk.</summary>
@@ -171,7 +190,7 @@ public static class Updater
             One.Release();
             return;
         }
-        (Checking, Problem) = (true, null);
+        (Checking, Problem, UpToDate) = (true, null, false);
         Changed?.Invoke();
         try
         {
@@ -185,9 +204,15 @@ public static class Updater
             failures = 0;
             // not the installed version again: the internal channel lists stable's packages, and Velopack offers the same
             // version while the channels differ
-            if (found is { } info && info.TargetFullRelease.Version != m.CurrentVersion && (download || await m.OnDisk(info.TargetFullRelease)))
+            if (found is not { } info || info.TargetFullRelease.Version == m.CurrentVersion) UpToDate = true;
+            else if (await m.OnDisk(info.TargetFullRelease) is var have && (download || have))
             {
-                await m.DownloadUpdatesAsync(info);
+                if (!have)
+                {
+                    Downloading = info.TargetFullRelease.Version.ToString();
+                    Changed?.Invoke();
+                }
+                await m.DownloadUpdatesAsync(info);   // a package already whole on disk is not fetched again
                 if (channel == Chosen()) ready = new(m, info.TargetFullRelease, channel);   // the choice may have changed meanwhile
             }
         }
@@ -196,12 +221,13 @@ public static class Updater
         catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException)
         {
             // offline or a hiccup: the next check retries; say so only once it has kept failing for a day
-            Problem = ++failures >= 4 ? "Couldn't reach the update server for a while. SCSKiller keeps trying." : null;
+            Problem = ++failures >= 24 ? "Couldn't reach the update server for a while. SCSKiller keeps trying."
+                : asked ? "Couldn't reach the update server. SCSKiller tries again within the hour." : null;
         }
         catch (Exception) { Problem = "Couldn't check for updates right now."; }
         finally
         {
-            Checking = false;
+            (Checking, Downloading, asked) = (false, null, false);
             One.Release();
             Changed?.Invoke();
         }

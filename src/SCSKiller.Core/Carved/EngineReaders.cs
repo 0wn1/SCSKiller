@@ -25,6 +25,8 @@ public sealed class EngineReaders(params (string Family, IEngineReader Reader)[]
         return first;
     }
 
+    public string IndexStamp(Game game) => string.Concat(readers.Select(r => r.Reader.IndexStamp(game)));
+
     public string DetectStamp(Game game, EngineInfo? engine) => engine == null ? string.Concat(readers.Select(r => r.Reader.DetectStamp(game, null)))
         : readers.FirstOrDefault(r => r.Family == engine.Family).Reader?.DetectStamp(game, engine) ?? "";
 

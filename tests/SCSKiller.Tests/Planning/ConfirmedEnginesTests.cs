@@ -49,9 +49,10 @@ public class ConfirmedEnginesTests : IDisposable
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);
         while (!File.Exists(Path.Combine(root.FullName, "SCSKiller.slnx"))) root = root.Parent!;
-        if (!Directory.Exists(Path.Combine(root.FullName, "server"))) return;   // the public source has no server/
+        var served = Path.Combine(root.FullName, "server-rs", "content", "confirmed-engines.json");
+        if (!Directory.Exists(Path.Combine(root.FullName, "server-rs"))) return;   // the public source has no server-rs/
         Assert.Equal(File.ReadAllBytes(Path.Combine(root.FullName, "src", "SCSKiller.Core", "Planning", "confirmed-engines.json")),
-                     File.ReadAllBytes(Path.Combine(root.FullName, "server", "content", "confirmed-engines.json")));
+                     File.ReadAllBytes(served));
     }
 
     [Fact]

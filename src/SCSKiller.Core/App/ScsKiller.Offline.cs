@@ -83,9 +83,13 @@ public sealed partial class ScsKiller
     public string? CleanupHelper { get; set; }
 
     /// <summary>Whether a process other than the session's runs from its folders, so its data files wait. Replaceable for tests.</summary>
-    internal Func<OfflineSession, bool> OfflineRuns { get; set; } = OthersRun;
+    internal Func<OfflineSession, bool> OfflineRuns { get; set; }
 
-    static bool OthersRun(OfflineSession s) => RunsFrom(true, [s.InstallDir, Path.GetDirectoryName(s.Exe)], notPid: s.Pid);
+    /// <summary>A process of <paramref name="all"/> is named like an exe of the session's folders, other than the session's
+    /// own (one that exited, still held open).</summary>
+    internal static bool OthersRun(OfflineSession s, List<(int Pid, int Parent, string Exe)> all) =>
+        ExeNamesIn([s.InstallDir, Path.GetDirectoryName(s.Exe)]) is not { } names   // can't tell: as if one runs
+        || all.Any(p => p.Pid != s.Pid && names.Contains(Path.GetFileNameWithoutExtension(p.Exe)));
 
     public void SetOfflineRecording(string gameId, bool on)
     {
@@ -425,8 +429,9 @@ public sealed partial class ScsKiller
     /// another process now; while it has none yet, as long as the SCSKiller that started this helper sets it up), then
     /// cleans up, again every few seconds while anything of it is left. <paramref name="exe"/>: this helper's, for the
     /// logon entry, written again while the session is pending (none in tests). 0 when nothing is left.</summary>
-    public static int RunOfflineCleanup(AppStore store, string gameId, TimeSpan? giveUp = null, string? exe = null)
+    public static int RunOfflineCleanup(AppStore store, string gameId, TimeSpan? giveUp = null, string? exe = null, Func<OfflineSession, bool>? othersRun = null)
     {
+        othersRun ??= s => OthersRun(s, ProcessTree.Snapshot());
         void Log(string line) => RecordersLog(store.DataDir, "offline cleanup: " + line);
         using var running = new Mutex(false, HelperMutex(gameId));   // while it runs, no update is applied (OfflineBlocksUpdate)
         using var app = StartingApp();
@@ -446,7 +451,7 @@ public sealed partial class ScsKiller
                             // never resumed within a minute: the cleanup ends it, unless it was resumed meanwhile
                             else if (WaitForSingleObject(h, 60_000) == WaitTimeout && store.LoadGame(gameId).OfflineSession is { Resumed: true }) continue;
                         }
-                if (CleanOfflineSession(store, gameId, OthersRun, Log) == null) return 0;
+                if (CleanOfflineSession(store, gameId, othersRun, Log) == null) return 0;
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Text.Json.JsonException) { Log($"{gameId}: {e.Message}"); }
             if (clock.Elapsed > (giveUp ?? TimeSpan.FromHours(24))) return 1;   // the next start or logon goes on

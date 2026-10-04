@@ -287,6 +287,31 @@ public class PerStagePlanTests(ITestOutputHelper output)
         }
     }
 
+    /// <summary>A PS no VS of its own map feeds (Elden Ring's gxflvershader PSs, drawn behind material VSs of other bundles)
+    /// gets the first VS of another map that links it, once, when it carries its own root signature; one without is left
+    /// out (its root signature would be the VS's guess).</summary>
+    [Fact]
+    public void AnUnfedPixelShaderGetsOneVsFromAnotherMap()
+    {
+        var rs = Hash("rs");
+        var col = new SigElement("COLOR", 0, 1, 0xF, 0, 3);
+        ShaderInfo orphan = Ps("ps-orphan", Target(0)) with { RootSignature = rs }, bare = Ps("ps-bare", Target(0)) with { Inputs = [PosOut, UvOut, col] };
+        ShaderInfo own = Shader("vs-own", Stage.Vertex, [], [PosOut, col]) with { RootSignature = rs };
+        ShaderInfo first = Vs("vs-first") with { RootSignature = rs }, second = Vs("vs-second") with { RootSignature = rs };
+        ShaderInfo other = Shader("vs-other", Stage.Vertex, [], [PosOut, UvOut, col]) with { RootSignature = rs };
+        var engine = new EngineInfo("FromSoftware", "DXIL+RTS0", "Elden Ring", "D3D12", false, null);
+        var index = new ShaderIndex("synthetic", ["D3D12"], new[] { orphan, bare, own, first, second, other }.ToDictionary(s => s.Sha1),
+            [new ShaderMap("flver", "flver", "D3D12", [orphan.Sha1, bare.Sha1, own.Sha1]), new ShaderMap("bdle", "bdle", "D3D12", [first.Sha1, second.Sha1, other.Sha1])]);
+        var dir = Ff7.TempDir("perstage-orphan");
+        var log = new List<string>();
+        var plan = new Planner().Build(Ff7.Game, engine, index, null, Ff7.Nvidia with { PerStageCache = true }, dir, new SyncLog(log.Add), CancellationToken.None);
+        var pairs = Psos(plan).Select(p => p.State.Stages).Where(s => s.ContainsKey((int)Stage.Pixel)).ToList();
+        var paired = Assert.Single(pairs, s => s[(int)Stage.Pixel] == orphan.Sha1);
+        Assert.Equal(first.Sha1, paired[(int)Stage.Vertex]);
+        Assert.DoesNotContain(pairs, s => s[(int)Stage.Pixel] == bare.Sha1);
+        Assert.Contains(log, l => l.StartsWith("plan:") && l.Contains("orphan_ps_paired 1"));
+    }
+
     /// <summary>Progress&lt;T&gt; posts to the thread pool; the test reads the log right after Build.</summary>
     sealed class SyncLog(Action<string> a) : IProgress<string> { public void Report(string value) => a(value); }
 }

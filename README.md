@@ -78,7 +78,7 @@ Measured with SCSKiller's pipeline recorder. Your numbers will vary by game, GPU
 ## Features
 
 - **NVIDIA and AMD.** DirectX 12 games, and DirectX 11 games on NVIDIA.
-- **Finds your games** in Steam, Epic Games, EA app, GOG, Ubisoft Connect, Xbox (PC) and Battle.net.
+- **Finds your games** in Steam, Epic Games, EA app, GOG, Ubisoft Connect, Xbox (PC), Battle.net, PURPLE, HoYoPlay and Gaijin.
 - **Knows which games stutter:** the library puts known offenders on top, with the reason.
 - **Recompiles after driver updates.** A driver update clears the shader cache; SCSKiller notices and compiles again,
   on its own if you let it.

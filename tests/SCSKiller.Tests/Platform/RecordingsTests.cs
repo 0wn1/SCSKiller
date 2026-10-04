@@ -339,6 +339,135 @@ public class RecordingsTests(ITestOutputHelper output) : IDisposable
         }
     }
 
+    /// <summary>A layer's 'W' (proxy.cpp): the key of the record the driver got, then the game's (none: the layer's own create).</summary>
+    internal static PsoDb.Rec W(PsoDb.Rec driver, PsoDb.Rec? game) => new('W', [.. Convert.FromHexString(driver.Key), .. game is { } g ? Convert.FromHexString(g.Key) : new byte[20]]);
+
+    /// <summary>A session under a layer: the game's pipeline, the one the driver got with the layer's root signature, and the
+    /// layer's own pipeline of its own shader, each paired by a 'W'.</summary>
+    (PsoDb.Rec Game, PsoDb.Rec Driver, PsoDb.Rec Own, PsoDb.Rec[] Session) Layered()
+    {
+        byte[] rs = CommunityTests.RootSignature(), layerRs = MiddlewarePackTests.Container("RTS0", "layer root signature"), a = Shader("a"), mod = Shader("the layer's");
+        var (game, driver, own) = (Cs(rs, a), Cs(layerRs, a), Cs(layerRs, mod));
+        return (game, driver, own, [Blob(rs), Blob(a), game, Blob(layerRs), driver, W(driver, game), Blob(mod), own, W(own, null)]);
+    }
+
+    /// <summary>What a layer made on this PC, from disk: every game folder's recording.db and the recorder's inbox next to
+    /// the exe its state.json names, read while the recorder holds it open for writing; a state.json that isn't JSON throws.</summary>
+    [Fact]
+    public void What_a_layer_made_is_read_from_every_recording_and_inbox_on_disk()
+    {
+        var data = Path.Combine(_dir, "data");
+        var store = new AppStore(data);
+        var (game, driver, own, session) = Layered();
+        var exeDir = Path.Combine(_dir, "game");
+        Directory.CreateDirectory(exeDir);
+        Directory.CreateDirectory(store.GameDir("test:a"));
+        File.Move(Raw("recording.db", session.Where(r => !(r.Tag == 'W' && r.Payload.AsSpan(20).IndexOfAnyExcept((byte)0) < 0))), Path.Combine(store.GameDir("test:a"), "recording.db"));
+        var rec = store.LoadGame("test:b");
+        rec.RecorderExe = Path.Combine(exeDir, "game.exe");
+        store.SaveGame("test:b", rec);
+        var inbox = Raw("scskiller.db", W(own, null));
+        File.Move(inbox, Path.Combine(exeDir, "scskiller.db"));
+        using (new FileStream(Path.Combine(exeDir, "scskiller.db"), FileMode.Open, FileAccess.Write, FileShare.ReadWrite))   // the recorder's handle
+            Assert.Equal(new[] { driver.Key, own.Key }.Order(), Recordings.LayerMadeOnDisk(data).Order());
+        File.WriteAllText(Path.Combine(store.GameDir("test:b"), "state.json"), "{ damaged");
+        Assert.ThrowsAny<System.Text.Json.JsonException>(() => Recordings.LayerMadeOnDisk(data));
+        File.WriteAllText(Path.Combine(store.GameDir("test:b"), "state.json"), """{"RecorderExe":123}""");   // JSON, but not a path
+        Assert.Throws<InvalidDataException>(() => Recordings.LayerMadeOnDisk(data));
+        File.WriteAllText(Path.Combine(store.GameDir("test:b"), "state.json"), """{"RecorderExe":null,"RecorderMoveFrom":null}""");
+        Assert.Equal([driver.Key], Recordings.LayerMadeOnDisk(data));   // null: no recorder
+    }
+
+    /// <summary>Nothing on the way to what a layer made turns an error into "none": a compact recording whose magic is
+    /// damaged (its leading 0 kept), a games folder this user may not list, and a damaged line in packs\layer-made.keys
+    /// all throw; only a missing games folder or list is empty.</summary>
+    [Fact]
+    public void A_damaged_or_unreadable_exclusion_source_throws()
+    {
+        var data = Path.Combine(_dir, "data");
+        var store = new AppStore(data);
+        Assert.Empty(Recordings.LayerMadeOnDisk(data));   // no games folder yet
+        Directory.CreateDirectory(store.GameDir("test:a"));
+        var (_, driver, _, session) = Layered();
+        var db = Path.Combine(store.GameDir("test:a"), "recording.db");
+        PsoDb.WriteCompact(db, session);
+        Assert.Contains(driver.Key, Recordings.LayerMadeOnDisk(data));
+        var bytes = File.ReadAllBytes(db);
+        bytes[7] ^= 0x20;   // "\0SCSKREc"
+        File.WriteAllBytes(db, bytes);
+        Assert.Throws<Recordings.IncompleteLayerList>(() => Recordings.LayerMadeOnDisk(data));
+        File.Delete(db);
+
+        var games = new DirectoryInfo(Path.Combine(data, "games"));
+        var sid = System.Security.Principal.WindowsIdentity.GetCurrent().User!;
+        var deny = new System.Security.AccessControl.FileSystemAccessRule(sid, System.Security.AccessControl.FileSystemRights.ListDirectory,
+            System.Security.AccessControl.AccessControlType.Deny);
+        var acl = games.GetAccessControl();
+        acl.AddAccessRule(deny);
+        games.SetAccessControl(acl);
+        try { Assert.ThrowsAny<UnauthorizedAccessException>(() => Recordings.LayerMadeOnDisk(data)); }
+        finally
+        {
+            acl.RemoveAccessRule(deny);
+            games.SetAccessControl(acl);
+        }
+
+        var packs = new MiddlewarePacks(Path.Combine(_dir, "packs"));
+        packs.Exclude([driver.Key]);
+        File.AppendAllText(Path.Combine(packs.Dir, "layer-made.keys"), "not a key\r\n");
+        Assert.Throws<InvalidDataException>(() => packs.LayerMade());
+    }
+
+    /// <summary>'W' records are merged by key like 'N', aren't counted as added pipelines, are counted by
+    /// <see cref="Recordings.Layered"/>, and are named in the keys file: a session that creates the same again records nothing.</summary>
+    [Fact]
+    public void A_layer_s_records_are_merged_once_counted_apart_and_named_in_the_keys_file()
+    {
+        var (game, driver, own, session) = Layered();
+        var store = Path.Combine(_dir, "recording.db");
+        Assert.Equal((0, 0), Recordings.Layered(store));
+        Assert.Equal(new[] { game.Key, driver.Key, own.Key }.Order(), Recordings.Merge(store, Raw("s1.db", session), null).Order());
+        Assert.Equal((1, 1), Recordings.Layered(store));
+        Assert.Empty(Recordings.Merge(store, Raw("s2.db", session), null));
+        Assert.Equal(Keys(session), Keys(PsoDb.Read(store)));
+
+        var keys = Path.Combine(_dir, Recordings.KeysFile);
+        Assert.Equal(0, Recordings.WriteKeys(store, null, keys));
+        Assert.Empty(Recorded(session, keys));
+
+        var other = new PsoDb.Rec('C', PsoDb.Compute(Sha(CommunityTests.RootSignature()), Sha(Shader("b"))));
+        Recordings.Merge(store, Raw("s3.db", other, W(other, game)), null);
+        Assert.Equal((2, 1), Recordings.Layered(store));   // the store changed: read again
+    }
+
+    /// <summary>The warm replays both the game's and the driver's records of a layered session; the 'W' pairing them is no
+    /// item: in the work folder's db for the proxy (a warm through the layer creates what it made under it), not skipped,
+    /// not a warm input.</summary>
+    [Fact]
+    public void A_layer_s_pairs_are_neither_warmed_nor_counted()
+    {
+        var (game, driver, own, session) = Layered();
+        var recording = Raw("recording.db", session);
+        var g = new Game("test:layer", "Fake", Store.Other, _dir, Path.Combine(_dir, "fake.exe"));
+        var plan = new Plan(g.Id, "c", "PCD3D_SM6", "nvidia-1", new PlanStats(3, 0, 0, 0, false), Path.Combine(_dir, "plan.bin"));
+        PlanFile.Write(plan, []);
+        var work = Path.Combine(_dir, "work");
+        new Planner().Materialize(plan, g, MiddlewarePackTests.Engine, new NoShaders(), new Recording(recording), work, default);
+
+        var db = PsoDb.Read(Path.Combine(work, "scskiller.db")).ToList();
+        Assert.Equal(Keys([game, driver, own]), Keys(db.Where(r => r.Tag is not ('B' or 'W'))));
+        Assert.Equal(2, db.Count(r => r.Tag == 'W'));
+        Assert.Equal(0, Planner.SkippedIn(work));
+        Assert.Equal(new[] { game.Key, driver.Key, own.Key }.Order(), WarmInputs.Of([recording], null, [], _ => false).Order());
+    }
+
+    sealed class NoShaders : IEngineReader
+    {
+        public EngineInfo? Detect(Game game) => null;
+        public ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, CancellationToken ct) => throw new NotSupportedException();
+        public void ReadShaders(Game game, EngineInfo engine, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct) { }
+    }
+
     [Fact]
     public void The_inbox_is_emptied_only_at_its_imported_length_and_while_nothing_has_it_open()
     {
@@ -350,5 +479,175 @@ public class RecordingsTests(ITestOutputHelper output) : IDisposable
         Assert.Equal(length, new FileInfo(inbox).Length);
         Assert.True(Recordings.Rotate(inbox, length));
         Assert.Equal(0, new FileInfo(inbox).Length);
+    }
+
+    // state object records as the recorder writes them (proxy.cpp write_so): [base key], type, count, subobjects
+    static byte[] U32(uint v) => BitConverter.GetBytes(v);
+    static byte[] Str(string? s) => s == null ? U32(uint.MaxValue) : [.. U32((uint)s.Length), .. System.Text.Encoding.Unicode.GetBytes(s)];
+    static byte[] So(string? baseKey, params byte[][] subs) =>
+        [.. baseKey == null ? [] : Convert.FromHexString(baseKey), .. U32(3), .. U32((uint)subs.Length), .. subs.SelectMany(x => x)];
+    static byte[] Library(string lib, params (string Name, string? Renames)[] exports) =>
+        [.. U32(5), .. Convert.FromHexString(lib), .. U32((uint)exports.Length), .. exports.SelectMany(e => (byte[])[.. Str(e.Name), .. Str(e.Renames), .. U32(0)])];
+    static byte[] HitGroup(string name, string? anyHit, string closestHit) => [.. U32(11), .. Str(name), .. U32(0), .. Str(anyHit), .. Str(closestHit), .. Str(null)];
+    static byte[] Rs(uint type, string rs) => [.. U32(type), .. Convert.FromHexString(rs)];
+    static byte[] Assoc(uint sub, params string[] exports) => [.. U32(7), .. U32(sub), .. U32((uint)exports.Length), .. exports.SelectMany(Str)];
+
+    // The Witcher 3's shapes: its base pipeline (export names ending in a launch's suffix) and a material addition to it
+    static PsoDb.Rec Pipeline(string suffix) => new('R', So(null, Library(new('1', 40), ("RGS_Shadows", null)), Library(new('2', 40), ("MISS_Occlusion", null)),
+        Library(new('3', 40), ($"CHS_Occlusion_LRS_{suffix}", "OcclusionCHS")), HitGroup("HitGroup_Occlusion", null, $"CHS_Occlusion_LRS_{suffix}"),
+        Rs(1, new('9', 40)), [.. U32(9), .. U32(32), .. U32(8)], [.. U32(12), .. U32(1), .. U32(0x200)], Rs(2, new('8', 40)), Assoc(7, "HitGroup_Occlusion")));
+    static PsoDb.Rec Material(string baseKey, string closestHit, string anyHit, string name, string suffix = "2AE4465CABAC2C89") =>
+        new('A', So(baseKey, Rs(1, new('9', 40)), [.. U32(9), .. U32(32), .. U32(8)], [.. U32(12), .. U32(1), .. U32(0x200)], [.. U32(0), .. U32(4)],
+            Library(closestHit, ($"ClosestHit_{name}_LRS_{suffix}", $"ClosestHit_{name}")), Library(anyHit, ($"AnyHit_{name}_LRS_{suffix}", $"AnyHit_{name}")),
+            HitGroup($"HitGroup_{name}", $"AnyHit_{name}_LRS_{suffix}", $"ClosestHit_{name}_LRS_{suffix}"), Rs(2, new('8', 40)), Assoc(7, $"HitGroup_{name}")));
+
+    static HashSet<string> Inputs(string store, bool nvidia) => WarmInputs.Of(WarmInputs.Recorded.Read([store], _ => true, nvidia), null, [], _ => true);
+
+    /// <summary>The Witcher 3 ends its base pipeline's export names with a suffix new every launch and adds its materials in
+    /// another order each launch: in session 1791029034388, 29 additions were byte for byte an earlier session's on another
+    /// base. The recording keeps every record as recorded; on NVIDIA, whose key leaves export names out and which caches an
+    /// addition whatever it grows, the count of new pipelines takes those as nothing new and a new material as one. AMD
+    /// caches a whole state object: there each new record counts.</summary>
+    [Fact]
+    public void Re_ordered_additions_of_known_materials_count_as_new_only_where_the_driver_needs_them()
+    {
+        string Lib(int i, char kind) => $"{i:x2}{new string(kind, 38)}";
+        string Name(int i) => $"0x{i:X16}";
+        var session1 = new List<PsoDb.Rec> { Pipeline("25B6436BA6B34F27") };
+        foreach (var i in Enumerable.Range(0, 29)) session1.Add(Material(session1[^1].Key, Lib(i, 'c'), Lib(i, 'a'), Name(i)));
+        var session2 = new List<PsoDb.Rec> { Pipeline("6B09914CA188FA81") };   // the next launch: the same 29 the other way round, then a new one
+        foreach (var i in Enumerable.Range(0, 29).Reverse()) session2.Add(Material(session2[^1].Key, Lib(i, 'c'), Lib(i, 'a'), Name(i)));
+        session2.Add(Material(session2[^1].Key, Lib(99, 'c'), Lib(99, 'a'), Name(99)));
+
+        static PsoDb.Rec Nv(PsoDb.Rec r) => new PsoDb.NvState(r.Key, 12, 1, 1, 0).ToRec();   // as The Witcher 3 records them
+        var store = Path.Combine(_dir, "recording.db");
+        Recordings.Merge(store, Raw("s1.db", session1.SelectMany(r => new[] { r, Nv(r) })), null);
+        var warmedNv = Inputs(store, true).Select(WarmInputs.Token).ToHashSet();   // the last warm's key files
+        var warmedAmd = Inputs(store, false).Select(WarmInputs.Token).ToHashSet();
+        Recordings.Merge(store, Raw("s2.db", session2.SelectMany(r => new[] { r, Nv(r) })), null);
+
+        Assert.Equal(Keys([.. session1, .. session2]), Keys(PsoDb.Read(store).Where(r => r.Tag != 'N')));   // every record as recorded: a warm replays what the game created
+        Assert.Equal([session2[^1].Key], Inputs(store, true).Where(i => !WarmInputs.Taken(warmedNv, i)).SelectMany(WarmInputs.Records));
+        Assert.Equal(Keys(session2).Order(), Inputs(store, false).Where(i => !WarmInputs.Taken(warmedAmd, i)).Select(WarmInputs.Key).Order());
+    }
+
+    /// <summary>Only a launch's alias is taken as one: a name given to another function (ExportToRename) ending in the
+    /// suffix. Two such aliases of different functions are two pipelines; a function's own name ending so, or a suffix in
+    /// mid-name, is the name itself; a record whose names would collapse into one counts by its key.</summary>
+    [Fact]
+    public void Only_a_launch_alias_is_taken_off_an_export_name()
+    {
+        PsoDb.Rec Collection(params byte[][] subs) => new('R', [.. U32(0), .. U32((uint)subs.Length + 1), .. Rs(1, new('9', 40)), .. subs.SelectMany(x => x)]);
+        int Count(params PsoDb.Rec[] recs)
+        {
+            var store = Path.Combine(_dir, $"recording-{Guid.NewGuid():N}.db");
+            Recordings.Merge(store, Raw($"in-{Guid.NewGuid():N}.db", recs), null);
+            return Inputs(store, true).Count;
+        }
+        string lib = new('3', 40), x = new('a', 40), y = new('b', 40);
+        Assert.Equal(1, Count(Collection(Library(lib, ("Hit_LRS_25B6436BA6B34F27", "Shade"))), Collection(Library(lib, ("Hit_LRS_6B09914CA188FA81", "Shade")))));   // one function, two launches
+        Assert.Equal(2, Count(Collection(Library(lib, ("Hit_LRS_25B6436BA6B34F27", "ShadeA"))), Collection(Library(lib, ("Hit_LRS_6B09914CA188FA81", "ShadeB")))));
+        Assert.Equal(2, Count(Collection(Library(lib, ("Hit_LRS_25B6436BA6B34F27", null))), Collection(Library(lib, ("Hit_LRS_6B09914CA188FA81", null)))));   // two functions of the library
+        Assert.Equal(2, Count(Collection(Library(lib, ("Hit_LRS_25B6436BA6B34F27_Opaque", "Shade"))), Collection(Library(lib, ("Hit_LRS_6B09914CA188FA81_Opaque", "Shade")))));
+        // two aliases in one record that would both become "Hit": the record counts by its key, its associations as recorded
+        byte[] Both() => Library(lib, ("Hit_LRS_1111111111111111", "ShadeA"), ("Hit_LRS_2222222222222222", "ShadeB"));
+        Assert.Equal(2, Count(Collection(Both(), Rs(2, x), Assoc(2, "Hit_LRS_1111111111111111"), Rs(2, y), Assoc(4, "Hit_LRS_2222222222222222")),
+            Collection(Both(), Rs(2, x), Assoc(2, "Hit_LRS_2222222222222222"), Rs(2, y), Assoc(4, "Hit_LRS_1111111111111111"))));
+        // an alias beside a library that exports all its functions (Hit among them, unnamed in the record): counts by its key
+        byte[] Implicit() => Library(new('4', 40));
+        Assert.Equal(2, Count(Collection(Library(lib, ("Hit_LRS_1111111111111111", "ShadeA")), Implicit(), Rs(2, x), Assoc(3, "Hit_LRS_1111111111111111"), Rs(2, y), Assoc(5, "Hit")),
+            Collection(Library(lib, ("Hit_LRS_1111111111111111", "ShadeA")), Implicit(), Rs(2, x), Assoc(3, "Hit"), Rs(2, y), Assoc(5, "Hit_LRS_1111111111111111"))));
+        // one function under two aliases, created with other NVAPI state: another NVIDIA cache key
+        PsoDb.Rec Aliased(string suffix) => Collection(Library(lib, ($"Hit_LRS_{suffix}", "Shade")));
+        PsoDb.Rec Space(PsoDb.Rec r, uint space) => new PsoDb.NvState(r.Key, 12, space, 1, 0).ToRec();
+        var (a1, a2) = (Aliased("25B6436BA6B34F27"), Aliased("6B09914CA188FA81"));
+        Assert.Equal(2, Count(a1, Space(a1, 1001), a2, Space(a2, 404)));
+        Assert.Equal(1, Count(a1, Space(a1, 1001), a2, Space(a2, 1001)));
+    }
+
+    static PsoDb.Rec HitSo(string suffix) => new('R', So(null, Library(new('3', 40), ($"Hit_LRS_{suffix}", "Shade")), Rs(1, new('9', 40))));
+    static PsoDb.Rec NvSpace(PsoDb.Rec r, uint space) => new PsoDb.NvState(r.Key, 12, space, 1, 0).ToRec();
+
+    static List<string> Pending(HashSet<string> warmed, HashSet<string> inputs) => [.. inputs.Where(i => !WarmInputs.Taken(warmed, i)).SelectMany(WarmInputs.Records)];
+    static HashSet<string> Baseline(HashSet<string> inputs) => inputs.Select(WarmInputs.Token).ToHashSet();
+
+    /// <summary>NVIDIA's key holds the NVAPI state a state object is replayed with, so a warm's key file must too: the
+    /// object under a state recorded after the warm, with an alias of it under the same state, is one new pipeline there
+    /// until the next warm takes it. AMD has no NVAPI state: there only the new record counts. A crash names a record:
+    /// its identity's input stands for it.</summary>
+    [Fact]
+    public void A_state_object_under_another_NVAPI_state_is_new_on_NVIDIA_across_a_warm()
+    {
+        var (a1, a2) = (HitSo("25B6436BA6B34F27"), HitSo("6B09914CA188FA81"));
+        var store = Path.Combine(_dir, "recording.db");
+        Recordings.Merge(store, Raw("s1.db", a1, NvSpace(a1, 1001)), null);
+        var (nv, amd) = (Baseline(Inputs(store, true)), Baseline(Inputs(store, false)));
+        Recordings.Merge(store, Raw("s2.db", a1, NvSpace(a1, 404), a2, NvSpace(a2, 404)), null);   // the game's NVAPI space changed, and its launch suffix
+
+        Assert.Equal([a1.Key, a2.Key], Pending(nv, Inputs(store, true)));
+        Assert.Equal([a2.Key], Pending(amd, Inputs(store, false)));
+        Assert.Empty(Pending(Baseline(Inputs(store, true)), Inputs(store, true)));
+    }
+
+    /// <summary>Two records of one identity and NVAPI state, warmed as one: one of them later recorded under another state is
+    /// one new pipeline; the other's identity and state stay taken, whichever record now comes first.</summary>
+    [Fact]
+    public void An_identity_stays_taken_when_its_first_record_moves_to_another_NVAPI_state()
+    {
+        var (a, b) = (HitSo("25B6436BA6B34F27"), HitSo("6B09914CA188FA81"));
+        var store = Path.Combine(_dir, "recording.db");
+        Recordings.Merge(store, Raw("s1.db", a, NvSpace(a, 1001), b, NvSpace(b, 1001)), null);
+        Assert.Single(Inputs(store, true));
+        var nv = Baseline(Inputs(store, true));
+        Recordings.Merge(store, Raw("s2.db", a, NvSpace(a, 404)), null);
+
+        Assert.Equal(2, Inputs(store, true).Count);
+        Assert.Equal([a.Key], Pending(nv, Inputs(store, true)));
+    }
+
+    /// <summary>A warm key file written before state object identities holds every record's key: after the update nothing
+    /// it took counts, on NVIDIA either, and a new identity does.</summary>
+    [Fact]
+    public void A_key_file_from_before_identities_takes_the_identities_of_its_records()
+    {
+        var (a, b, c) = (HitSo("25B6436BA6B34F27"), HitSo("6B09914CA188FA81"), new PsoDb.Rec('R', So(null, Library(new('4', 40), ("Other", null)), Rs(1, new('9', 40)))));
+        var store = Path.Combine(_dir, "recording.db");
+        Recordings.Merge(store, Raw("s1.db", a, NvSpace(a, 1001), b, NvSpace(b, 1001)), null);
+        var legacy = Baseline(Inputs(store, false));   // every record by its key, as the count kept them before
+        Assert.Empty(Pending(legacy, Inputs(store, true)));
+        Recordings.Merge(store, Raw("s2.db", c), null);
+        Assert.Equal([c.Key], Pending(legacy, Inputs(store, true)));
+    }
+
+    /// <summary>A state object first created without NVAPI state and then with it replays with it (proxy.cpp g_nvext): on
+    /// NVIDIA another compile than the warm took.</summary>
+    [Fact]
+    public void An_NVAPI_state_recorded_after_a_warm_makes_its_state_object_new_on_NVIDIA()
+    {
+        var a = HitSo("25B6436BA6B34F27");
+        var store = Path.Combine(_dir, "recording.db");
+        Recordings.Merge(store, Raw("s1.db", a), null);
+        var (nv, amd) = (Baseline(Inputs(store, true)), Baseline(Inputs(store, false)));
+        Recordings.Merge(store, Raw("s2.db", a, NvSpace(a, 404)), null);
+
+        Assert.Equal([a.Key], Pending(nv, Inputs(store, true)));
+        Assert.Empty(Pending(amd, Inputs(store, false)));
+    }
+
+    /// <summary>The NVAPI state counted is the one replayed: the last 'N' of the recordings' union (Community.Union), which
+    /// drops a community 'N' this PC's recording already has.</summary>
+    [Fact]
+    public void The_NVAPI_state_counted_is_the_last_of_the_recordings_union()
+    {
+        var a = HitSo("25B6436BA6B34F27");
+        var local = Raw("local.db", a, NvSpace(a, 1001), NvSpace(a, 404));
+        var community = Raw("community.db", a, NvSpace(a, 1001));
+        var merged = Path.Combine(_dir, "merged.db");
+        Community.Union(local, community, merged);
+
+        Assert.Equal(NvSpace(a, 404).Key, PsoDb.Read(merged).Last(r => r.Tag == 'N').Key);
+        HashSet<string> Of(params string[] recordings) => WarmInputs.Of(WarmInputs.Recorded.Read(recordings, _ => true, true), null, [], _ => true);
+        Assert.Equal(Of(Raw("as-404.db", a, NvSpace(a, 404))), Of(local, community));
+        Assert.NotEqual(Of(Raw("as-1001.db", a, NvSpace(a, 1001))), Of(local, community));
     }
 }

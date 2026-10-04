@@ -5,6 +5,90 @@ All notable changes to the SCSKiller app and command line. The format follows
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-04
+
+### Added
+
+- Finds installed games from NCSOFT's PURPLE launcher, in a PURPLE section of the Library. AION 2 is listed as not
+  supported: its game files are encrypted, and its anti-cheat (NCGuard) keeps it from being recorded. Play starts a PURPLE
+  game through PURPLE, as its desktop shortcut does (not for anti-cheat games, which SCSKiller never starts).
+- Finds games installed with HoYoPlay (Genshin Impact, Honkai: Star Rail, Zenless Zone Zero, Honkai Impact 3rd), in a
+  HoYoPlay section of the Library. Every HoYoverse game ships a kernel anti-cheat, so these games are never recorded;
+  more of their anti-cheat files are recognised when the same games come from Steam or Epic Games.
+- War Thunder installed with Gaijin's launcher shows up in the Library, and on NVIDIA SCSKiller compiles all of its
+  DirectX 11 shaders without a recording. DirectX 12 isn't covered: it would need a recording, which the game's
+  BattlEye anti-cheat blocks.
+- Control (Remedy's Northlight engine, DirectX 12) compiles without a recording: SCSKiller reads the game's shader files
+  and the pipelines they pair, with the root signatures the game builds. Ray tracing shaders are compiled too, without
+  a guarantee that the game reuses them yet. On NVIDIA its DirectX 11 shaders are compiled as well, for playing on
+  DirectX 11.
+
+### Changed
+
+- Before it writes into a game folder, SCSKiller reads the list of running programs once to tell whether the game runs,
+  instead of twice. What counts as running is the same.
+- A compile that completes with pipelines the driver rejected keeps its log as `warm-rejects.log` in the game's data
+  folder, so the reasons can be looked at afterwards. Only the latest is kept; a later compile with no rejections
+  removes it.
+- ELDEN RING's known-stutter note is "moderate" instead of "severe": it says most of the game's big hitches aren't shader
+  compiles, citing Digital Foundry and SCSKiller's own measurement.
+- SCSKiller checks for updates every hour (it was 6 hours), and About has a Check for updates button. Refreshing the
+  Library also downloads a new version, so "Restart to update" appears without waiting.
+- Games with a RenoDX HDR mod compile through a copy of ReShade and the mod, so the compile matches what the modded game
+  creates. Games whose mod adds to every root signature (most RenoDX mods) are no longer left uncompiled and
+  unrecorded, and games whose mod replaces some shaders get those pipelines too. The recorder records under ReShade what
+  reaches the driver, which covers the pipelines a mod creates while the game draws; those stay on this PC and are
+  never shared. Installing, updating or removing the mod marks the game to compile again, and a compile stopped before
+  that starts over instead of resuming. With ReShade installed as d3d12.dll, the game page says to turn on Record
+  alongside ReShade for those pipelines. A game is still not compiled or recorded when its mod adds to every root
+  signature and SCSKiller can't reproduce how the game loads ReShade: ReShade in the install folder rather than beside
+  the game's exe, or under a name the game doesn't load by itself (an .asi, ReShade64.dll). The game page says so. Luma
+  mods need their shader files, which the copy leaves out: those games compile without the mod, as before.
+- On NVIDIA, a game's new pipelines no longer count a ray tracing pipeline it creates again under another launch's
+  export names, or a material it adds again in another order (The Witcher 3 does both every launch): the driver compiles
+  nothing new for them. A ray tracing pipeline the game creates with other NVIDIA shader extension settings counts as
+  new.
+
+### Fixed
+
+- Stellar Blade (and any game whose folder holds a patcher's copy of its exe): the recorder went next to the copy,
+  which never runs, so the game showed Playing without a frame graph. SCSKiller now picks the real exe, and when a game
+  runs another exe of its folder than the one SCSKiller found, it follows that exe and moves the recorder next to it
+  once the game exits.
+- On NVIDIA, the last session's report counts a ray-traced (RayQuery) pipeline the compile took from the game's files
+  as one the driver partly recompiles every launch, not as a compile, also when no recording has it.
+- Games with BattlEye whose launcher sits at the top of the game folder (such as War Thunder) are found with the
+  program BattlEye's launcher starts, also when you add one by picking its launcher, instead of the launcher itself.
+- Warframe counts as an anti-cheat game, so it is never recorded: Digital Extremes detects third-party software
+  itself, with no driver or folder SCSKiller could see.
+- Elden Ring and Elden Ring Nightreign: a compile without a recording now also covers the few pixel shaders the game
+  draws behind another bundle's vertex shaders. Against an Elden Ring recording, every pipeline made of shaders in the game's
+  files is now planned.
+- Elden Ring with ray tracing on NVIDIA: the compile builds each material's ray tracing collection the way the game
+  does, with the game's own root signatures, instead of a guess that matched nothing the game creates. All 30
+  collections of a recorded session match. The game's ray tracing pipelines, built from whichever materials are loaded,
+  still compile the first time.
+- An Unreal game whose shader code partly doesn't decompress (Dead Island 2) no longer fails the whole compile with a
+  long list of "cannot decompress" errors. SCSKiller skips those shaders and compiles the rest. Only when none of the
+  game's shader code decompresses does the compile fail, with one message.
+- Unreal Engine 5.8 games (Fortnite, The Sinking City 2) no longer fail to compile with "Arithmetic operation resulted
+  in an overflow". When SCSKiller can't read a game's exe (anti-cheat, Xbox app), it now recognizes 5.8 from the game's
+  containers instead of taking it for 5.6. 5.8 shader libraries store shorter shader hashes, and SCSKiller reads either
+  layout whichever version it detected. A shader library that still can't be read fails with its file name. A 5.8
+  game isn't compiled with 5.5's root-signature rule any more: it needs a recording until a 5.8 rule is confirmed.
+- Recording did nothing since 1.2.0: the recorder was installed but never armed, so games stayed on "Needs a recording"
+  however long they were played. On a PC where SCSKiller had never armed a recorder before, arming failed every time;
+  and an install or update that wrote the keys file disarmed the recorder it had just installed. A recorder is now armed
+  as soon as it is installed, updated or turned on, every check re-arms one that isn't, and a failure to arm is written
+  to recorders.log.
+- A game showed "Playing now" all the time, and its cache couldn't be cleared, while another program ran under the name
+  of an exe in the game's folder (a tool or launcher helper that ships with the game but runs from elsewhere, like
+  Gaijin's agent in War Thunder's folder). Such a process counts as the game only when it runs from the game's folder.
+- SCSKiller's memory use while it idles in the notification area: the key sets a scan reads are dropped after 5 minutes
+  without use (about 280 MB on a library with 66 games), the memory is handed back to Windows while the window is
+  closed to the notification area or minimized, and a compile no longer
+  keeps the game's whole shader index in memory afterwards (about 250 MB for a game with 130,000 shaders).
+
 ## [1.2.0] - 2026-10-04
 
 ### Added

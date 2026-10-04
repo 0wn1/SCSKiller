@@ -21,17 +21,18 @@ public static class KeyFiles
 
     static readonly Dictionary<string, Entry> cache = new(StringComparer.OrdinalIgnoreCase);
     static readonly Lock gate = new();
-    static long count, uses;
+    static long count, uses, lastUse;
 
     public static long CachedKeys { get { lock (gate) return count; } }
 
     /// <summary><paramref name="read"/>'s keys of the file (shared: never changed by a caller); none when it's missing or
-    /// unreadable. <paramref name="variant"/>: another reading of the same file.</summary>
-    public static HashSet<string> Keys(string path, Func<string, HashSet<string>> read, string? variant = null)
+    /// unreadable. <paramref name="variant"/>: another reading of the same file. <paramref name="failOpen"/> false: an
+    /// unreadable file throws instead.</summary>
+    public static HashSet<string> Keys(string path, Func<string, HashSet<string>> read, string? variant = null, bool failOpen = true)
     {
         var full = Path.GetFullPath(path);
-        try { return Stamp(full) is { } stamp ? Cached(variant == null ? full : full + "|" + variant, stamp, () => read(full)) : []; }
-        catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException) { return []; }
+        try { return Stamp(full, strict: !failOpen) is { } stamp ? Cached(variant == null ? full : full + "|" + variant, stamp, () => read(full)) : []; }
+        catch (Exception e) when (failOpen && e is IOException or InvalidDataException or UnauthorizedAccessException) { return []; }
     }
 
     /// <summary>A set computed from several files, cached while every one of them is the same (each by its size, write
@@ -45,12 +46,15 @@ public static class KeyFiles
     static HashSet<string> Cached(string name, string stamp, Func<HashSet<string>> read)
     {
         lock (gate)
+        {
+            lastUse = Environment.TickCount64;
             if (cache.TryGetValue(name, out var hit) && hit.Stamp == stamp)
             {
                 hit.Used = ++uses;
                 Evict();   // a bound lowered since
                 return hit.Keys;
             }
+        }
         var keys = read();
         if (keys.Count > MaxKeys) return keys;
         lock (gate)
@@ -74,6 +78,19 @@ public static class KeyFiles
         }
     }
 
+    /// <summary>Drops every cached set once none was asked for in <paramref name="idle"/>: an evaluation burst (a scan) reads
+    /// them again in one go, and the app idles in the notification area for hours. True when it dropped any.</summary>
+    public static bool DropIdle(TimeSpan idle)
+    {
+        lock (gate)
+        {
+            if (cache.Count == 0 || Environment.TickCount64 - lastUse < idle.TotalMilliseconds) return false;
+            cache.Clear();
+            count = 0;
+            return true;
+        }
+    }
+
     /// <summary>A file written here: its cached sets (every variant) are read again.</summary>
     public static void Forget(string path)
     {
@@ -86,17 +103,23 @@ public static class KeyFiles
             }
     }
 
-    internal static string? Stamp(string path)
+    /// <summary><paramref name="strict"/>: null only when the file isn't there; one that can't be opened throws (Exists
+    /// is false for a file it may not look at).</summary>
+    internal static string? Stamp(string path, bool strict = false)
     {
-        var fi = new FileInfo(path);
-        if (!fi.Exists) return null;
-        using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        var head = new byte[(int)Math.Min(Sample, f.Length)];
-        f.ReadExactly(head);
-        var tail = new byte[(int)Math.Min(Sample, Math.Max(0, f.Length - head.Length))];
-        f.Seek(-tail.Length, SeekOrigin.End);
-        f.ReadExactly(tail);
-        return $"{fi.Length}:{fi.LastWriteTimeUtc.Ticks}:{Convert.ToHexStringLower(SHA1.HashData([.. head, .. tail]))}";
+        if (!strict && !File.Exists(path)) return null;
+        FileStream f;
+        try { f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete); }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException) { return null; }
+        using (f)
+        {
+            var head = new byte[(int)Math.Min(Sample, f.Length)];
+            f.ReadExactly(head);
+            var tail = new byte[(int)Math.Min(Sample, Math.Max(0, f.Length - head.Length))];
+            f.Seek(-tail.Length, SeekOrigin.End);
+            f.ReadExactly(tail);
+            return $"{f.Length}:{File.GetLastWriteTimeUtc(f.SafeFileHandle).Ticks}:{Convert.ToHexStringLower(SHA1.HashData([.. head, .. tail]))}";
+        }
     }
 
     static readonly HashSet<string> Damaged = [];

@@ -32,8 +32,8 @@ public static class HashOnly
     public const string TooManyReferences = "state objects naming more than ";
     public const long MaxRaw = 256L << 20;
 
-    /// <summary>The tags a hash-only recording may hold: all the recorder (proxy.cpp) writes, and 'L'. 'P' / 'Y' / '1' / '2' /
-    /// 'M' are plan or work-folder records, rebuilt by each client from its own index.</summary>
+    /// <summary>The tags a hash-only recording may hold: all the recorder (proxy.cpp) writes but 'W' (a layer's, never
+    /// shared), and 'L'. 'P' / 'Y' / '1' / '2' / 'M' are plan or work-folder records, rebuilt by each client from its own index.</summary>
     public const string Tags = "BGCSRANL";
 
     public sealed record Counts(int Psos, int GraphicsPsos, int DistinctVs);
@@ -49,17 +49,23 @@ public static class HashOnly
     /// every record checked with the client's parser. A state object
     /// must have every root signature it names as a 'B' (a client can't rebuild those: they aren't in the game's files) and
     /// every record it builds on. <paramref name="local"/>: a full recording of this machine, whose shader blobs (DXIL
-    /// libraries included) and unreplayable state objects are dropped; otherwise (someone else's upload) they are errors.
+    /// libraries included) and unreplayable state objects are dropped, and so is what a layer wrapping the device made: each
+    /// 'W' and the record it names as the driver's (per add-on build and settings; the bytes are a mod's). A 'W' names
+    /// pipeline and state object records only; a root signature goes when no kept record names it; otherwise
+    /// (someone else's upload) they are errors.
     /// InvalidDataException names the first problem, <see cref="TooManyReferences"/> past <paramref name="maxRefs"/>
     /// references (<see cref="MaxEntryStateObjectRefs"/> for an entry).</summary>
-    public static List<Rec> Canonical(IEnumerable<Rec> records, bool local, out Dropped dropped, int maxRefs = MaxStateObjectRefs)
+    /// <paramref name="layerMade"/>: more records a layer made, known from other recordings (<see cref="MiddlewarePacks.LayerMade"/>):
+    /// dropped too in a local recording that has them without their 'W'.
+    public static List<Rec> Canonical(IEnumerable<Rec> records, bool local, out Dropped dropped, int maxRefs = MaxStateObjectRefs, IReadOnlySet<string>? layerMade = null)
     {
         var blobs = new SortedDictionary<string, Rec>(StringComparer.Ordinal);
         var psos = new SortedDictionary<string, Rec>(StringComparer.Ordinal);
         var states = new SortedDictionary<string, (Rec Rec, StateObject So)>(StringComparer.Ordinal);
         var nv = new SortedDictionary<string, Rec>(StringComparer.Ordinal);
         var flags = new SortedDictionary<string, Rec>(StringComparer.Ordinal);
-        int shaders = 0, dups = 0, n = 0, refs = 0;
+        var layer = new HashSet<string>();   // the records the driver got from a layer, named by 'W' records
+        int shaders = 0, layerRecords = 0, dups = 0, n = 0, refs = 0;
         foreach (var r in records)
         {
             switch (r.Tag)
@@ -92,13 +98,24 @@ public static class HashOnly
                     if (r.Payload.Length != 20) throw new InvalidDataException($"'L' record of {r.Payload.Length} bytes");
                     if (!flags.TryAdd(r.Key, r)) dups++;
                     break;
+                case 'W' when local:
+                    if (r.Payload.Length != 40) throw new InvalidDataException($"'W' record of {r.Payload.Length} bytes");
+                    layer.Add(Hex(r.Payload.AsSpan(0, 20)));
+                    layerRecords++;
+                    break;
                 default:
                     Check(r);
                     if (!psos.TryAdd(r.Key, r)) dups++;
                     break;
             }
-            // dropped shader blobs don't count (29k of a real 86k-record session)
-            if (++n - shaders > MaxRecords) throw new InvalidDataException($"more than {MaxRecords} records");
+            // dropped shader blobs and 'W' records don't count (29k shaders of a real 86k-record session)
+            if (++n - shaders - layerRecords > MaxRecords) throw new InvalidDataException($"more than {MaxRecords} records");
+        }
+        if (local && layerMade != null) layer.UnionWith(layerMade);
+        foreach (var k in layer)
+        {
+            psos.Remove(k);
+            states.Remove(k);   // what builds on it can't be replayed from the upload: dropped below
         }
         // state objects: replayable from hashes, in dependency order (a record's key hashes the keys it builds on, so there
         // are no cycles; the walk guards anyway). Depth-first post-order with an explicit stack: uploads can chain any depth.

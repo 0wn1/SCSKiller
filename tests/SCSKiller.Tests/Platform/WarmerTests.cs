@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using SCSKiller.Core;
+using SCSKiller.Core.Planning;
 using SCSKiller.Core.Vendors;
 using SCSKiller.Core.Warming;
 
@@ -240,6 +241,83 @@ public class WarmerTests : IDisposable
         Assert.Equal(["scskiller.log", "scskiller_creates.csv"], Directory.GetFiles(flat).Select(Path.GetFileName).Order(StringComparer.Ordinal));
         Assert.Empty(Directory.GetDirectories(flat));
         Assert.Equal(["scskiller.log", "scskiller_creates.csv"], Directory.GetFiles(stage).Select(Path.GetFileName).Order(StringComparer.Ordinal));
+    }
+
+    /// <summary>The real scskiller_warm on WARP with a layer (--layer): its dlls, ini and add-ons are staged next to the
+    /// child's exe and go with the other staged inputs; anything else in the folder (an exe, game data, a log) is left out,
+    /// and the folder stays as it was. A layer file named like a staged input (ReShade as d3d12.dll, the proxy's name), or
+    /// an ini pointing ReShade at another folder, stops the run before it starts. Needs this checkout's proxy built.</summary>
+    [Fact]
+    public async Task The_real_warm_stages_only_the_layer_s_files_and_removes_them()
+    {
+        var bin = Path.Combine(TestEnv.RepoRoot, "proxy", "build", "Release");
+        if (!File.Exists(Path.Combine(bin, "scskiller_warm.exe"))) return;
+        var luid = Process.Start(new ProcessStartInfo(Path.Combine(bin, "selftest.exe"), "warpluid") { RedirectStandardOutput = true })!.StandardOutput.ReadToEnd().Trim();
+        var exe = $"scsk-layer-{Guid.NewGuid():N}"[..20] + ".exe";
+        var layer = Path.Combine(_dir, "layer");
+        Directory.CreateDirectory(layer);
+        string[] files = ["Game.exe", "ReShade.ini", "ReShade.log", "data.pak", "fake.addon64", "helper.dll"];
+        foreach (var f in files) File.WriteAllText(Path.Combine(layer, f), f == "ReShade.ini" ? "[GENERAL]\r\nNoReloadOnInit=1\r\n" : f);
+        var work = Path.Combine(_dir, "work");
+        Directory.CreateDirectory(work);
+        async Task<(string Out, string Err)> Run()
+        {
+            var p = Process.Start(new ProcessStartInfo(Path.Combine(bin, "scskiller_warm.exe"), [work, exe, "--adapter-luid", luid, "--layer", layer])
+                { StandardOutputEncoding = System.Text.Encoding.UTF8, RedirectStandardOutput = true, RedirectStandardError = true })!;
+            var (o, e) = (p.StandardOutput.ReadToEndAsync(), p.StandardError.ReadToEndAsync());
+            await p.WaitForExitAsync().WaitAsync(Patience);
+            return (await o, await e);
+        }
+        var (o1, _) = await Run();
+        Assert.Contains("\"done\"", o1);
+        var stage = Assert.Single(Directory.GetDirectories(work, "stage-*"));
+        Assert.Equal(["scskiller.log", "scskiller_creates.csv"], Directory.GetFiles(stage).Select(Path.GetFileName).Order(StringComparer.Ordinal));
+        Assert.Equal(files.Order(StringComparer.Ordinal), Directory.GetFiles(layer).Select(Path.GetFileName).Order(StringComparer.Ordinal));
+
+        File.WriteAllText(Path.Combine(layer, "ReShade.ini"), "[ADDON]\r\nAddonPath=C:\\Games\\X\r\n");
+        Assert.Contains("sets [ADDON] AddonPath", (await Run()).Out);
+        File.WriteAllText(Path.Combine(layer, "ReShade.ini"), "[GENERAL]\r\n");
+        File.WriteAllText(Path.Combine(layer, "d3d12.dll"), "ReShade");
+        Assert.Contains("staging the layer's d3d12.dll failed", (await Run()).Out);
+    }
+
+    /// <summary>A careful warm (pass file) of a recording with a layer's 'W' records, through the real scskiller_warm on WARP:
+    /// the pass file has an entry per item the proxy replays, so every pass runs ('W' is none). Needs this checkout's proxy
+    /// built.</summary>
+    [Fact]
+    public async Task A_careful_warm_of_a_layered_recording_runs_every_pass()
+    {
+        var bin = Path.Combine(TestEnv.RepoRoot, "proxy", "build", "Release");
+        if (!File.Exists(Path.Combine(bin, "scskiller_warm.exe"))) return;
+        var luid = Process.Start(new ProcessStartInfo(Path.Combine(bin, "selftest.exe"), "warpluid") { RedirectStandardOutput = true })!.StandardOutput.ReadToEnd().Trim();
+        var vendor = new UnsupportedVendor(new GpuInfo(GpuVendor.Unknown, "WARP", "1.0", Convert.ToInt64(luid, 16), 0));
+        var work = Path.Combine(_dir, "work");
+        Directory.CreateDirectory(work);
+        string H(int i) => Convert.ToHexStringLower(System.Security.Cryptography.SHA1.HashData([(byte)i]));
+        using (var db = File.Create(Path.Combine(work, "scskiller.db")))
+            foreach (var rs in new[] { 1, 2, 3 })   // one compute shader on three root signatures: siblings, in passes of their own
+            {
+                PsoDb.Write(db, 'C', PsoDb.Compute(H(rs), H(9)));
+                if (rs > 1) PsoDb.Write(db, 'W', Convert.FromHexString(new PsoDb.Rec('C', PsoDb.Compute(H(rs), H(9))).Key + H(1)));
+            }
+        Assert.True(WarmPasses.Write(work) > 1);
+        var exe = $"scsk-careful-{Guid.NewGuid():N}"[..20] + ".exe";
+        var r = await new Warmer(vendor, Path.Combine(bin, "scskiller_warm.exe")).Start(Game with { ExePath = Path.Combine(_dir, exe) }, work, new WarmOptions(1, WarmPriority.BelowNormal), null).Completion.WaitAsync(Patience);
+        Assert.Null(r.Error);
+        Assert.Equal(WarmOutcome.Completed, r.Outcome);
+        Assert.Equal(3, r.Total);
+    }
+
+    /// <summary>The folder the Layer hook gives for a game (a copy of its layer, made in the run's work folder) goes to
+    /// scskiller_warm as --layer.</summary>
+    [Fact]
+    public async Task A_layer_folder_goes_to_the_warm_as_layer()
+    {
+        var work = Work("complete");
+        string? asked = null;
+        await new Warmer(Vendor, _exe) { Layer = (_, w) => Path.Combine(asked = w, "layer") }.Start(Game, work, new WarmOptions(1, WarmPriority.BelowNormal), null).Completion;
+        Assert.Equal(work, asked);
+        Assert.Equal(["--layer", Path.Combine(work, "layer")], File.ReadAllLines(Path.Combine(work, "args.txt")).SkipWhile(x => x != "--layer").Take(2));
     }
 
     /// <summary>NVIDIA warms with the segment-heap build (its staged copy is that exe), the other vendors with the NT-heap

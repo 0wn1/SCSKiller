@@ -80,6 +80,8 @@ public static class UpdateFeeds
 {
     public const string GhRepo = "BlueHeisenberg/SCSKiller";
     public static readonly Uri Packages = new("https://dl.scskiller.io/");   // alpha/beta/internal packages: VPS route only (hosting.md §3)
+    /// <summary>The app's background check; the Library's refresh and About's "Check for updates" check in between.</summary>
+    public static readonly TimeSpan CheckEvery = TimeSpan.FromHours(1);
 
     /// <summary>Stable: the feed on GitHub Releases (§4.4). Other channels: the edge, behind the access token, through
     /// <see cref="RouteFailover"/> (a URL on its primary route).</summary>

@@ -7,7 +7,7 @@
 //                  [--stop-event <name>] [--adapter-luid <hex>] [--rt-threads N] [--skip i,j,...]
 //                  [--memory-mb N] [--package <app user model id>] [--stage-path <install folder>\<dir>\<exe>]
 //                  [--skip-keys <sha1 hex>,...] [--isolate i,j,...]
-//                  [--ags <amd_ags_x64.dll> --ags-app <name> --ags-engine <name>] [--pass K]
+//                  [--ags <amd_ags_x64.dll> --ags-app <name> --ags-engine <name>] [--pass K] [--layer <folder>]
 //
 // Protocol (JSON lines on stdout, exit codes): ARCHITECTURE.md. Stages <workdir>\stage-<pid>-<n>\<exe name> (a new folder
 // of this run's) + d3d12.dll (the proxy) + the dbs and runs that copy (the child), which prints the JSON. The caller only
@@ -28,6 +28,7 @@
 #include <io.h>
 #include <cstdarg>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <thread>
@@ -50,6 +51,7 @@ static const CLSID CLSID_DesktopAppXActivator = {0x168EB462, 0x775F, 0x42AE, {0x
 
 static std::wstring beat_name(DWORD parent) { return L"Local\\SCSKiller.Beat." + std::to_wstring(parent); }
 static std::wstring final_name(DWORD parent) { return L"Local\\SCSKiller.Final." + std::to_wstring(parent); }
+static std::wstring started_name(DWORD parent) { return L"Local\\SCSKiller.Started." + std::to_wstring(parent); }
 static std::wstring pipe_name(DWORD parent, int fd) { return L"\\\\.\\pipe\\SCSKiller.Warm." + std::to_wstring(parent) + L"." + std::to_wstring(fd); }
 
 enum { RUN, PAUSE, STOP };  // SCSKiller_Control states (proxy.cpp)
@@ -67,6 +69,7 @@ struct Opts {
     std::wstring package;        // app user model id whose package identity the child runs with
     std::wstring stage_path;
     std::wstring ags, ags_app, ags_engine;
+    std::wstring layer;          // a copy of the game's layer (ReShade's dll, its ini, add-ons), staged next to the exe
     int pass = -1;
 };
 
@@ -87,6 +90,7 @@ static bool parse(int argc, wchar_t** argv, int i, Opts& o) {
         else if (k == L"--ags-app") o.ags_app = v;
         else if (k == L"--ags-engine") o.ags_engine = v;
         else if (k == L"--pass") o.pass = (int)wcstol(v.c_str(), &end, 10);
+        else if (k == L"--layer") o.layer = v;
         else if (k == L"--skip" || k == L"--isolate") {
             for (const wchar_t* c = v.c_str(); *c;) {
                 (k == L"--skip" ? o.skip : o.isolate).push_back(_wcstoui64(c, &end, 10));
@@ -231,7 +235,8 @@ static int child(DWORD parent_pid, const Opts& o) {
     if (o.pass >= 0) warm_pass(pass_of.data(), pass_of.size(), (uint32_t)o.pass);
     const uint64_t first = p[0];
     emit("{\"event\":\"start\",\"total\":%llu,\"adapter\":%s,\"exe\":%s}", p[1], json(bd.Description).c_str(), json(exe).c_str());
-    start(dev);
+    start(dev);  // looks for a layer's device under it: a layer's code still runs
+    if (HANDLE started = OpenEventW(EVENT_MODIFY_STATE, FALSE, started_name(parent_pid).c_str())) SetEvent(started), CloseHandle(started);
 
     HANDLE stop = o.stop_event.empty() ? nullptr : CreateEventW(nullptr, TRUE, FALSE, o.stop_event.c_str());
     auto beat = (volatile LONG*)MapViewOfFile(beat_map, FILE_MAP_READ, 0, 0, sizeof(LONG));
@@ -321,12 +326,14 @@ int wmain(int argc, wchar_t** argv) {
             for (size_t e = 0; (e = sub.find(L'\\', e)) != std::wstring::npos; ++e)
                 dirs.push_back(flat + sub.substr(0, e)), CreateDirectoryW(dirs.back().c_str(), nullptr), stage = dirs.back() + L"\\";
     }
+    std::vector<std::wstring> layer;  // the --layer files staged (CopyFileW never overwrites a staged input)
     struct Unstage {
         std::function<void()> f;
         ~Unstage() { f(); }
     } unstage{[&] {  // only inside this run's folder: the staged inputs go, the proxy's outputs stay in flat
         for (auto n : {exe, std::wstring(L"d3d12.dll"), std::wstring(L"scskiller.db"), std::wstring(L"scskiller_gen.db"), std::wstring(L"scskiller_pass.bin")})
             DeleteFileW((stage + n).c_str());
+        for (auto& n : layer) DeleteFileW((stage + n).c_str());
         if (stage == flat) return;
         for (auto n : {L"scskiller.log", L"scskiller_creates.csv", L"scskiller_warm_times.csv"})
             MoveFileExW((stage + n).c_str(), (flat + n).c_str(), 0);
@@ -343,6 +350,23 @@ int wmain(int argc, wchar_t** argv) {
     if (!put(self, exe, false) || !put(proxy, L"d3d12.dll", false) || !put(work + L"scskiller.db", L"scskiller.db", true) ||
         !put(work + L"scskiller_gen.db", L"scskiller_gen.db", true) || !put(work + L"scskiller_pass.bin", L"scskiller_pass.bin", true))
         return fail(L"staging into " + stage + L" failed (error " + std::to_wstring(GetLastError()) + L")");
+    if (!o.layer.empty()) {
+        // the layer's log stays in the stage, with the proxy's outputs
+        std::error_code ec;
+        for (auto& e : std::filesystem::directory_iterator(o.layer, ec)) {
+            std::wstring n = e.path().filename().wstring(), x = e.path().extension().wstring();
+            // the layer's dll, its ini, its add-ons and the dlls they load: never an exe or the game's data
+            if (!e.is_regular_file(ec) || (_wcsicmp(x.c_str(), L".dll") && _wcsicmp(x.c_str(), L".ini") && _wcsnicmp(x.c_str(), L".addon", 6))) continue;
+            if (!put(e.path().wstring(), n, false)) return fail(L"staging the layer's " + n + L" failed (error " + std::to_wstring(GetLastError()) + L")");
+            layer.push_back(n);
+            // ReShade reads add-ons and its config from these when set: the game's folder, not the stage
+            wchar_t v[8];
+            for (auto [sec, key] : {std::pair{L"ADDON", L"AddonPath"}, std::pair{L"INSTALL", L"BasePath"}})
+                if (!_wcsicmp(x.c_str(), L".ini") && GetPrivateProfileStringW(sec, key, L"", v, 8, (stage + n).c_str()))
+                    return fail(L"the layer's " + n + L" sets [" + sec + L"] " + key + L": its files would come from outside the stage");
+        }
+        if (ec) return fail(L"--layer " + o.layer + L" can't be listed");
+    }
 
     const DWORD me = GetCurrentProcessId();
     HANDLE map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(LONG), beat_name(me).c_str());
@@ -352,6 +376,16 @@ int wmain(int argc, wchar_t** argv) {
     // was poisoned (a thread stuck in it) may never finish exiting: after SCSKILLER_WARM_EXIT_S (default 600 s: a big cache
     // flush at exit takes minutes) it is terminated, and whatever it hadn't written of the driver cache is lost (ARCHITECTURE.md).
     HANDLE final_event = CreateEventW(nullptr, TRUE, FALSE, final_name(me).c_str());
+    // set by the child once its device exists: a layer's code (--layer) runs before that, and may hang
+    HANDLE started = CreateEventW(nullptr, TRUE, FALSE, started_name(me).c_str());
+    // ReShade reads these before the child runs: RESHADE_BASE_PATH_OVERRIDE would load its config and add-ons from elsewhere
+    if (wchar_t* env = GetEnvironmentStringsW()) {
+        std::vector<std::wstring> reshade;
+        for (wchar_t* e = env; *e; e += wcslen(e) + 1)
+            if (!_wcsnicmp(e, L"RESHADE_", 8) && wcschr(e, L'=')) reshade.emplace_back(e, wcschr(e, L'='));
+        FreeEnvironmentStringsW(env);
+        for (auto& n : reshade) SetEnvironmentVariableW(n.c_str(), nullptr);
+    }
     std::wstring args = L"--child " + std::to_wstring(me);
     for (int i = 3; i < argc; ++i) args += L" \"" + std::wstring(argv[i]) + L"\"";
     fflush(stdout);
@@ -402,9 +436,16 @@ int wmain(int argc, wchar_t** argv) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);  // a starved heartbeat would read as a pause
     wchar_t lim[16] = {};
     ULONGLONG exit_ms = 1000ull * (GetEnvironmentVariableW(L"SCSKILLER_WARM_EXIT_S", lim, 16) ? _wtoi(lim) : 600), final_at = 0;
-    bool killed = false;
+    // counted in this loop's turns, not wall time: the caller suspends this process to pause the warm
+    uint64_t start_turns = 10ull * (GetEnvironmentVariableW(L"SCSKILLER_WARM_START_S", lim, 16) ? _wtoi(lim) : 180), turns = 0;
+    bool killed = false, stuck = false;
     while (WaitForSingleObject(pi.hProcess, 100) == WAIT_TIMEOUT) {
         InterlockedIncrement(beat);
+        if (started && ++turns > start_turns && WaitForSingleObject(started, 0) == WAIT_TIMEOUT) {
+            TerminateProcess(pi.hProcess, 1), stuck = true;
+            WaitForSingleObject(pi.hProcess, 5000);
+            break;
+        }
         if (final_event && !final_at && WaitForSingleObject(final_event, 0) == WAIT_OBJECT_0) final_at = GetTickCount64();
         if (final_at && GetTickCount64() - final_at > exit_ms) {
             fwprintf(stderr, L"the warm process did not exit %llu s after its last line: terminated (its unwritten driver cache is lost)\n", exit_ms / 1000);
@@ -417,6 +458,9 @@ int wmain(int argc, wchar_t** argv) {
         if (WaitForSingleObject(t.native_handle(), 1000) == WAIT_TIMEOUT) CancelSynchronousIo(t.native_handle());
         t.join();
     }
+    if (stuck)
+        return fail(L"the warm process didn't start replaying within " + std::to_wstring(start_turns / 10) + L" s" +
+                    (o.layer.empty() ? L"" : L" (an add-on of the game's layer may hang outside the game)") + L"; ended it");
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
     if (killed) return 3;  // its last line (done / retry) was printed; the caller goes by it

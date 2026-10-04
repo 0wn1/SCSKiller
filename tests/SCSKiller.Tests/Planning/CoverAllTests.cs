@@ -230,7 +230,7 @@ public class CoverAllTests(ITestOutputHelper output)
         var engine = reader.Detect(game!)!;
         if (Ff7.Recording(game!, engine, reader, "rq-townfall-rec") is not { } db) return;
         var keys = Path.Combine(Ff7.TempDir("rq-townfall-keys"), "rayquery.keys");
-        SCSKiller.Core.App.SessionLog.WriteRayQueryKeys(db, keys);
+        SCSKiller.Core.App.SessionLog.WriteRayQueryKeys([db], keys);
         var rq = SCSKiller.Core.App.SessionLog.ReadRayQueryKeys(keys)!;
         Assert.NotEmpty(rq);
         Assert.All(Read(db).Where(r => rq.Contains(r.Key)), r => Assert.True(r.Tag == 'C' || Parse(r).Stages.ContainsKey((int)Stage.Compute)));

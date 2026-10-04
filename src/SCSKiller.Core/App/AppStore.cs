@@ -33,6 +33,7 @@ public sealed class GameRecord
     public double ResumeSeconds { get; set; }                // ...and their time: a complete warm's time and rate include them
     public long ResumeFailed { get; set; }                   // ...and their failures: a resumed warm counts only its own
     public string? ResumeGpu { get; set; }                   // ...on this driver (ScsKiller.DriverId): another one's cache lacks them; null = unknown, as another
+    public string? ResumeLayer { get; set; }                 // ...through this ReShade layer (ReShadeInstall.Fingerprint); null = none
     public string? WarmedDriverVersion { get; set; }         // shown; earlier builds also compared it
     public string? WarmedDriverId { get; set; }              // what staleness compares (ScsKiller.DriverId); null = an earlier build's warm
     public DateTimeOffset? WarmedAt { get; set; }
@@ -47,6 +48,8 @@ public sealed class GameRecord
     public string? WarmedIndexHash { get; set; }
     public string? WarmedExeStamp { get; set; }             // exe size + write time at the warm: a game patch changes it
     public string? WarmedGameVersion { get; set; }          // Game.Version (store build id) at the warm; preferred over the exe stamp
+    public string? WarmedLayer { get; set; }                // the ReShade layer the warm ran through (ReShadeInstall.Fingerprint); null = none
+    public string? WarmedIndexStamp { get; set; }           // IEngineReader.IndexStamp when the warm's index was taken; null = ""
     public double? BytesPerPso { get; set; }                // measured by the last complete warm onto a cold cache (ScsKiller.ColdWarm)
     public double? PsoPerSecond { get; set; }               // ...and this
     public DateTimeOffset? RecordingImportedAt { get; set; }  // when an import last added records
@@ -56,6 +59,9 @@ public sealed class GameRecord
     public string? RecorderExe { get; set; }                 // the game's exe while a recorder is installed: uninstall finds it without a scan
     public string? RecorderInstallDir { get; set; }          // and its install root, for the running check
     public string? RecorderMoveFrom { get; set; }            // a recorder moving next to the game's exe: the old exe, until its folder's recording is imported and its files are gone
+    public string? RunsExe { get; set; }                    // the exe of its install the game was seen running when discovery named another: used instead (ScsKiller.Following)
+    public string? RunsExeFrom { get; set; }                // ...discovery's exe then, and the build (store version, else RunsExe's size and write time):
+    public string? RunsExeBuild { get; set; }               // either changed, RunsExe is dropped
     public string? RecorderMoveTo { get; set; }              // ...and the game's exe it moves next to: the uninstall hook's running check covers both
     // null = not migrated: the first reconcile makes an installed recorder of ours On (the user put it there), else Default
     public RecorderOverride? Recorder { get; set; }

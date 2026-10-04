@@ -429,7 +429,7 @@ public class RedEngineReaderTests
             RedRayTracing.Learn([Addition(global, 32, 0x200), Addition(global, 32, 0x200), Addition(new string('8', 40), 16, 0)]));
 
         ShaderInfo Lib(params Binding[] b) => new("", Stage.Library, "lib_6_5", 0, new(0, 0, 0, 0), b, [], []);
-        var g = new RootSig.Ranges(0, [(0, 2, 12, 1, 0), (0, 0, 4, 40, 0)]);   // the global root signature gives b12 and t4-t43 in space 0
+        var g = new RootSig.Ranges(0, [(0, 2, 12, 1, 0, false), (0, 0, 4, 40, 0, true)]);   // the global root signature gives b12 and t4-t43 in space 0
         var d = RedRayTracing.Local([Lib(new("srv", 0, 0, 2), new("cbv", 0, 12, 1), new("cbv", 0, 2, 1)), Lib(new("srv", 0, 3, 1), new("srv", 0, 5, 1), new("srv", 1, 0, 1))], g)!;
         Assert.Equal((0x80u, true), (d.Flags, d.AppendRanges));
         Assert.Equal([[3, 0, 1, 1, 2], [3, 0, 2, 1, 2], [1, 0, 3, 1, 22], [0, 0, 0, 2, 0, 0, 3, 0, 1, 3, 0, 3], [0, 0, 2, 1, 2, 0, 3]], d.Rows);   // runs t0-t1 and t3 (t5 is the global's), b2
@@ -437,7 +437,7 @@ public class RedEngineReaderTests
         Assert.Null(RedRayTracing.Local([Lib(new Binding("srv", 0, 5, 1))], g));   // only registers the global one gives: the same
         Assert.Equal([[3, 0, 1, 1, 2], [3, 0, 2, 1, 2], [1, 0, 3, 1, 22], [0, 0], [0, 0, 2, 1, 2, 0, 3]], RedRayTracing.Local([Lib(new Binding("cbv", 0, 2, 1))], g)!.Rows);   // an empty SRV table before a CBV one works
         Assert.NotEmpty(RootSig.Serialize(d, []));
-        var g47 = new RootSig.Ranges(0, [(0, 0, 4, 4, 0), (0, 0, 20, uint.MaxValue, 0)]);   // t4-t7, and t20 on unbounded
+        var g47 = new RootSig.Ranges(0, [(0, 0, 4, 4, 0, true), (0, 0, 20, uint.MaxValue, 0, true)]);   // t4-t7, and t20 on unbounded
         Assert.Null(RedRayTracing.Local([Lib(new Binding("srv", 0, 0, 8))], g47));   // t0-t7: a local t0-t7 would overlap t4-t7
         Assert.Null(RedRayTracing.Local([Lib(new Binding("srv", 0, 18, 4))], g47));   // t18-t21: partly in the unbounded one
         Assert.Null(RedRayTracing.Local([Lib(new Binding("srv", 0, 0, -1))], g47));   // unbounded

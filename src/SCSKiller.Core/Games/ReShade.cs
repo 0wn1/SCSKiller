@@ -22,10 +22,36 @@ public sealed record ReShadeAddon(string Path, string? Mod, AddonKind Kind, bool
 /// <summary>ReShade next to the game: its DLL (whatever its name), ReShade.ini and ReShade.log when present, and the
 /// add-ons in the folder it loads them from (its own, or ReShade.ini's AddonPath).</summary>
 /// <param name="LoadsAddons">the build with full add-on support; the standard one loads no add-on files</param>
-public sealed record ReShadeInstall(string Dll, bool LoadsAddons, string? Ini, string? Log, IReadOnlyList<ReShadeAddon> Addons)
+/// <param name="BesideExe">in the exe's own folder, where the game loads it; else in the install root above it</param>
+public sealed record ReShadeInstall(string Dll, bool LoadsAddons, string? Ini, string? Log, IReadOnlyList<ReShadeAddon> Addons, bool BesideExe = true)
 {
     /// <summary>The loaded add-on that changes the most of the game's pipelines; null = none changes any.</summary>
     public ReShadeAddon? ShaderMod => LoadsAddons ? Addons.Where(a => a is { Disabled: false, Kind: not AddonKind.NotPipeline }).MaxBy(a => a.Kind) : null;
+
+    // the names the game itself loads ReShade under from its exe's folder (system DLLs it imports, or the recorder's chain)
+    static readonly string[] Loaded = ["dxgi.dll", "d3d12.dll", "d3d11.dll", "d3d10.dll", "d3d9.dll", "opengl32.dll", "dinput8.dll", ScsKiller.ChainName];
+
+    /// <summary>A copy of the layer next to the warm's exe reproduces what the game loads: ReShade beside the exe under a
+    /// name the game loads by itself (not an .asi, ReShade64.dll or a renamed file another loader may or may not pick
+    /// up), and no Luma add-on, whose shader files a copy leaves out.</summary>
+    public bool Copyable => BesideExe && Loaded.Contains(Path.GetFileName(Dll), StringComparer.OrdinalIgnoreCase)
+        && !Addons.Any(a => a is { Disabled: false, Mod: "Luma" });
+
+    /// <summary>A shader mod whose layer a copy reproduces (<see cref="Copyable"/>): compiles run through it.</summary>
+    public bool Layered => ShaderMod != null && Copyable;
+
+    /// <summary>An add-on that changes every pipeline in a layer a copy can't reproduce: a compile without it matches
+    /// nothing if the game loads it, and one through it nothing if the game doesn't.</summary>
+    public bool Blocks => !Copyable && ShaderMod is { Kind: AddonKind.LayoutInjecting };
+
+    /// <summary>ReShade under the recorder's own name (d3d12.dll, or the name a chained mod gets): the recorder records
+    /// under it only when the user chains it ("Record alongside").</summary>
+    public bool AsD3D12 => Path.GetFileName(Dll) is var n && (n.Equals("d3d12.dll", StringComparison.OrdinalIgnoreCase) || n.Equals(ScsKiller.ChainName, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>What a warm through this layer depends on: ReShade's DLL and the add-ons that change pipelines, each by
+    /// name, size and write time (not ReShade.ini: ReShade rewrites it as it runs); null = nothing to copy (not <see cref="Layered"/>).</summary>
+    public string? Fingerprint => !Layered ? null : string.Join('|', new[] { Dll }.Concat(Addons.Where(a => a is { Disabled: false, Kind: not AddonKind.NotPipeline }).Select(a => a.Path))
+        .Select(p => new FileInfo(p)).Select(f => $"{f.Name}:{f.Length}:{f.LastWriteTimeUtc.Ticks}"));
 }
 
 public static class ReShade
@@ -97,7 +123,7 @@ public static class ReShade
                     var a = Classify(f, verdicts, log);
                     return a with { Disabled = disabled.Any(d => Disables(d, a, f)) };
                 }).ToList();
-            return new(dll.FullName, Find(dll, "limited", Limited) != 0, ini, log, addons);
+            return new(dll.FullName, Find(dll, "limited", Limited) != 0, ini, log, addons, dir.Equals(GameFiles.DirKey(Path.GetDirectoryName(game.ExePath)!), StringComparison.OrdinalIgnoreCase));
         }
         return null;
     }
@@ -106,6 +132,33 @@ public static class ReShade
     {
         try { return new DirectoryInfo(dir).EnumerateFiles("*", Flat).ToList(); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException) { return null; }
+    }
+
+    /// <summary>A copy of the layer for a warm (scskiller_warm --layer) in <paramref name="dest"/>, emptied first: ReShade's
+    /// DLL as dxgi.dll (the warm's exe loads it under that name, whatever the game's is), the add-ons that change pipelines,
+    /// and ReShade.ini without the keys that point ReShade at another folder ([ADDON] AddonPath, [INSTALL] BasePath).</summary>
+    public static string Stage(ReShadeInstall r, string dest)
+    {
+        if (Directory.Exists(dest)) Directory.Delete(dest, true);
+        Directory.CreateDirectory(dest);
+        File.Copy(r.Dll, Path.Combine(dest, "dxgi.dll"));
+        foreach (var a in r.Addons.Where(a => a is { Disabled: false, Kind: not AddonKind.NotPipeline })) File.Copy(a.Path, Path.Combine(dest, Path.GetFileName(a.Path)));
+        if (r.Ini != null) File.WriteAllLines(Path.Combine(dest, "ReShade.ini"), WithoutPaths(File.ReadAllLines(r.Ini)));
+        return dest;
+    }
+
+    static IEnumerable<string> WithoutPaths(IEnumerable<string> ini)
+    {
+        var section = "";
+        foreach (var line in ini)
+        {
+            var t = line.Trim();
+            if (t.StartsWith('[') && t.EndsWith(']')) section = t[1..^1].Trim();
+            var key = t.Split('=', 2)[0].Trim();
+            if (!(section.Equals("ADDON", StringComparison.OrdinalIgnoreCase) && key.Equals("AddonPath", StringComparison.OrdinalIgnoreCase)
+                  || section.Equals("INSTALL", StringComparison.OrdinalIgnoreCase) && key.Equals("BasePath", StringComparison.OrdinalIgnoreCase)))
+                yield return line;
+        }
     }
 
     static bool Ext(FileInfo f, string ext) => f.Extension.Equals(ext, StringComparison.OrdinalIgnoreCase);

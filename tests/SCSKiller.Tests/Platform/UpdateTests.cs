@@ -203,6 +203,24 @@ public class UpdateTests : IDisposable
                 UpdateFeeds.Package(AppVersion.Parse("1.5.0-beta.2")!, "SCSKiller.App-1.5.0-beta.2-delta.nupkg").AbsoluteUri);
     }
 
+    [Fact]
+    public void Checks_RunHourly() => Assert.Equal(TimeSpan.FromHours(1), UpdateFeeds.CheckEvery);
+
+    /// <summary>The App project is WinUI and has no test seam: its source says that "Check for updates" and the Library's
+    /// refresh download what they find (CheckAsync's download defaults to true).</summary>
+    [Fact]
+    public void ManualCheck_AndLibraryRefresh_Download()
+    {
+        var app = Path.Combine(TestEnv.RepoRoot, "src", "SCSKiller.App");
+        var updater = File.ReadAllText(Path.Combine(app, "Updater.cs"));
+        Assert.Matches(@"public static async Task CheckAsync\(bool backToStable = false, bool download = true\)", updater);
+        var now = System.Text.RegularExpressions.Regex.Match(updater, @"public static Task CheckNowAsync\(\)\s*\{(.*?)\r?\n    \}",System.Text.RegularExpressions.RegexOptions.Singleline);
+        Assert.True(now.Success);
+        Assert.Contains("return CheckAsync();", now.Groups[1].Value);
+        Assert.Contains("_ = Updater.CheckNowAsync();", File.ReadAllText(Path.Combine(app, "Pages", "AboutPage.xaml.cs")));
+        Assert.Matches(@"real\.UserFetch = async \(\) => \{ await Account\.RefreshAsync\(\); await Updater\.CheckAsync\(\); \};", File.ReadAllText(Path.Combine(app, "App.xaml.cs")));
+    }
+
     /// <summary>A package host can't fill the disk past the signed feed's size, nor hold the update check forever.</summary>
     [Fact]
     public async Task Download_StopsAtTheFeedsSize_AndOnAStall()

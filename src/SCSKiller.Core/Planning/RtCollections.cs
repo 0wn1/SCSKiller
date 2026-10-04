@@ -62,26 +62,9 @@ public static class RtCollections
         return null;
     }
 
-    /// <summary>Engines whose collections are GUESSED without a recording (unverified in game): their libraries carry no
-    /// RDAT subobjects, so nothing says the game's root signatures or pipeline shape. Elden Ring (FromSoftware): EasyAntiCheat
-    /// blocks recording.</summary>
-    public static readonly HashSet<string> GuessedFamilies = ["FromSoftware"];
-
-    /// <summary>The guessed global root signature: one table visible to every shader per resource class and space, covering
-    /// registers 0 up to the highest any library binds (unbounded where one is), no static samplers. The local root signature
-    /// is <see cref="EmptyLocal"/>: the global one already covers every binding. One collection per library (its own hit group,
-    /// its own payload), attributes 8, depth 1 (<see cref="GuessedRule"/>).</summary>
-    public static RootSig.Desc GuessedGlobal(IEnumerable<ShaderInfo> libs)
-    {
-        var type = new Dictionary<string, uint> { ["srv"] = 0, ["uav"] = 1, ["cbv"] = 2, ["sampler"] = 3 };
-        return new(0, [.. libs.SelectMany(l => l.Bindings).Where(b => type.ContainsKey(b.Class)).GroupBy(b => (b.Class, b.Space)).OrderBy(g => type[g.Key.Class]).ThenBy(g => g.Key.Space)
-            .Select(g => new uint[] { 0, 0, type[g.Key.Class], g.Any(b => b.Count < 0) ? uint.MaxValue : (uint)g.Max(b => b.Lower + b.Count), 0, (uint)g.Key.Space, g.Key.Class == "sampler" ? 1u : 5u })]);
-    }
-
-    public static readonly RootSig.Desc EmptyLocal = new(0x80, []);
-
-    /// <summary>ALLOW_STATE_OBJECT_ADDITIONS, depth 1, each library's own payload (0: the function's), attributes 8 (triangle barycentrics).</summary>
-    public static Rule GuessedRule(string global) => new(global, 4, 1, 0, 8, false);
+    /// <summary>Northlight's local root signature (version 1.1), as Control's renderer builds it: the hit geometry's index and
+    /// vertex buffer SRVs t0/t1 and 10 root constants b0, all in space 3. Its global one is <see cref="RootSig.NorthlightCompute"/>.</summary>
+    public static readonly RootSig.Desc NorthlightLocal = new(0x80, [[3, 0, 0, 3, 0], [3, 0, 1, 3, 0], [1, 0, 0, 3, 10]]);
 
     /// <summary>The global root signature of the libraries' engine: UE 4.26's (<see cref="Ue426Global"/>), or Avalanche's 4.27
     /// fork's when the libraries carry its bindless marker (unbounded SRVs t0 in spaces 4-9, <see cref="RootSig.MaxSrvsFor"/>;

@@ -3,17 +3,18 @@ using SCSKiller.Core.App;
 
 namespace SCSKiller.Core.Games;
 
-/// <summary>Games known to suffer shader-compilation stutter: known-stutter.json, embedded in Core (the default) and served
-/// at /v1/content/known-stutter.json (server\content\known-stutter.json) so it can change without a release. Matched by
-/// store id (Game.Id), else by name (letters and digits only, case-insensitive: "STAR WARS Jedi: Survivor™" = "Star Wars
-/// Jedi Survivor"). The server's copy replaces the embedded one when it passes <see cref="TryParse"/> (<see cref="ContentFile"/>).</summary>
+/// <summary>Games known to suffer shader-compilation stutter: known-stutter.json, embedded in Core (the default) and
+/// served at /v1/content/known-stutter.json (server-rs\content\known-stutter.json) so it can change without a release.
+/// Matched by store id (Game.Id), else by name (letters and digits only, case-insensitive: "STAR WARS Jedi: Survivor™"
+/// = "Star Wars Jedi Survivor"). The server's copy replaces the embedded one when it passes <see cref="TryParse"/>
+/// (<see cref="ContentFile"/>).</summary>
 public sealed class StutterList
 {
     public const string ContentPath = "v1/content/known-stutter.json";
     /// <summary>The source of an entry SCSKiller measured itself; any other source is an https URL.</summary>
     public const string OwnMeasurement = "SCSKiller measurement";
     public const int MaxBytes = ContentFile.MaxBytes, MaxGames = 200;
-    static readonly string[] Stores = ["steam", "xbox", "epic", "ea", "gog", "ubisoft", "battlenet"];
+    static readonly string[] Stores = ["steam", "xbox", "epic", "ea", "gog", "ubisoft", "battlenet", "purple"];
 
     sealed record Entry(string Name, string[] Ids, string Severity, string Reason, string Source, string Date);
     sealed record ListFile(Entry[] Games, string? About = null);

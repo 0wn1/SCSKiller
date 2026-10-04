@@ -49,7 +49,7 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
     /// <summary>Bump when the plan for the same game and inputs changes (new pipeline kinds, root-signature rules, D3D11):
     /// the app then rebuilds plans (warmed games' when idle, ScsKiller.CheckPlans) and offers a re-warm only where the new
     /// plan has records the warm didn't replay.</summary>
-    public const int Version = 26;
+    public const int Version = 27;
 
     /// <summary>The vendor's D3D11 driver cache persists across processes, is keyed on the exe file name and caches per
     /// shader, whatever the state or the other stages (measured on NVIDIA, proxy/probe11.cpp): a staged warm
@@ -163,7 +163,7 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
         var body = PlanFile.Read(plan.FilePath).Records.ToList();
         var templates = body.Where(r => r.Tag is 'G' or 'C' or 'S' && !inMain.Contains(r.Key)).ToList();
         var rt = body.Where(r => r.Tag == 'Y').Select(r => RtCollections.ParseItem(r.Payload)).ToList(); // ray tracing collections: need their library's exports
-        var hitGroups = body.Where(r => r.Tag == 'H').Select(r => RedEngine.RedRayTracing.ParseItem(r.Payload)).ToList(); // REDengine 3's: need both libraries' exports
+        var hitGroups = body.Where(r => r.Tag == 'H').Select(r => RedEngine.RedRayTracing.ParseItem(r.Payload)).ToList(); // REDengine 3's and FromSoftware's: need both libraries' exports
         var rtLibs = rt.Select(y => y.Library).Concat(hitGroups.SelectMany(h => new[] { h.ClosestHit, h.AnyHit }).OfType<string>()).ToHashSet();
         var rtBytes = new Dictionary<string, byte[]>();
         if (rtLibs.Count > 0) foreach (var r in Read(mainDb)) if (r.Tag == 'B' && rtLibs.Contains(Hex(r.Payload.AsSpan(0, 20)))) rtBytes[Hex(r.Payload.AsSpan(0, 20))] = r.Payload[20..];
@@ -203,7 +203,8 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
         var usedTemplates = keptItems.Where(r => r.Tag == 'P').Select(r => ParseItem(r.Payload).Template).ToHashSet();
         bool Keep(Rec r) => usedTemplates.Contains(r.Key) || Resolved(r);
         var main = Read(mainDb).ToList();
-        // 'L' (a community recording's): the record names a shader only a recording on this PC has; not for the proxy
+        // 'L' (a community recording's): the record names a shader only a recording on this PC has, not for the proxy. 'W' (a
+        // layer's pairing of two records that both replay) is: a warm through the layer creates what the layer made under it
         var flags = main.Where(r => r.Tag == 'L').ToList();
         var localOnly = flags.Select(HashOnly.Target).ToHashSet();
         long needsRecording = 0;
@@ -212,7 +213,7 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
         var keptKeys = new HashSet<string>();
         var keptMain = new List<Rec>();
         foreach (var r in main)
-            if (r.Tag == 'B') keptMain.Add(r);
+            if (r.Tag is 'B' or 'W') keptMain.Add(r);
             else if (r.Tag == 'L') continue;
             else if (Keep(r) && (!IsStateObject(r.Tag) || ParseStateObject(r).Depends.All(keptKeys.Contains))) { keptMain.Add(r); keptKeys.Add(r.Key); }
             else if (localOnly.Contains(r.Key)) needsRecording++;
@@ -222,7 +223,7 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
             foreach (var r in keptMain) Write(f, r.Tag, r.Payload);
         }
         var keptTemplates = templates.Where(Keep).ToList();
-        skipped += main.Count - flags.Count - keptMain.Count + templates.Count - keptTemplates.Count + items.Count - keptItems.Count;
+        skipped += main.Count - main.Count(r => r.Tag == 'L') - keptMain.Count + templates.Count - keptTemplates.Count + items.Count - keptItems.Count;
         foreach (var r in keptTemplates) Write(gen, r.Tag, r.Payload);
         foreach (var r in keptItems) Write(gen, r.Tag, r.Payload);
         var keptPsos = keptTemplates.Concat(keptItems).Select(r => r.Key).ToHashSet();
@@ -250,7 +251,8 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
         foreach (var h in hitGroups)
         {
             if (rtBytes.TryGetValue(h.ClosestHit, out var ch) && (h.AnyHit == null || rtBytes.ContainsKey(h.AnyHit))
-                && RedEngine.RedRayTracing.Collection(ch, h, h.AnyHit != null ? rtBytes[h.AnyHit] : []) is { } so)
+                && (engine.Family == FromSoft.FromSoftReader.Family ? FromSoft.SoulsRayTracing.Collection(ch, h, h.AnyHit != null ? rtBytes[h.AnyHit] : [])
+                    : RedEngine.RedRayTracing.Collection(ch, h, h.AnyHit != null ? rtBytes[h.AnyHit] : [])) is { } so)
             {
                 Write(gen, 'R', so);
                 if (h.Nv is { } nv) { var r = new NvState(new Rec('R', so).Key, nv.Slot, nv.Space, 2, nv.Options).ToRec(); Write(gen, r.Tag, r.Payload); }
@@ -377,7 +379,7 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
 }
 
 /// <summary>plan.bin: "SCSKPLAN", u32 version, u32 header length, header (the <see cref="Plan"/> as JSON), then a
-/// Brotli-compressed body of proxy db records: 'B' root signatures, 'G'/'C'/'S' templates, 'P' items, '1' D3D11 shaders, '2' D3D11 HS+DS pairs, 'Y' ray tracing collections (<see cref="RtCollections.Item"/>), 'H' REDengine 3 hit group collections (<see cref="RedEngine.RedRayTracing.Item"/>), 'N' NVAPI states, 'M' middleware pack entries (<see cref="MiddlewarePacks.Wrap"/>). Hash-only: shader
+/// Brotli-compressed body of proxy db records: 'B' root signatures, 'G'/'C'/'S' templates, 'P' items, '1' D3D11 shaders, '2' D3D11 HS+DS pairs, 'Y' ray tracing collections (<see cref="RtCollections.Item"/>), 'H' REDengine 3 and FromSoftware hit group collections (<see cref="RedEngine.RedRayTracing.Item"/>), 'N' NVAPI states, 'M' middleware pack entries (<see cref="MiddlewarePacks.Wrap"/>). Hash-only: shader
 /// bytes are pulled from the game at materialize time.</summary>
 public static class PlanFile
 {

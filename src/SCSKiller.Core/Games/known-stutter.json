@@ -100,10 +100,10 @@
     {
       "name": "ELDEN RING",
       "ids": ["steam:1245620"],
-      "severity": "severe",
-      "reason": "Documented mid-game shader-compilation stutter",
-      "source": "https://www.techpowerup.com/292781/elden-ring-pc-stuttering-issues-fixed-but-only-on-valves-steam-deck",
-      "date": "2026-09-26"
+      "severity": "moderate",
+      "reason": "Digital Foundry put its launch pauses down to shader compiles, but Valve found most big hitches on Steam Deck weren't. In one session after compiling, SCSKiller measured 37 in-play frames of 50 ms or more: 2 on a ray tracing pipeline compile, 35 with no compile under them",
+      "source": "https://www.digitalfoundry.net/articles/digitalfoundry-2022-yes-valve-really-did-fix-elden-ring-for-steam-deck",
+      "date": "2026-10-04"
     },
     {
       "name": "FINAL FANTASY VII REBIRTH",

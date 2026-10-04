@@ -79,6 +79,7 @@ public class WarmPassesTests : IDisposable
             PsoDb.Write(main, 'S', t1);
             PsoDb.Write(main, 'C', cs);
             PsoDb.Write(main, 'N', new byte[36]);
+            PsoDb.Write(main, 'W', new byte[40]);   // a layer's pairing: no item
             PsoDb.Write(main, 'S', t1b);
         }
         var tmplKey = new PsoDb.Rec('S', t1).Key;
