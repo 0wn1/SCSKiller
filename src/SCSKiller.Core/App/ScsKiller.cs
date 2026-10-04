@@ -461,7 +461,7 @@ public sealed partial class ScsKiller : IScsKiller
         ConfirmedEngines.Current = list;
         lock (_refreshLock)
             foreach (var s in Games)
-                if (s.StatusReason.Contains(Planner.Untested) && RootSig.Verified(s.Engine!)) Refresh(s.Game);
+                if (s.StatusReason.Contains(Planner.UntestedNote) && RootSig.Verified(s.Engine!)) Refresh(s.Game);
     }
 
     void UseStutterList(StutterList list)
@@ -527,6 +527,7 @@ public sealed partial class ScsKiller : IScsKiller
         var pending = PendingOf(g, rec);   // after the import and the scan's engine: derived from what they and any download left
         if (engine != null && check.Reason.Contains(Planner.Untested) && RootSig.Verified(engine))
             check = check with { Reason = check.Reason.Replace(Planner.Untested, Planner.NoRecording) };
+        else if (antiCheat != AntiCheat.None) check = check with { Reason = check.Reason.Replace(Planner.Untested, Planner.UntestedNote) };
         var manifest = LocalManifest();
         var entry = manifest != null ? DbEntry(manifest, g, rec) : null;
         bool? inDb = manifest != null ? entry != null : null;

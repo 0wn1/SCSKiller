@@ -16,8 +16,8 @@ All notable changes to the SCSKiller app and command line. The format follows
   HoYoPlay section of the Library. Every HoYoverse game ships a kernel anti-cheat, so these games are never recorded;
   more of their anti-cheat files are recognised when the same games come from Steam or Epic Games.
 - War Thunder installed with Gaijin's launcher shows up in the Library, and on NVIDIA SCSKiller compiles all of its
-  DirectX 11 shaders without a recording. DirectX 12 isn't covered: it would need a recording, which the game's
-  BattlEye anti-cheat blocks.
+  DirectX 11 shaders without a recording. On DirectX 12 it compiles the pipelines the game's shader definitions
+  name, with the root signatures the game builds from them, also without a recording.
 - Control (Remedy's Northlight engine, DirectX 12) compiles without a recording: SCSKiller reads the game's shader files
   and the pipelines they pair, with the root signatures the game builds. Ray tracing shaders are compiled too, without
   a guarantee that the game reuses them yet. On NVIDIA its DirectX 11 shaders are compiled as well, for playing on
@@ -74,8 +74,10 @@ All notable changes to the SCSKiller app and command line. The format follows
 - Unreal Engine 5.8 games (Fortnite, The Sinking City 2) no longer fail to compile with "Arithmetic operation resulted
   in an overflow". When SCSKiller can't read a game's exe (anti-cheat, Xbox app), it now recognizes 5.8 from the game's
   containers instead of taking it for 5.6. 5.8 shader libraries store shorter shader hashes, and SCSKiller reads either
-  layout whichever version it detected. A shader library that still can't be read fails with its file name. A 5.8
-  game isn't compiled with 5.5's root-signature rule any more: it needs a recording until a 5.8 rule is confirmed.
+  layout whichever version it detected. A shader library that still can't be read fails with its file name. Unreal
+  Engine 5.7, 5.8 and later compile without a recording, with the newest root-signature rule SCSKiller has (the one a
+  5.6 game's recording confirmed), marked "not tested on this engine version yet". Pipelines whose shaders bind
+  something that rule doesn't cover are left out, as for any untested engine.
 - Recording did nothing since 1.2.0: the recorder was installed but never armed, so games stayed on "Needs a recording"
   however long they were played. On a PC where SCSKiller had never armed a recorder before, arming failed every time;
   and an install or update that wrote the keys file disarmed the recorder it had just installed. A recorder is now armed

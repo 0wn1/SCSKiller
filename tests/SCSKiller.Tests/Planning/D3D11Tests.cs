@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Security.Cryptography;
 using SCSKiller.Core;
 using SCSKiller.Core.Carved;
@@ -28,6 +28,7 @@ public class D3D11Tests(ITestOutputHelper output)
         const string FromSource = Planner.Untested; // RootSig.RuleFor, RootSig.Verified
         Assert.Equal(new PlanCheck(Readiness.Ready, FromSource), C("D3D12", "4.25"));
         Assert.Equal(new PlanCheck(Readiness.Ready, "no recording needed"), C("D3D12")); // 4.26: confirmed by two forks' recordings
+        Assert.Equal(new PlanCheck(Readiness.Ready, FromSource), C("D3D12", "5.8")); // newer than any rule: the newest, not tested
         Assert.Equal(new PlanCheck(Readiness.Unsupported, "runs on Vulkan"), C("Vulkan"));
         Assert.Equal(new PlanCheck(Readiness.Ready, $"{FromSource}; also {All11} (the game may run on either)"), C(UnrealRhi.Ambiguous, "4.25"));
         Assert.Equal(new PlanCheck(Readiness.Ready, $"{All11} (the game may run on either); for DirectX 12, {Planner.Record}"),

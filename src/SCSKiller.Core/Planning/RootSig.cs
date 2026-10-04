@@ -29,9 +29,11 @@ public static unsafe class RootSig
         Ue50,   // 5.0: no hull/domain, mesh/amplification stages, AGS/diagnostic root UAVs, bindless heap flags
         Ue51,   // 5.1-5.3: a stage's table only when it uses that resource type
         Ue54,   // 5.4: MAX_SAMPLERS 32, root constants
-        Ue55,   // 5.5-5.7: vertex shaders get UAVs
+        Ue55,   // 5.5+: vertex shaders get UAVs (5.6 confirmed; 5.7 and later have no rule of their own)
         Red3,   // REDengine 3 (The Witcher 3, DX12): three fixed root signatures, see BuildRed3
         Northlight, // Northlight (Control, DX12): one graphics and one compute root signature, see BuildNorthlight
+        Dagor,  // Dagor Engine (DX12): built from each shader's header, constant buffers as root CBVs, see DagorRootSig
+        DagorCbvRanges,   // the same with constant buffers in descriptor tables (War Thunder)
     }
 
     /// <summary>The rule a game's engine (an Unreal version, REDengine 3) builds with; null = none known. A fork other than FF7's gets its base
@@ -40,6 +42,7 @@ public static unsafe class RootSig
     {
         if (e.Family == RedEngine.RedEngineReader.Family) return Rule.Red3;
         if (e.Family == Northlight.NorthlightReader.Family) return Rule.Northlight;
+        if (e.Family == Dagor.DagorReader.Family) return e.Fork == Dagor.DagorReader.CbvRangesFork ? Rule.DagorCbvRanges : Rule.Dagor;
         if (e.Family != "Unreal" || !System.Version.TryParse(e.Version, out var v)) return null;
         if (e.Fork == "GAME_FinalFantasy7Rebirth" && e.Version == "4.26") return Rule.Ff7;
         return (v.Major, v.Minor) switch
@@ -52,7 +55,7 @@ public static unsafe class RootSig
             (5, 0) => Rule.Ue50,
             (5, <= 3) => Rule.Ue51,
             (5, 4) => Rule.Ue54,
-            (5, <= 7) => Rule.Ue55,
+            (5, _) => Rule.Ue55, // a newer 5.x than any rule: the newest, unconfirmed (Planner.Untested)
             _ => null,
         };
     }
@@ -65,7 +68,7 @@ public static unsafe class RootSig
     public static readonly byte[] Ue426Samplers = UeSamplers(0, 1000);
 
     /// <summary>The static samplers a rule's root signatures carry (4.25: the same six at s1000-s1005 in space 0; before: none).</summary>
-    public static byte[] StaticSamplers(Rule r) => r switch { Rule.Ue420 or Rule.Ue421 or Rule.Ue422 or Rule.Red3 or Rule.Northlight => [], Rule.Ue425 => Ue425Samplers, _ => Ue426Samplers };
+    public static byte[] StaticSamplers(Rule r) => r switch { Rule.Ue420 or Rule.Ue421 or Rule.Ue422 or Rule.Red3 or Rule.Northlight or Rule.Dagor or Rule.DagorCbvRanges => [], Rule.Ue425 => Ue425Samplers, _ => Ue426Samplers };
 
     static readonly byte[] Ue425Samplers = UeSamplers(1000, 0);
 
@@ -90,17 +93,18 @@ public static unsafe class RootSig
     /// A single-range table's range is at OFFSET_APPEND unless the row carries an explicit offset as an 8th value; a multi-range
     /// table's ranges all start at offset 0 (they alias one heap region, see <see cref="BindlessTables"/>), or with
     /// <paramref name="AppendRanges"/> each at OFFSET_APPEND (one after the other). <paramref name="Version10"/>: serialized
-    /// as a version 1.0 root signature (range and root descriptor flags dropped). <see cref="Key"/> identifies it.</summary>
-    public sealed record Desc(uint Flags, List<uint[]> Rows, bool AppendRanges = false, bool Version10 = false)
+    /// as a version 1.0 root signature (range and root descriptor flags dropped); with <paramref name="RangeOffsets"/> each
+    /// range's fifth value is its offset from the table's start. <see cref="Key"/> identifies it.</summary>
+    public sealed record Desc(uint Flags, List<uint[]> Rows, bool AppendRanges = false, bool Version10 = false, bool RangeOffsets = false)
     {
-        public string Key => $"{Flags}|{string.Join(';', Rows.Select(r => string.Join(',', r)))}{(AppendRanges ? "|append" : "")}{(Version10 ? "|1.0" : "")}";
+        public string Key => $"{Flags}|{string.Join(';', Rows.Select(r => string.Join(',', r)))}{(AppendRanges ? "|append" : "")}{(Version10 ? "|1.0" : "")}{(RangeOffsets ? "|offsets" : "")}";
     }
 
     /// <param name="meshTier">the RHI runs at feature level SM6 (the game's PCD3D_SM6 shaders), where UE 5 sets
     /// GRHISupportsMeshShadersTier0 on mesh-shader GPUs and so denies the mesh/amplification stages it doesn't use</param>
     /// <param name="maxSrvs">the game's MAX_SRVS when it isn't the rule's (<see cref="MaxSrvsFor"/>); 0 = the rule's</param>
     public static Desc Build(Rule r, IReadOnlyDictionary<Stage, ShaderInfo> stages, bool meshTier, uint maxSrvs = 0) =>
-        r switch { Rule.Ff7 => BuildUe(stages), Rule.Red3 => BuildRed3(stages), Rule.Northlight => BuildNorthlight(stages), _ => BuildStock(r, stages, meshTier, maxSrvs) };
+        r switch { Rule.Ff7 => BuildUe(stages), Rule.Red3 => BuildRed3(stages), Rule.Northlight => BuildNorthlight(stages), Rule.Dagor => Dagor.DagorRootSig.Build(stages), Rule.DagorCbvRanges => Dagor.DagorRootSig.Build(stages, cbvRanges: true), _ => BuildStock(r, stages, meshTier, maxSrvs) };
 
     /// <summary>The stage sets the recording confirmed <see cref="BuildRed3"/> on: VS, VS+PS, VS+HS+DS, VS+HS+DS+PS,
     /// VS+GS+PS, VS+GS+HS+DS, CS.</summary>
@@ -372,10 +376,10 @@ public static unsafe class RootSig
                     for (var j = 0; j < count; j++, next += stride)
                     {
                         for (var k = 0; k < stride - 1; k++) next[k] = r[2 + 5 * j + k];
-                        next[stride - 1] = count == 1 ? r.Length == 8 ? r[7] : Append : d.AppendRanges ? Append : 0;
+                        next[stride - 1] = d.RangeOffsets ? r[2 + 5 * j + 4] : count == 1 ? r.Length == 8 ? r[7] : Append : d.AppendRanges ? Append : 0;
                     }
                 }
-                else for (var k = 0; k < 3; k++) ((uint*)(p + 8))[k] = r[2 + k];
+                else for (var k = 0; k < (d.Version10 && r[0] != 1 ? 2 : 3); k++) ((uint*)(p + 8))[k] = r[2 + k];
             }
             *(uint*)pd = d.Version10 ? 1u : 2u; // D3D_ROOT_SIGNATURE_VERSION_1_0 / 1_1
             *(uint*)(pd + 8) = (uint)n;

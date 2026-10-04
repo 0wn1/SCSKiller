@@ -60,7 +60,7 @@ public static class Format
             GameStatus.Ready when Has(ScsKiller.RtUnseenNote) => "No ray tracing seen while recording",
             GameStatus.Ready when Has(ScsKiller.RtInlineNote) => "Path tracing needs a recording",
             GameStatus.Ready when ScsKiller.IsPartial(s.Plan) => "Partly covered",
-            GameStatus.Ready when Has(Planning.Planner.Untested) => "Not tested on this engine version",
+            GameStatus.Ready when Has(Planning.Planner.UntestedNote) => "Not tested on this engine version",
             GameStatus.Ready when Has("for DirectX 12, ") => "DirectX 11; DirectX 12 needs a recording",
             GameStatus.Ready when Has("also compiles every DirectX 11 shader") => "DirectX 11 and 12",
             GameStatus.Ready when Starts("compiles every DirectX 11 shader") => "DirectX 11",

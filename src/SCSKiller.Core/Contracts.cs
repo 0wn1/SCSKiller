@@ -48,7 +48,8 @@ public sealed record ShaderInfo(string Sha1, Stage Stage, string ShaderModel, in
     IReadOnlyList<Binding> Bindings, IReadOnlyList<SigElement> Inputs, IReadOnlyList<SigElement> Outputs,
     int GsInputPrimitive = 0,   // geometry shaders: D3D_PRIMITIVE of the input (1 point, 2 line, 3 triangle, 6 line_adj, 7 tri_adj); 0 otherwise
     string? RootSignature = null,   // SHA-1 of the root-signature blob the game creates from the one the shader carries (RTS0), servable through ReadShaders; null = none
-    bool InlineRayTracing = false);  // traces rays inline (RayQuery: Dxbc.InlineRayTracing)
+    bool InlineRayTracing = false,   // traces rays inline (RayQuery: Dxbc.InlineRayTracing)
+    byte[]? EngineHeader = null);   // the engine's own header stored beside the shader, read by its root-signature rule (Dagor: dxil::ShaderHeader)
 
 /// <summary>A group of shaders that can combine. <see cref="IsPipeline"/>: the game shipped this exact stage set as one
 /// pipeline (e.g. a PSO cache record), so no pairing is needed.</summary>

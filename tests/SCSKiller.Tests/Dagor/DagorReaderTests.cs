@@ -14,22 +14,23 @@ namespace SCSKiller.Tests.Dagor;
 /// entry holding a VS and the GS it is drawn with, then a pixel and a compute entry, each a zstd frame of the dump's dictionary.</summary>
 public class DagorReaderTests
 {
-    static readonly byte[] Vs = Hlsl.Compile("float4 main(float3 p : POSITION) : SV_Position { return float4(p, 1); }", "main", "vs_5_0");
-    static readonly byte[] Gs = Hlsl.Compile("""
+    internal static readonly byte[] Vs = Hlsl.Compile("float4 main(float3 p : POSITION) : SV_Position { return float4(p, 1); }", "main", "vs_5_0");
+    internal static readonly byte[] Gs = Hlsl.Compile("""
         struct V { float4 p : SV_Position; };
         [maxvertexcount(3)] void main(triangle V i[3], inout TriangleStream<V> o) { for (int k = 0; k < 3; k++) o.Append(i[k]); }
         """, "main", "gs_5_0");
-    static readonly byte[] Ps = Hlsl.Compile("""
+    internal static readonly byte[] Ps = Hlsl.Compile("""
         Texture2D t : register(t0); SamplerState s : register(s0);
         float4 main(float4 p : SV_Position) : SV_Target { return t.Sample(s, p.xy); }
         """, "main", "ps_5_0");
-    static readonly byte[] Cs = Hlsl.Compile("RWBuffer<float> b : register(u0); [numthreads(8, 1, 1)] void main(uint i : SV_DispatchThreadID) { b[i] = i; }", "main", "cs_5_0");
+    internal static readonly byte[] Cs = Hlsl.Compile("RWBuffer<float> b : register(u0); [numthreads(8, 1, 1)] void main(uint i : SV_DispatchThreadID) { b[i] = i; }", "main", "cs_5_0");
 
     static string Sha(byte[] b) => Convert.ToHexStringLower(SHA1.HashData(b));
 
     /// <summary>The dump: header, the compressed body's size and list, the body (a ScriptedShadersBinDump with only the fields
-    /// the reader uses), each entry compressed with the body's dictionary.</summary>
-    internal static byte[] Dump(byte[][] entries, int vertexEntries, string version = "11.3")
+    /// the reader uses), each entry compressed with the body's dictionary. <paramref name="metadata"/>: each entry's (DX11's
+    /// 12 zero bytes by default); <paramref name="passes"/>: the (vprId, fshId) of one shader class's passes.</summary>
+    internal static byte[] Dump(byte[][] entries, int vertexEntries, string version = "11.3", byte[][]? metadata = null, (int Vpr, int Fsh)[]? passes = null)
     {
         var dict = Enumerable.Range(0, 4096).Select(i => (byte)(i * 7)).ToArray();   // a raw-content dictionary
         using var c = new Compressor();
@@ -48,7 +49,22 @@ public class DagorReaderTests
         var codes = Append(new byte[8 * entries.Length]);
         var at = frames.Select(Append).ToList();
         var dictAt = Append(dict);
+        metadata ??= entries.Select(_ => new byte[12]).ToArray();
+        var metas = Append(new byte[8 * entries.Length]);
+        var metaAt = metadata.Select(Append).ToList();
+        passes ??= [];
+        // one ShaderClass (108 bytes, its codes first), one ShaderCode (72, its passes at 20), Pass records (20, a ShRef pointer first)
+        var cls = Append(new byte[108]);
+        var code = Append(new byte[72]);
+        var pass = Append(new byte[20 * passes.Length]);
+        var refs = passes.Select(p => Append([.. BitConverter.GetBytes((ushort)p.Vpr), .. BitConverter.GetBytes((ushort)p.Fsh), .. new byte[20]])).ToList();
         var b = body.ToArray();
+        List(b, 140, cls, 1);
+        List(b, cls, code, 1);
+        List(b, code + 20, pass, passes.Length);
+        for (var i = 0; i < passes.Length; i++) BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(pass + 20 * i), refs[i] - (pass + 20 * i));
+        List(b, 180, metas, entries.Length);
+        for (var i = 0; i < metadata.Length; i++) List(b, metas + 8 * i, metaAt[i], metadata[i].Length);
         BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(16), vertexEntries);
         BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(20), entries.Length - vertexEntries);
         List(b, 172, sizes, entries.Length);
@@ -71,7 +87,7 @@ public class DagorReaderTests
         BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(field + 4), count);
     }
 
-    static Game Install(string name, byte[] dump, string? config, string file = "game.ps50.shdump.bin")
+    internal static Game Install(string name, byte[] dump, string? config, string file = "game.ps50.shdump.bin")
     {
         var dir = Ff7.TempDir(name);
         Directory.CreateDirectory(Path.Combine(dir, "compiledShaders"));
@@ -86,7 +102,7 @@ public class DagorReaderTests
         var game = Install("dagor-index", Dump([[.. Vs, .. Gs], Ps, Cs], 1), "video{\r\n  driver:t=\"dx11\"\r\n}\r\n");
         var reader = new DagorReader();
         var engine = reader.Detect(game)!;
-        Assert.Equal(new EngineInfo(DagorReader.Family, "11.3", null, "D3D11", false, null), engine);
+        Assert.Equal(new EngineInfo(DagorReader.Family, "11.3", DagorReader.CbvRangesFork, "D3D11", false, null), engine);
         var index = reader.Index(game, engine, null, CancellationToken.None);
         Assert.Equal([Stage.Vertex, Stage.Geometry, Stage.Pixel, Stage.Compute], index.Shaders.Values.Select(s => s.Stage));
         Assert.Equal([[Sha(Vs), Sha(Gs)], [Sha(Ps)], [Sha(Cs)]], index.Maps.Select(m => m.Shaders.ToList()));
@@ -135,9 +151,9 @@ public class DagorReaderTests
         Assert.Null(new DagorReader().Detect(Install("dagor-none", [1, 2, 3], null)));
 
         var dump = Dump([Ps, Cs], 0);
-        Assert.Throws<InvalidDataException>(() => DagorReader.Entries(dump[..^8], CancellationToken.None).ToList());
+        Assert.Throws<InvalidDataException>(() => DagorReader.Entries(DagorReader.Body(dump[..^8]), CancellationToken.None).ToList());
         BinaryPrimitives.WriteInt32LittleEndian(dump.AsSpan(72), int.MaxValue);   // a body list past the end
-        Assert.Throws<InvalidDataException>(() => DagorReader.Entries(dump, CancellationToken.None).ToList());
+        Assert.Throws<InvalidDataException>(() => DagorReader.Entries(DagorReader.Body(dump), CancellationToken.None).ToList());
     }
 
     [Fact]

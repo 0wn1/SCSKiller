@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using SCSKiller.Core;
 using SCSKiller.Core.Planning;
 using SCSKiller.Core.Unreal;
@@ -48,8 +48,8 @@ public class RootSigRulesTests
     [InlineData("4.26", "GAME_FinalFantasy7Rebirth", Rule.Ff7)] [InlineData("4.26", "GAME_StellarBlade", Rule.Ue426)]
     [InlineData("5.0", null, Rule.Ue50)] [InlineData("5.1", "GAME_Palworld", Rule.Ue51)] [InlineData("5.2", null, Rule.Ue51)]
     [InlineData("5.3", null, Rule.Ue51)] [InlineData("5.4", null, Rule.Ue54)] [InlineData("5.5", null, Rule.Ue55)]
-    [InlineData("5.6", null, Rule.Ue55)] [InlineData("5.7", null, Rule.Ue55)]
-    [InlineData("4.20", null, Rule.Ue420)] [InlineData("4.21", null, Rule.Ue421)] [InlineData("4.19", null, null)] [InlineData("5.8", null, null)] [InlineData("GAME_Something", null, null)]
+    [InlineData("5.6", null, Rule.Ue55)] [InlineData("5.7", null, Rule.Ue55)] [InlineData("5.8", null, Rule.Ue55)] [InlineData("5.12", null, Rule.Ue55)]
+    [InlineData("4.20", null, Rule.Ue420)] [InlineData("4.21", null, Rule.Ue421)] [InlineData("4.19", null, null)] [InlineData("6.0", null, null)] [InlineData("GAME_Something", null, null)]
     public void RuleForMapsVersions(string version, string? fork, Rule? expected)
     {
         Assert.Equal(expected, RuleFor(new EngineInfo("Unreal", version, fork, "D3D12", false, null)));

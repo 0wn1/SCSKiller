@@ -62,7 +62,7 @@ Everything vendor- or engine-specific sits behind one interface: a new GPU vendo
 | `src/SCSKiller.Core/ReEngine/` | `IEngineReader` for Capcom's RE Engine |
 | `src/SCSKiller.Core/RedEngine/` | `IEngineReader` for REDengine 3 (The Witcher 3, DX12) |
 | `src/SCSKiller.Core/Northlight/` | `IEngineReader` for Remedy's Northlight (Control, DX12) |
-| `src/SCSKiller.Core/Dagor/` | `IEngineReader` for Gaijin's Dagor Engine (War Thunder, DX11) |
+| `src/SCSKiller.Core/Dagor/` | `IEngineReader` for Gaijin's Dagor Engine (War Thunder) |
 | `src/SCSKiller.Core/Carved/` | `IEngineReader` for any game that ships raw DXBC/DXIL containers in its files |
 | `src/SCSKiller.Core/Planning/` | The planner, root-signature rules, the plan and recording formats, materialization |
 | `src/SCSKiller.Core/Vendors/` | NVIDIA and AMD backends and their per-application cache (`IAppCache`) |
@@ -299,15 +299,16 @@ open game files read-only and never launch or attach to the game.
   set in `pc_dx11` (SM 5.0, the same layout) is indexed apart, one map per file on its own platform: D3D11 items only,
   never a D3D12 pipeline. The game runs on either API and its files don't say which, so it is "D3D11 or D3D12"
   (Control: 1,435 DX11 shaders).
-- **Dagor** (`Dagor/`): War Thunder's DirectX 11 shader dump, `compiledShaders\game.ps50.shdump.bin`
-  (`game.compatibility.ps50` in the game's compatibility mode), dump version 11.3 only. The body is zstd, each shader a
-  zstd frame of the dump's own dictionary holding plain DXBC; a vertex entry also holds the HS, DS and GS it is drawn
-  with, and each entry is one shader map. `config.blk`'s `video/driver` gives the API (`auto`: "D3D11 or D3D12"). The
-  dump compatibility mode selects is the reader's `IndexStamp`: a warm is stale ("game shaders changed since the warm")
-  once it changes. The DirectX 12 dump isn't read: the engine builds root signatures from a resource header stored
-  beside each shader, a rule SCSKiller doesn't have, so DirectX 12 needs a recording, which BattlEye blocks. Gaijin's
-  launcher installs are found from `HKCU\Software\Gaijin\<project>`, the exe from `BattlEye\BELauncher.ini`
-  (`GaijinSource`).
+- **Dagor** (`Dagor/`): War Thunder's shader dumps, `compiledShaders\game.ps50.shdump.bin` (DirectX 11) and
+  `gameDX12.ps50.shdump.bin` (`game.compatibility*` in the game's compatibility mode), dump version 11.3 only. The body
+  is zstd, each entry a zstd frame of the dump's own dictionary; a vertex entry also holds the HS, DS and GS it is drawn
+  with. DirectX 11 entries are plain DXBC, one shader map each (`PCD3D_SM5`). A DirectX 12 entry's metadata holds a
+  `dxil::ShaderHeader` per stage (kept as `ShaderInfo.EngineHeader`) and where its DXIL is; every vertex/pixel and
+  compute pass of the shader classes is one exact pipeline (`PCD3D_SM6`). A pass drawn with the engine's null pixel
+  shader is left out (which shader that is isn't in the dump). `config.blk`'s `video/driver` gives the API (`auto`:
+  "D3D11 or D3D12"). The dumps compatibility mode selects are the reader's `IndexStamp`: a warm is stale ("game shaders
+  changed since the warm") once they change. Gaijin's launcher installs are found from `HKCU\Software\Gaijin\<project>`,
+  the exe from `BattlEye\BELauncher.ini` (`GaijinSource`).
 - **Carved** (`Carved/`): any other game that ships raw DXBC/DXIL containers. Files are carved, each container
   validated and reflected; a file of pipeline records becomes one shader map per record.
 
@@ -336,6 +337,17 @@ it confirms get one (`RootSig.Red3Validated`); any other is left out.
 Northlight builds its root signatures in code (version 1.0, read from Control's renderer DLL), one for graphics and one
 for compute (`RootSig.Rule.Northlight`). Both end in a bounded table of 244,000 SRVs in space 1 that the shaders declare
 unbounded; the runtime accepts an unbounded shader range in a bounded one that holds its first register.
+
+Dagor builds each pipeline's root signature from its stages' `dxil::ShaderHeader`s (`RootSig.Rule.Dagor`,
+`DagorRootSig`, ported from DagorEngine's `decode_graphics_root_signature` / `decode_compute_root_signature`): version
+1.0, no static samplers; the draw-id constant, root constants, constant buffers, sampler tables, one bindless sampler
+table, SRV tables, one bindless SRV table, UAV tables, the vendor-extension UAV; stages PS, VS, HS, DS, GS, the
+non-pixel ones sharing descriptor offsets. Constant buffers are root CBVs, or with the engine's
+`dx12/rootSignaturesUsesCBVDescriptorRanges` one table per stage (`Rule.DagorCbvRanges`, EngineInfo.Fork `cbv-ranges`).
+That setting is read from flag 1 of `cache\dx12.cache`'s header, which the game writes after a DirectX 12 session;
+without the file it's taken as on, as War Thunder's cache shows. The cache holds no root signature (its PSOs are in the
+driver's pipeline library), so the rule isn't confirmed against the game's own. Each header's register masks equal its
+DXIL's own bindings for every War Thunder shader.
 
 `RootSig.Verified` holds for the versions and forks a real game has confirmed (`ConfirmedEngines`:
 `confirmed-engines.json`, embedded, plus the entries of the copy the server serves as a content file); any other gets

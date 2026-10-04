@@ -8187,6 +8187,16 @@ public partial class AppTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task An_anti_cheat_games_not_tested_note_doesnt_suggest_recording()
+    {
+        File.WriteAllBytes(Path.Combine(_exeDir, "BEService_x64.exe"), [0]);
+        var k = Killer(new FakeReader(Unreal with { Version = "5.4", Fork = "GAME_OnlyThisTest" }), new Planner());
+        var s = (await k.ScanAsync(default)).Single();
+        Assert.Equal((GameStatus.Ready, Planner.UntestedNote), (s.Status, s.StatusReason));
+        Assert.Equal("Not tested on this engine version", Format.ShortNote(s));
+    }
+
     /// <summary>A scan keeps the planner's check; an engine the server's list confirms afterwards loses its note without a rescan.</summary>
     [Fact]
     public async Task The_server_confirmed_engines_list_drops_the_not_tested_note_after_a_scan()

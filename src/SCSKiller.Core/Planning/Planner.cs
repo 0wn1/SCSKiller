@@ -68,7 +68,9 @@ public sealed class Planner(string? packDir = null, string? sharedPackDir = null
     public const string NoRecording = "no recording needed";
     /// <summary>The plan comes from a rule no game has confirmed yet (<see cref="RootSig.Verified"/>). A scan keeps its
     /// check, so ScsKiller.Evaluate turns it into <see cref="NoRecording"/> once the list confirms the engine.</summary>
-    public const string Untested = "not tested on this engine version yet: playing with recording on improves it";
+    public const string Untested = UntestedNote + ": playing with recording on improves it";
+    /// <summary><see cref="Untested"/> without the recording hint: what an anti-cheat game, which can't be recorded, is told.</summary>
+    public const string UntestedNote = "not tested on this engine version yet";
     public const string Record = "turn on recording and play for about 5 minutes";
 
     public PlanCheck Check(Game game, EngineInfo engine, Recording? recording, VendorCaps caps)
