@@ -478,6 +478,55 @@ public class DiscoveryAndVendorTests(ITestOutputHelper output)
             XboxSource.PackageFamilyName("FocusHomeInteractiveSA.APlagueTaleFelons", "CN=244B08DA-6A27-4DCD-99EF-F6DCBE2A0C28"));
     }
 
+    static byte[] GamingRoot(uint count, params string[] paths) =>
+        [.. "RGBX"u8, .. BitConverter.GetBytes(count), .. paths.SelectMany(p => System.Text.Encoding.Unicode.GetBytes(p + "\0"))];
+
+    [Fact]
+    public void Xbox_gaming_root_lists_the_install_folders_and_rejects_anything_else()
+    {
+        Assert.Equal(["XboxGames"], XboxSource.ParseGamingRoot(GamingRoot(1, "XboxGames")));
+        Assert.Equal(28, GamingRoot(1, "XboxGames").Length);   // the size the Xbox app writes
+        Assert.Equal(["XboxGames", @"Games\XboxGames"], XboxSource.ParseGamingRoot(GamingRoot(2, "XboxGames", @"Games\XboxGames")));
+        Assert.Equal([@"Games\XboxGames"], XboxSource.ParseGamingRoot(GamingRoot(1, @"Games\XboxGames")));
+
+        Assert.Null(XboxSource.ParseGamingRoot([.. "RGBY"u8, .. GamingRoot(1, "XboxGames")[4..]]));
+        Assert.Null(XboxSource.ParseGamingRoot(GamingRoot(1, "XboxGames")[..20]));   // no terminator
+        Assert.Null(XboxSource.ParseGamingRoot(GamingRoot(1, "XboxGames")[..6]));
+        Assert.Null(XboxSource.ParseGamingRoot(GamingRoot(2, "XboxGames")));         // fewer paths than the count
+        Assert.Null(XboxSource.ParseGamingRoot(GamingRoot(uint.MaxValue, "XboxGames")));
+        Assert.Null(XboxSource.ParseGamingRoot(GamingRoot(0)));
+        Assert.Null(XboxSource.ParseGamingRoot(GamingRoot(1, "")));
+    }
+
+    [Fact]
+    public void Xbox_finds_games_in_the_folders_the_gaming_root_lists()
+    {
+        var root = Directory.CreateTempSubdirectory("scskiller-xbox-test-").FullName;
+        try
+        {
+            void Title(string library, string name)
+            {
+                var content = Directory.CreateDirectory(Path.Combine(root, library, name, "Content")).FullName;
+                File.WriteAllText(Path.Combine(content, "MicrosoftGame.config"),
+                    $"""<Game><Identity Name="Pub.{name}" Version="1.0.0.0"/><ExecutableList><Executable Name="{name}.exe"/></ExecutableList></Game>""");
+            }
+            Title(@"Games\XboxGames", "Custom");
+            Title("XboxGames", "Default");
+
+            // the custom folder listed twice is scanned once, and XboxGames still is
+            File.WriteAllBytes(Path.Combine(root, ".GamingRoot"), GamingRoot(2, @"Games\XboxGames", @"\Games\XboxGames"));
+            Assert.Equal(["xbox:Pub.Custom", "xbox:Pub.Default"], new XboxSource([root]).Discover().Select(g => g.Id));
+            File.WriteAllBytes(Path.Combine(root, ".GamingRoot"), GamingRoot(1, "XboxGames"));
+            Assert.Equal(["xbox:Pub.Default"], new XboxSource([root]).Discover().Select(g => g.Id));
+
+            File.WriteAllBytes(Path.Combine(root, ".GamingRoot"), [.. "RGBX"u8, 0xFF, 0xFF]);
+            Assert.Equal(["xbox:Pub.Default"], new XboxSource([root]).Discover().Select(g => g.Id));
+            File.Delete(Path.Combine(root, ".GamingRoot"));
+            Assert.Equal(["xbox:Pub.Default"], new XboxSource([root]).Discover().Select(g => g.Id));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
     [Trait("Needs", "Game")]
     [Fact]
     public void Gog_finds_cyberpunk_with_the_real_exe_not_the_prelauncher()

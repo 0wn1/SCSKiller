@@ -80,6 +80,7 @@ All notable changes to the SCSKiller app and command line. The format follows
   (r.RayTracing.AllowPipeline=0, as SILENT HILL: Townfall does) never uses its ray tracing libraries, and the game page
   says so. Otherwise the page notes that ray tracing using separate pipelines (such as path tracing) is compiled only
   from a recording, and still counts those libraries as not compiled.
+- Xbox app games installed in a folder other than `<drive>:\XboxGames`, such as D:\Games\XboxGames, weren't found.
 
 ## [1.1.2] - 2026-10-03
 

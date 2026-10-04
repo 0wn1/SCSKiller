@@ -3,23 +3,25 @@ using System.Xml.Linq;
 
 namespace SCSKiller.Core.Games;
 
-/// <summary>Installed Xbox app / Game Pass PC games: &lt;drive&gt;:\XboxGames\&lt;title&gt;\Content, each with its
+/// <summary>Installed Xbox app / Game Pass PC games: &lt;library&gt;\&lt;title&gt;\Content, each with its
 /// own MicrosoftGame.config (the GDK package manifest) naming the game's real executable(s) and version. No
 /// package-manager query is needed to enumerate installs: the manifest sits right there in Content, readable like
 /// any other file since the 2022 Xbox app. It's only used, via the native PackageFamilyNameFromId (below), to turn
 /// the manifest's Identity name+publisher into the same PackageFamilyName Get-AppxPackage would show, for the id.</summary>
-public sealed class XboxSource : IGameSource
+public sealed class XboxSource(IEnumerable<string>? driveRoots = null) : IGameSource
 {
     public Store Store => Store.Xbox;
 
     public IReadOnlyList<Game> Discover()
     {
         var games = new List<Game>();
-        foreach (var drive in DriveInfo.GetDrives().Where(d => d.DriveType is DriveType.Fixed or DriveType.Removable))
+        var roots = driveRoots ?? DriveInfo.GetDrives().Where(d => d.DriveType is DriveType.Fixed or DriveType.Removable).Select(d => d.RootDirectory.FullName);
+        foreach (var root in roots.SelectMany(LibraryFolders).Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            var root = Path.Combine(drive.RootDirectory.FullName, "XboxGames");
-            if (!Directory.Exists(root)) continue;
-            foreach (var titleDir in Directory.EnumerateDirectories(root))
+            IEnumerable<string> titleDirs;
+            try { titleDirs = Directory.Exists(root) ? Directory.GetDirectories(root) : []; }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { continue; }
+            foreach (var titleDir in titleDirs)
             {
                 var content = Path.Combine(titleDir, "Content");
                 var configPath = Path.Combine(content, "MicrosoftGame.config");
@@ -32,6 +34,42 @@ public sealed class XboxSource : IGameSource
             }
         }
         return games;
+    }
+
+    /// <summary>The folders the Xbox app installs to on this drive, from its .GamingRoot, and &lt;drive&gt;:\XboxGames.</summary>
+    static IEnumerable<string> LibraryFolders(string driveRoot)
+    {
+        List<string>? listed = null;
+        try
+        {
+            var file = new FileInfo(Path.Combine(driveRoot, ".GamingRoot"));
+            if (file.Exists && file.Length <= MaxGamingRoot) listed = ParseGamingRoot(File.ReadAllBytes(file.FullName));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        // GetFullPath with a base resolves a relative entry, a "\"-rooted one and an absolute one alike. XboxGames always:
+        // games installed before the install folder was changed stay there.
+        return [.. (listed ?? []).Select(p => Path.GetFullPath(p, driveRoot)), Path.Combine(driveRoot, "XboxGames")];
+    }
+
+    const int MaxGamingRoot = 64 * 1024;
+
+    /// <summary>.GamingRoot: "RGBX", a uint32 count, then that many null-terminated UTF-16LE paths, relative to the drive
+    /// root. Null when the bytes aren't that.</summary>
+    internal static List<string>? ParseGamingRoot(ReadOnlySpan<byte> bytes)
+    {
+        if (bytes.Length < 8 || bytes.Length > MaxGamingRoot || !bytes[..4].SequenceEqual("RGBX"u8)) return null;
+        var count = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes[4..]);
+        if (count is 0 or > 64) return null;
+        var chars = MemoryMarshal.Cast<byte, char>(bytes[8..][..((bytes.Length - 8) & ~1)]);
+        var paths = new List<string>();
+        while (paths.Count < count)
+        {
+            var end = chars.IndexOf('\0');
+            if (end <= 0) return null;
+            paths.Add(new string(chars[..end]));
+            chars = chars[(end + 1)..];
+        }
+        return paths;
     }
 
     static Game? ParseGame(string content, string configPath)
