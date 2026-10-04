@@ -247,6 +247,7 @@ public sealed record GameState(
     bool RecorderEffective = false,   // should be installed (it may not be yet: RecorderNote)
     string? RecorderSkip = null,      // ScsKiller.Skip*; null = compatible
     string? RecorderNote = null,      // the last reconcile's pending or failed change; null = none
+    string? RecorderRefused = null,   // why the recorder passed the game's last launch through (ScsKiller.Refused); null = it recorded, or no launch since
     string? RecorderMod = null,       // what a foreign d3d12.dll in the game folder (or the one chained to it) calls itself; null = none
     bool RecordAlongsideMod = false,  // the user chose to record alongside it (IScsKiller.SetRecordAlongsideMod)
     long? LastWarmNeedsRecording = null,   // of LastWarmSkipped, those the community recording flags as built at run time or by a mod

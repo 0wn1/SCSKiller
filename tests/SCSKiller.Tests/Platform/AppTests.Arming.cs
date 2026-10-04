@@ -119,7 +119,7 @@ public partial class AppTests
         await k.CheckRecorderGames(false);
         Assert.False(ArmedWithLedger(_game));
         var log = Path.Combine(k.Store.DataDir, "recorders.log");
-        Assert.Single(File.ReadAllLines(log), l => l.Contains("couldn't arm the recorder"));
+        Assert.Single(SharedLog(log).Split(Environment.NewLine), l => l.Contains("couldn't arm the recorder"));
 
         File.Delete(ScsKiller.LedgerDir);
         await k.CheckRecorderGames(false);
@@ -159,5 +159,86 @@ public partial class AppTests
         Assert.False(File.Exists(Path.Combine(_exeDir, "d3d12.dll")));
         Assert.False(File.Exists(Path.Combine(_exeDir, ScsKiller.ArmedFile)));
         Assert.False(File.Exists(ScsKiller.LedgerFile(_game.ExePath)));
+    }
+
+    /// <summary>Started on a PC without the ledger folder, the session runs and its cleanup leaves the folder as it was. A
+    /// ledger folder that can't be made stops the start with nothing left behind. The built proxy reads the real ledger,
+    /// so the process here is a pass-through.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task An_offline_session_starts_without_a_ledger_folder(bool cantBeMade)
+    {
+        using var ledger = new FreshLedger(_root);
+        if (cantBeMade)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(ScsKiller.LedgerDir)!);
+            File.WriteAllText(ScsKiller.LedgerDir, "");
+        }
+        EasyAntiCheatBeside();
+        if (OfflineKiller() is not { } k) return;
+        await Listed(async () =>
+        {
+            await k.ScanAsync(default);
+            k.SetOfflineRecording(_game.Id, true);
+            var before = Names(_exeDir);
+            k.ProcessNames = () => k.Games.Single().OfflineRunning ? new HashSet<string> { "steam", "Fake-Win64-Shipping" } : new HashSet<string> { "steam" };
+            if (cantBeMade)
+                Assert.Contains("didn't start", Assert.Throws<InvalidOperationException>(() => { _ = k.StartOfflineSession(_game.Id, confirmed: true); }).Message);
+            else
+            {
+                await k.StartOfflineSession(_game.Id, confirmed: true).WaitAsync(TimeSpan.FromSeconds(120));
+                Assert.True(Directory.Exists(ScsKiller.LedgerDir));
+            }
+            Assert.Equal(before, Names(_exeDir));
+            Assert.False(File.Exists(ScsKiller.LedgerFile(_game.ExePath)));
+            Assert.Null(k.Store.LoadGame(_game.Id).OfflineSession);
+        });
+    }
+
+    [Fact]
+    public async Task A_disarm_without_a_ledger_folder_revokes_and_the_next_pass_arms()
+    {
+        using var _ = new FreshLedger(_root);
+        var k = Managed();
+        await k.ScanAsync(default);
+        await AssertStaysArmed(k, _game);
+        Directory.Delete(ScsKiller.LedgerDir, true);
+        File.WriteAllBytes(Path.Combine(_exeDir, "patch.bin"), [0]);   // a change: the watcher's event disarms
+        await Until(() => !File.Exists(Path.Combine(_exeDir, ScsKiller.ArmedFile)));
+        await Until(() => !k.DisarmQueued(_game));
+        Assert.False(k.RevocationPending(_game.Id));
+        await k.CheckRecorderGames(true);
+        Assert.True(ArmedWithLedger(_game));
+    }
+
+    [Fact]
+    public async Task Uninstall_without_a_ledger_folder_removes_the_recorder()
+    {
+        using var _ = new FreshLedger(_root);
+        var k = Managed();
+        await k.ScanAsync(default);
+        Directory.Delete(ScsKiller.LedgerDir, true);
+        ScsKiller.RemoveAllRecorders(k.Store, new HashSet<string>());   // SCSKiller's own uninstall
+        Assert.False(File.Exists(Path.Combine(_exeDir, "d3d12.dll")));
+        Assert.False(File.Exists(Path.Combine(_exeDir, ScsKiller.ArmedFile)));
+    }
+
+    [Fact]
+    public void The_offline_cleanup_helper_finishes_without_a_ledger_folder()
+    {
+        using var _ = new FreshLedger(_root);
+        var store = Journal(["d3d12.dll", "scskiller.ini", ScsKiller.ArmedFile]);
+        Assert.Equal(0, ScsKiller.RunOfflineCleanup(store, _game.Id, TimeSpan.Zero, othersRun: OurOthersRun));
+        Assert.Null(store.LoadGame(_game.Id).OfflineSession);
+        Assert.Equal(["Fake-Win64-Shipping.exe"], Names(_exeDir));
+    }
+
+    [Fact]
+    public void An_attestation_is_written_without_a_ledger_folder()
+    {
+        using var _ = new FreshLedger(_root);
+        ScsKiller.WriteAttestation(_game.ExePath);
+        Assert.True(ArmedWithLedger(_game));
     }
 }

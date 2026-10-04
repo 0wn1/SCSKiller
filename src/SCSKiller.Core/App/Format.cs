@@ -66,7 +66,7 @@ public static class Format
             GameStatus.Ready when Starts("compiles every DirectX 11 shader") => "DirectX 11",
             GameStatus.Ready => null,
             _ when s.ShaderModBlocks => $"{s.ShaderMod} changes all its pipelines",
-            _ when s.AntiCheat != AntiCheat.None && Starts("needs a recording, which") => $"Blocked by {AntiCheatName(s.AntiCheat)}",
+            _ when s.AntiCheat != AntiCheat.None && Starts("needs a recording, which") => $"Blocked by {AntiCheatName(s.AntiCheat)}" + (s.InCommunityDb == true ? " · in the community database" : ""),
             _ when Has(ScsKiller.ManualNoRecording) => "Needs a recording: confirm its folder",
             _ when s.Engine?.Encrypted == true => null,   // the title: "Encrypted game files"
             _ when s.Engine?.Unsupported is { } u => u.StartsWith("no D3D shaders", StringComparison.Ordinal) ? "No DirectX shaders" : "Engine not supported yet",

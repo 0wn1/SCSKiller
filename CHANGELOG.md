@@ -5,6 +5,37 @@ All notable changes to the SCSKiller app and command line. The format follows
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-10-04
+
+### Fixed
+
+- An offline session without EasyAntiCheat (ELDEN RING) didn't start on a PC where SCSKiller had never armed a recorder:
+  it stopped with "Could not find a part of the path" for a file in %LOCALAPPDATA%\SCSKiller\armed. It starts now, and every other
+  step that reads or clears the recorder's ledger works when its folder isn't there yet.
+- A game you added by hand and recorded, which a store or launcher now lists (such as Zenless Zone Zero, found through
+  HoYoPlay), compiles from that recording again. The recording moves to the store's entry of the game, which before
+  started without it, so an anti-cheat game showed as not supported. An anti-cheat game is compiled whenever its game
+  files, a recording made on this PC or a community recording give a plan; only the recorder stays out of it.
+- An anti-cheat game with no recording that the community database has says so, and where to get it.
+- When a store entry takes over a game you added by hand, the recorder installed for it comes out of its own folder, every
+  file SCSKiller installed and recorded there included, for each copy you added; what it recorded joins the store entry.
+- A different build of the same version (a pre-release and the release) checks every game again instead of reusing the
+  last build's results.
+- A game compiled before 1.2.1 with a RenoDX HDR mod showed "an HDR mod was installed since the compile" after the update,
+  although the mod had been there all along. It now says the last compile didn't run through the game's HDR mod; compiling
+  again runs through it, as 1.2.1 does for every such game.
+- The recorder stays armed when a mod beside the game writes a log, an ini, a screenshot or a save as the game starts
+  (OptiScaler's log, a DLSS frame generation enabler's log), so those launches are recorded. Before, any new file
+  anywhere in the game folder disarmed it until the next check, and the launch was silently not recorded. Any other new
+  file (a program file under any name included), anything named like anti-cheat, or a changed game exe still disarms
+  it, and each disarm is logged with the file.
+- A launch the recorder doesn't record now says why on the game's page ("The last launch wasn't recorded: ...").
+- A mod's d3d12.dll that can't be renamed for "Record alongside" (OptiScaler, Special K) is named on the game's page.
+  For OptiScaler, which stops working renamed, the page says to rename it to dxgi.dll (or winmm.dll or version.dll),
+  names OptiScaler supports and the recorder records beside.
+- A recorder moved next to the exe a game really runs (Stellar Blade's PatchData copy) is armed as soon as it moves, so
+  the next launch is recorded instead of only one after the next check.
+
 ## [1.2.1] - 2026-10-04
 
 ### Added

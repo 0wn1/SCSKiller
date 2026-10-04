@@ -188,7 +188,7 @@ public sealed partial class ScsKiller
                 if (addAppId) Place(SteamAppIdFile, temp => WriteNew(temp, entry!.AppId));
                 if (GameFiles.DetectAntiCheat(g, quick: true, ignore: AntiCheat.EasyAntiCheat) is not AntiCheat.None and var other)
                     throw new InvalidOperationException($"{other} appeared in its folder");
-                File.Delete(LedgerFile(g.ExePath) + ".revoked");   // an earlier revocation's mark: the proxy would refuse on it
+                DeleteRevocationMark(g.ExePath);   // an earlier revocation's mark: the proxy would refuse on it
                 process = StartAttested(g.ExePath, OfflineArguments, (h, pid, started) =>
                 {
                     _offline[gameId] = h;

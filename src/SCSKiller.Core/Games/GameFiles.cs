@@ -267,7 +267,7 @@ public static class GameFiles
     /// <summary>The time one detection takes at most (the slowest install measured: about 0.3 s cold).</summary>
     public static readonly TimeSpan Budget = TimeSpan.FromSeconds(30);
 
-    static AntiCheat Marker(string name)
+    internal static AntiCheat Marker(string name)
     {
         foreach (var (marker, kind) in Markers)
             if (marker[0] == '*' ? name.EndsWith(marker[1..], StringComparison.OrdinalIgnoreCase) : name.Equals(marker, StringComparison.OrdinalIgnoreCase)) return kind;

@@ -579,12 +579,13 @@ public sealed class DetailVm(string id) : Bindable
             : s.LastWarmTime == null ? "not compiled yet" : "its shader cache is empty: compile it again")
             + (Row.Note != null ? ". " + Sentence(s.StatusReason) : ""),
         GameStatus.NeedsRecording => HasDbTeaser ? Row.FullNote.Replace("; " + ScsKiller.InDbNote, "") : Row.FullNote,   // the teaser says it
-        _ => s.StatusReason,
+        _ => HasDbTeaser ? s.StatusReason.Replace("; " + ScsKiller.InDbNote, "") : s.StatusReason,
     } + (s.Status == GameStatus.NeedsRecording ? "" : GameRow.ModNote(s)));   // FullNote has it
 
     // The manifest is public: a PC without "db" sees that the community database covers the game, and where to get it.
     // Shown, it is the page's only mention of the database.
-    public bool HasDbTeaser => s is { Status: GameStatus.NeedsRecording, InCommunityDb: true, Community: null } && !App.Account.HasDb;
+    public bool HasDbTeaser => s is { InCommunityDb: true, Community: null } && !App.Account.HasDb
+        && (s.Status == GameStatus.NeedsRecording || s.Status == GameStatus.Unsupported && !NoAntiCheat && s.StatusReason.StartsWith("needs a recording, which", StringComparison.Ordinal));
     public string DbTeaser => $"In the community database: {s.CommunityDbPsos:N0} pipeline{(s.CommunityDbPsos == 1 ? "" : "s")} recorded by other players. Patreon supporters compile them without recording.";
     public string DbTeaserLink => App.Account.SignedIn ? "Patreon membership" : "Sign in with Patreon";
     public bool CanCompile => s.Status is GameStatus.Ready or GameStatus.Warmed or GameStatus.Stale || RtPartial;
@@ -933,9 +934,11 @@ public sealed class DetailVm(string id) : Bindable
         : !NoAntiCheat
         ? $"Not available: {Fmt.AntiCheatName(s.AntiCheat)} treats an extra d3d12.dll as tampering, so this game is compiled from its files only."
         : s.RecorderSkip == ScsKiller.SkipManual ? "Not available until you confirm the game's folder (Game folder… above): SCSKiller checks all of it for anti-cheat before it records."
+        : s.RecorderSkip == ScsKiller.SkipModNotChainable ? $"Not available: {ScsKiller.NotChainableReason(s.RecorderMod)}."
         : s.RecorderSkip is { } skip ? $"Not available: {skip}."
         : "Adds a small d3d12.dll next to the game to catch anything the plan missed and time each frame, so this page shows what stuttered. Remove any time."
-          + (s.RecorderNote is { } note ? $" ({Sentence(note)})" : "");
+          + (s.RecorderNote is { } note ? $" ({Sentence(note)})" : "")
+          + (s.RecorderRefused is { } why ? $" The last launch wasn't recorded: {why}." : "");
 
     // A mod's d3d12.dll where the recorder goes (ReShade, a wrapper): off = the game isn't recorded; on = the recorder chains to it
     public bool HasMod => s.RecorderMod != null && s.RecorderSkip is not (ScsKiller.SkipAntiCheat or ScsKiller.SkipShaderMod or ScsKiller.SkipManual or ScsKiller.SkipUnsupported or ScsKiller.SkipNotDx12);

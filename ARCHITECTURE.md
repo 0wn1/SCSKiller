@@ -30,8 +30,12 @@ session), plans which pipelines to create, and replays them in a separate proces
    or one whose subfolders look like several games is refused (`ManualSource.RootProblem`). With its folder confirmed
    the game follows the recorder rules of any game: the anti-cheat check covers that whole folder and the exe's
    folder, plus the names directly in each folder above it up to a drive or a folder of many (a confirmed `win64`
-   still sees the `BattlEye` folder beside it), and the recorder is armed only for the folder that was checked (a new folder disarms it until the next
-   clean check). An entry from before the folder could be confirmed isn't recorded until it is. It yields to a store's
+   still sees the `BattlEye` folder beside it), and the recorder is armed only for the folder that was checked. A new or renamed file disarms it
+   until the next clean check unless it is of a data type (`ScsKiller.DataTypes`: a log, an ini, a screenshot, a save)
+   and doesn't start with "MZ"; so do anything named like an anti-cheat marker, a folder moved in with contents and a
+   changed exe. A launch the proxy passes through leaves
+   its reason beside the exe's ledger entry (`<entry>.refused`), which the game's page shows. An entry from before the
+   folder could be confirmed isn't recorded until it is. It yields to a store's
    game whose install holds its exe, has no build id (the exe's size and write time mark a patch), starts its exe
    directly, uploads nothing and fills no middleware pack (the upload key is a public store build alias, which a game
    added on one PC doesn't have). Removing it takes its recorder out and forgets the entry.

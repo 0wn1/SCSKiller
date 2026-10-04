@@ -418,4 +418,52 @@ public partial class AppTests
     public void The_offline_cleanup_logon_entry_outlives_its_run() =>
         Assert.Equal(("!SCSKiller offline cleanup steam:1", "\"C:\\A B\\SCSKiller.exe\" --offline-cleanup \"steam:1\""),
             ScsKiller.RunOnceEntry("steam:1", @"C:\A B\SCSKiller.exe"));
+
+    /// <summary>A mod loader beside the exe under a name the session doesn't use (dinput8.dll, as ModEngine2 or Seamless
+    /// Co-op ship it), with its own folder: the session runs, and its cleanup leaves the loader and its files as they were.</summary>
+    [Fact]
+    public async Task An_offline_session_runs_beside_a_dinput8_mod_loader_and_leaves_it()
+    {
+        EasyAntiCheatBeside();
+        var loader = Planning.MiddlewarePackTests.Pe("dinput8.dll", Guid.NewGuid().ToByteArray());
+        File.WriteAllBytes(Path.Combine(_exeDir, "dinput8.dll"), loader);
+        File.WriteAllText(Path.Combine(Directory.CreateDirectory(Path.Combine(_exeDir, "SeamlessCoop")).FullName, "ersc_settings.ini"), "[GAMEPLAY]");
+        if (OfflineKiller() is not { } k) return;
+        await Listed(async () =>
+        {
+            await k.ScanAsync(default);
+            k.SetOfflineRecording(_game.Id, true);
+            var before = Names(_exeDir);
+            k.ProcessNames = () => k.Games.Single().OfflineRunning ? new HashSet<string> { "steam", "Fake-Win64-Shipping" } : new HashSet<string> { "steam" };
+            await k.StartOfflineSession(_game.Id, confirmed: true).WaitAsync(TimeSpan.FromSeconds(120));
+            Assert.Equal(before, Names(_exeDir));
+            Assert.Equal(loader, File.ReadAllBytes(Path.Combine(_exeDir, "dinput8.dll")));
+            Assert.True(File.Exists(Path.Combine(_exeDir, "SeamlessCoop", "ersc_settings.ini")));
+        });
+    }
+
+    /// <summary>A d3d12.dll of a mod, or one SCSKiller renamed to chain it: the session never chains or renames, it is
+    /// refused naming the file, before anything is written or journaled.</summary>
+    [Theory]
+    [InlineData("d3d12.dll")]
+    [InlineData(ScsKiller.ChainName)]
+    public async Task An_offline_session_beside_a_d3d12_mod_is_refused_naming_it(string name)
+    {
+        EasyAntiCheatBeside();
+        if (OfflineKiller() is not { } k) return;
+        var mod = Planning.MiddlewarePackTests.Pe("d3d12.dll", Guid.NewGuid().ToByteArray());
+        File.WriteAllBytes(Path.Combine(_exeDir, name), mod);
+        await Listed(async () =>
+        {
+            await k.ScanAsync(default);
+            k.SetOfflineRecording(_game.Id, true);
+            var before = Names(_exeDir);
+            var e = Assert.Throws<InvalidOperationException>(() => { _ = k.StartOfflineSession(_game.Id, confirmed: true); });
+            Assert.Equal($"Fake Game: no offline session: {name} is already in its folder", e.Message);
+            Assert.Equal(before, Names(_exeDir));
+            Assert.Equal(mod, File.ReadAllBytes(Path.Combine(_exeDir, name)));
+            var rec = k.Store.LoadGame(_game.Id);
+            Assert.Equal((null, 0, null), (rec.OfflineSession, rec.RecorderFiles.Count, rec.RecorderExe));
+        });
+    }
 }

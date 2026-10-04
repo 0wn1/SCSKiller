@@ -27,4 +27,15 @@
     <EmbeddedResource Include="App\welcome.json" LogicalName="SCSKiller.Core.App.welcome.json" />
   </ItemGroup>
 
+  <!-- the commit, also in a release (publish.ps1 drops it from the informational version): ScsKiller.CoreBuild keys the scan cache on it -->
+  <Target Name="EmbedSourceRevision" DependsOnTargets="InitializeSourceControlInformation" BeforeTargets="GetAssemblyAttributes"
+          Condition="'$(SourceControlInformationFeatureSupported)' == 'true'">
+    <ItemGroup Condition="'$(SourceRevisionId)' != ''">
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>SourceRevisionId</_Parameter1>
+        <_Parameter2>$(SourceRevisionId)</_Parameter2>
+      </AssemblyAttribute>
+    </ItemGroup>
+  </Target>
+
 </Project>

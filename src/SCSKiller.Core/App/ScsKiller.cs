@@ -25,8 +25,13 @@ public sealed partial class ScsKiller : IScsKiller
     const string RecorderIni = "[scskiller]\r\n; written by SCSKiller: record the pipelines this game creates. Removed by 'uninstall recorder'.\r\nmode=record\r\n";
     static readonly TimeSpan Poll = TimeSpan.FromMilliseconds(500), AttributionInterval = TimeSpan.FromSeconds(3);
     // A new SCSKiller version may detect engines or plan differently: cached scan results from another one are redone.
-    // "1.0.0+<commit>": the same for the app and the CLI built from one commit (their Core.dll bytes differ, so no MVID).
-    static readonly string CoreBuild = typeof(ScsKiller).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "";
+    // "1.0.0+<commit>": the same for the app and the CLI built from one commit (their Core.dll bytes differ, so no MVID). A
+    // release's informational version has no commit (publish.ps1), and two builds of one tag may differ: the commit is added.
+    internal static readonly string CoreBuild = BuildOf(typeof(ScsKiller).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "",
+        typeof(ScsKiller).Assembly.GetCustomAttributes<AssemblyMetadataAttribute>().FirstOrDefault(m => m.Key == "SourceRevisionId")?.Value);
+
+    internal static string BuildOf(string version, string? commit) =>
+        string.IsNullOrEmpty(commit) || version.EndsWith("+" + commit, StringComparison.Ordinal) ? version : $"{version}+{commit}";
 
     readonly IReadOnlyList<IGameSource> _sources;
     readonly IEngineReader _reader;
@@ -373,7 +378,10 @@ public sealed partial class ScsKiller : IScsKiller
         foreach (var source in _sources)
             try
             {
-                var games = source.Discover().Where(g => !claimed.Contains(GameFiles.DirKey(g.InstallDir))
+                var listed = source.Discover();
+                foreach (var g in listed)
+                    if (g.Store == Core.Store.Manual && found.FirstOrDefault(f => GameFiles.Inside(f.InstallDir, g.ExePath)) is { } owner) AdoptManual(g, owner);
+                var games = listed.Where(g => !claimed.Contains(GameFiles.DirKey(g.InstallDir))
                     && !(g.Store == Core.Store.Manual && found.Any(f => GameFiles.Inside(f.InstallDir, g.ExePath)))).ToList();
                 found.AddRange(games);
                 claimed.UnionWith(games.Select(g => GameFiles.DirKey(g.InstallDir)));
@@ -556,7 +564,8 @@ public sealed partial class ScsKiller : IScsKiller
         {
             _ when reshade is { Blocks: true } => (GameStatus.Unsupported, ShaderModReason(shaderMod!.Mod!)),
             Readiness.Unsupported => (GameStatus.Unsupported, check.Reason),
-            Readiness.NeedsRecording when noRecording != null => (GameStatus.Unsupported, $"needs a recording, {noRecording}"),
+            // no plan source at all: the game files, this PC's recording and the community's were each checked
+            Readiness.NeedsRecording when noRecording != null => (GameStatus.Unsupported, $"needs a recording, {noRecording}" + DbNote(inDb)),
             Readiness.NeedsRecording => (GameStatus.NeedsRecording, check.Reason + DbNote(inDb)),
             // the plan compiles the rest, but not the game's ray tracing: that needs a recording (compiling stays possible, partial)
             _ when rt && noRecording == null && (rec.WarmedAt == null || StaleReason(g, rec, pending, gpuNow) == null) => (GameStatus.NeedsRecording, RtNote(inDb)),
@@ -594,6 +603,7 @@ public sealed partial class ScsKiller : IScsKiller
         var db = Length(Path.Combine(exeDir, "scskiller.db"));
         return s with { RecorderOverride = o, RecorderSkip = skip, RecorderEffective = RecorderEffective(o, Settings.RecordAllGames, skip),
             RecorderNote = _recorderNotes.GetValueOrDefault(s.Game.Id), RecorderMod = ModName(exeDir, rec, ours),
+            RecorderRefused = ours ? Refused(s.Game.ExePath) : null,
             RecordAlongsideMod = rec.RecordAlongsideMod,
             RecordingBytes = RecordingFiles(s.Game).Where(f => Path.GetFileName(f) != FrameLog.FileName).Sum(Length),
             RecordingPaused = ours && DbCap(s.Game) is { } cap && db >= cap,
@@ -961,7 +971,7 @@ public sealed partial class ScsKiller : IScsKiller
         : TrimmedReason(r) is { } trimmed ? trimmed
         : WarmMissesGame(r) ? MissesGameReason
         : r.AgsMissed && r.WarmedAgsApp != null ? AgsMissedReason(r)
-        : LayerNow(g) is var layer && layer != r.WarmedLayer ? (layer == null ? "the HDR mod the last compile ran through is gone" : r.WarmedLayer == null ? "an HDR mod was installed since the compile" : "the HDR mod changed since the compile")
+        : LayerNow(g) is var layer && layer != r.WarmedLayer ? (layer == null ? "the HDR mod the last compile ran through is gone" : r.WarmedLayer == null ? NotThroughLayerReason : "the HDR mod changed since the compile")
         : WarmExeName(g, r) is var runs && (r.WarmedExeName ?? Path.GetFileName(g.ExePath)) is var warmed && runs != warmed && CaseMatters(g, r, warmed)
             ? $"the game runs as {runs}, the warm filled the cache of {warmed} (the driver keys it on the exe name's exact case)"
         : IndexStamp(g) != (r.WarmedIndexStamp ?? "") ? IndexChangedReason
@@ -1012,6 +1022,9 @@ public sealed partial class ScsKiller : IScsKiller
     static string? IndexChanged(GameRecord r) => r.IndexContentHash != r.WarmedIndexHash ? IndexChangedReason : null;
 
     const string IndexChangedReason = "game shaders changed since the warm";
+
+    /// <summary>A warm without a layer (also every warm from before compiles ran through one) and a layer now.</summary>
+    internal const string NotThroughLayerReason = "the last compile didn't run through the game's HDR mod";
 
     /// <summary>NVIDIA's DXCache key ignores the exe name's case (measured: same files in upper case); AMD's DxcCache key is
     /// case-sensitive (FNV-1a of the UTF-16 name as launched). Other vendors: unmeasured, assume it matters.</summary>
@@ -1461,6 +1474,59 @@ public sealed partial class ScsKiller : IScsKiller
                                      ?? throw new ArgumentException($"unknown game '{gameId}' (scan first)");
 
     string RecordingPath(string gameId) => Path.Combine(Store.GameDir(gameId), "recording.db");
+
+    /// <summary>A game the user added that a store now lists (its install holds the exe, and the store's id wins): its
+    /// recording, and what its recorder recorded in its folder, are merged into the store game's recording, so the game plans
+    /// from them. Its recorder comes out of its own folder by its own record (<see cref="TakeOutNow"/>), never merged into
+    /// the store game's: another added copy may have recorded another folder. Until its folder is clean (the game runs, a
+    /// file is held) it stays pending, and the next scan tries again.</summary>
+    void AdoptManual(Game added, Game owner)
+    {
+        var (from, to) = (RecordingPath(added.Id), RecordingPath(owner.Id));
+        var dir = Path.GetDirectoryName(added.ExePath)!;
+        try
+        {
+            if (File.Exists(from))
+                using (Recordings.Lock(to))
+                using (Recordings.Lock(from))
+                {
+                    Directory.CreateDirectory(Store.GameDir(owner.Id));
+                    Recordings.Merge(to, from, null);
+                    Imported(owner);
+                    File.Delete(from);
+                    RecorderLog($"{owner.Name}: the recording made when you added it by hand now belongs to its store entry");
+                }
+            var was = Store.LoadGame(added.Id);
+            if (was.RecorderFiles.Count > 0 || was.RecorderChained != null || was.RecorderExe != null || ProxyOnDisk(added) || ProxyOnDisk(RecordedAt(added, was)))
+            {
+                TakeOutNow(added, "its store entry took it over");
+                was = Store.LoadGame(added.Id);
+                if (was.RecorderFiles.Count > 0 || was.RecorderChained != null || was.RecorderRollback || ProxyOnDisk(added) || ProxyOnDisk(RecordedAt(added, was))) return;
+            }
+            if (!RecorderDataFiles.Append(Recordings.KeysFile).Append(ArmedFile).Any(f => File.Exists(Path.Combine(dir, f))) || GameRunning(added)) return;
+            var inbox = new FileInfo(Path.Combine(dir, "scskiller.db"));
+            var unread = inbox is { Exists: true, Length: > 0 } && $"{inbox.Length}:{inbox.LastWriteTimeUtc.Ticks}" != was.RecordingInbox;
+            Directory.CreateDirectory(Store.GameDir(owner.Id));
+            if (RemoveRecorderData(dir, to, was.RecordingInbox, () => GameRunning(added)))
+            {
+                File.Delete(Path.Combine(dir, ArmedFile));
+                if (unread) Imported(owner);
+                RecorderLog($"{owner.Name}: the recorder's data files removed ({dir}), left by the copy you added by hand");
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidDataException)
+        {
+            RecorderLog($"{owner.Name}: couldn't clear what SCSKiller kept for it as a game you added (tried again at the next scan): {e.Message}");
+        }
+    }
+
+    /// <summary>The scan's cached check is keyed on <see cref="GameRecord.RecordingImportedAt"/>.</summary>
+    void Imported(Game g)
+    {
+        var rec = Store.LoadGame(g.Id);
+        rec.RecordingImportedAt = DateTimeOffset.Now;
+        Store.SaveGame(g.Id, rec);
+    }
 
     string RayQueryKeysPath(string gameId) => Path.Combine(Store.GameDir(gameId), "rayquery.keys");
 
@@ -2066,6 +2132,14 @@ public sealed partial class ScsKiller : IScsKiller
         return vkd3d ? SkipVulkanMod : null;
     }
 
+    /// <summary>Why the mod's d3d12.dll (<see cref="GameState.RecorderMod"/>) can't be chained, as the game's page says it
+    /// (<see cref="SkipModNotChainable"/>). OptiScaler picks its role from its file name (renamed, it does nothing) and works
+    /// under the other names it supports, beside the recorder.</summary>
+    public static string NotChainableReason(string? mod) =>
+        mod?.StartsWith("OptiScaler", StringComparison.OrdinalIgnoreCase) == true
+            ? "OptiScaler is installed as d3d12.dll, and renamed it stops working (it picks its role from its file name). To record alongside it, rename it to dxgi.dll (or winmm.dll or version.dll if a dxgi.dll is already there): OptiScaler supports those names"
+            : $"{mod ?? "another mod"} is installed as d3d12.dll, and the recorder can't run alongside it: renamed it stops working";
+
     /// <summary>What the game folder's d3d12.dll that isn't SCSKiller's (or the one chained to it) calls itself, for "Record
     /// alongside &lt;mod&gt;"; null = none there.</summary>
     public string? RecorderMod(string gameId)
@@ -2347,6 +2421,10 @@ public sealed partial class ScsKiller : IScsKiller
                     Store.SaveGame(id, rec);
                     RecorderLog($"{g.Name}: recorder removed ({wasDir}): the game runs {g.ExePath}");
                     (ours, moved, changed) = (IsOurProxy(dll), true, true);
+                    // the old folder's watcher would take the install's files in the new one for a change and keep it unarmed
+                    if (WatchKey(old) != WatchKey(g))
+                        lock (_installWatchers)
+                            if (_installWatchers.Remove(WatchKey(old), out var w)) Unwatch(w);
                 }
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException)
@@ -2489,9 +2567,19 @@ public sealed partial class ScsKiller : IScsKiller
         RecordersLog(Store.DataDir, line);
     }
 
+    static readonly object _recordersLogLock = new();
+
+    // lines come from background tasks and the cleanup helper's process at once: an unshared append loses one to a sharing violation
     static void RecordersLog(string dataDir, string line)
     {
-        try { File.AppendAllText(Path.Combine(dataDir, "recorders.log"), $"{DateTimeOffset.Now:u} {line}{Environment.NewLine}"); }
+        try
+        {
+            lock (_recordersLogLock)
+            {
+                using var f = new FileStream(Path.Combine(dataDir, "recorders.log"), FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+                f.Write(System.Text.Encoding.UTF8.GetBytes($"{DateTimeOffset.Now:u} {line}{Environment.NewLine}"));
+            }
+        }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 
@@ -3785,6 +3873,12 @@ public sealed partial class ScsKiller : IScsKiller
         var states = Games;
         var games = states.Where(s => s.RecorderInstalled && s.AntiCheat == AntiCheat.None).ToDictionary(s => WatchKey(s.Game));
         foreach (var s in games.Values) WatchOrDisarm(s.Game);   // made, or made again after a failure (bounded); before the change counts below
+        foreach (var (key, s) in games)
+            if (!ExeAsArmed(s.Game))   // written in place: no name event; the proxy's fingerprint refuses it, this checks and arms it anew
+            {
+                DisarmFromWatcher(s.Game, $"{s.Game.ExePath} changed");
+                _installChanged[key] = true;
+            }
         var pending = games.Where(e => _installChanged.TryRemove(e.Key, out _) | all || UnarmedDue(e.Value.Game))
             .Select(e => (e.Value.Game, Gen: InstallGen(e.Value.Game))).Select(c => (c.Game, c.Gen, Walk: Task.Run(() => FullAntiCheatCheck(c.Game))))
             .ToList();
@@ -3868,6 +3962,37 @@ public sealed partial class ScsKiller : IScsKiller
     static readonly HashSet<string> RecorderOwnFiles = new([.. RecorderDataFiles, Recordings.KeysFile, Recordings.KeysFile + ".tmp", "d3d12.dll", "scskiller.ini", ChainName, ArmedFile],
         StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>The file types a mod or a game writes as it runs that are never loaded as code (LoadLibrary takes any extension,
+    /// so every other type, unknown ones included, counts as a possible binary).</summary>
+    static readonly HashSet<string> DataTypes = new([".log", ".txt", ".ini", ".cfg", ".json", ".xml", ".csv", ".yaml", ".yml", ".md",
+        ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".dds", ".sav", ".tmp", ".bak"], StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>A created or renamed entry that can't bring anti-cheat, so the install watcher doesn't disarm for it: no
+    /// anti-cheat marker's name, and either a file of a <see cref="DataTypes"/> type that doesn't start with "MZ" (a PE under
+    /// another name; one locked from reading goes by its type), or an empty folder (one moved in carries its contents, which
+    /// raise no events of their own; files made in a new one raise theirs). A mod's log, an ini, a screenshot, a save.</summary>
+    internal static bool Harmless(string path)
+    {
+        var name = Path.GetFileName(path);
+        if (GameFiles.Marker(name) != AntiCheat.None) return false;
+        try
+        {
+            var a = File.GetAttributes(path);
+            if ((a & FileAttributes.ReparsePoint) != 0) return false;
+            if ((a & FileAttributes.Directory) != 0) return !Directory.EnumerateFileSystemEntries(path).Any();
+            if (!DataTypes.Contains(Path.GetExtension(name))) return false;
+            Span<byte> head = stackalloc byte[2];
+            try
+            {
+                using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                return f.ReadAtLeast(head, 2, throwOnEndOfStream: false) < 2 || head[0] != (byte)'M' || head[1] != (byte)'Z';
+            }
+            catch (IOException e) when (e is not (FileNotFoundException or DirectoryNotFoundException)) { return true; }   // held without read sharing: by its type
+        }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException) { return true; }   // gone (a temp file renamed): what it became raises its own event
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { return false; }
+    }
+
     List<FileSystemWatcher>? WatchInstall(string key, Game g)
     {
         _installChanged[key] = true;   // checked at once: it may have changed unwatched
@@ -3892,15 +4017,20 @@ public sealed partial class ScsKiller : IScsKiller
                 w.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName;
                 void Changed(object? _, FileSystemEventArgs e)
                 {
-                    if (OwnFile(e.FullPath)) return;   // the recorder's own files next to the exe (an install, its arming, a session): no marker
-                    DisarmFromWatcher(g);   // in the event itself, before any check: a launch from now on is a pass-through
+                    // a recorder file renamed away by someone else disarms; its own files next to the exe (an install, its
+                    // arming, a session) and what can't carry anti-cheat (a mod's log, an ini, a save) don't
+                    var old = (e as RenamedEventArgs)?.OldFullPath;
+                    if (OwnFile(e.FullPath)) return;
+                    var ownRenamed = old != null && Path.GetDirectoryName(old)!.Equals(exeDir, StringComparison.OrdinalIgnoreCase) && RecorderOwnFiles.Contains(Path.GetFileName(old));
+                    if (!ownRenamed && Harmless(e.FullPath)) return;
+                    DisarmFromWatcher(g, ownRenamed ? $"{old} renamed to {e.FullPath}" : $"{e.FullPath} {(old != null ? "renamed" : "created")}");   // in the event itself, before any check: a launch from now on is a pass-through
                     _installChanged[key] = true;
                 }
                 w.Created += Changed;
                 w.Renamed += Changed;
                 w.Error += (_, _) =>   // events lost: disarmed, checked, and the watcher made again
                 {
-                    DisarmFromWatcher(g);
+                    DisarmFromWatcher(g, "the install watcher lost events");
                     (_installChanged[key], _watchFailed[key]) = (true, true);
                 };
                 w.EnableRaisingEvents = true;
@@ -3985,9 +4115,10 @@ public sealed partial class ScsKiller : IScsKiller
     /// <summary>The install watcher's disarm. In the event (notifications are handled one at a time) only what needs no game
     /// record: the watched exe's ledger entry, mark and armed file. The rest (where the record says the recorder was
     /// installed, the pending decision) on a background task; the game isn't armed until it's done.</summary>
-    void DisarmFromWatcher(Game g)
+    void DisarmFromWatcher(Game g, string why)
     {
         _disarmWork.AddOrUpdate(g.Id, 1, (_, n) => n + 1);   // first: an arming from now on refuses
+        var was = Armed(g);
         CountChange(g.Id);
         if (RevokeAt(g, [g.ExePath], new(StringComparer.OrdinalIgnoreCase)).Count > 0) _revocationPending.TryAdd(g.Id, g);
         Task.Run(() =>
@@ -3995,6 +4126,7 @@ public sealed partial class ScsKiller : IScsKiller
             try { Disarm(g); }
             finally { _disarmWork.AddOrUpdate(g.Id, 0, (_, n) => n - 1); }
         });
+        if (was) Task.Run(() => RecorderLog($"{g.Name}: recorder disarmed until the install is checked again: {why}"));   // a slow log sink never holds up the next event's revocation
     }
 
     readonly ConcurrentDictionary<string, int> _disarmWork = new();   // game id -> the watcher's disarms still running in the background
@@ -4078,14 +4210,43 @@ public sealed partial class ScsKiller : IScsKiller
             try
             {
                 if (!IsOurProxy(Path.Combine(Path.GetDirectoryName(g.ExePath)!, "d3d12.dll")) || BlockingMod(g) != null) return;   // a blocking HDR mod: never recorded
-                Directory.CreateDirectory(LedgerDir);   // File.Delete throws on a missing folder: a fresh PC has no ledger yet
-                File.Delete(LedgerFile(g.ExePath) + ".revoked");   // a revocation's mark goes first; one that can't, keeps it unarmed
+                DeleteRevocationMark(g.ExePath);   // first; one that can't go keeps it unarmed
                 WriteAttestation(g.ExePath);
                 if (InstallGen(g) != gen || DisarmQueued(g)) File.Delete(LedgerFile(g.ExePath));   // a change counted while it was written
                 else _armFailures.TryRemove(g.Id, out _);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { ArmFailed(g, e.Message); }   // not armed: a pass-through until the next pass arms it
         }
+    }
+
+    /// <summary>Why the proxy passed the exe's last launch through, from the file it leaves beside the exe's ledger entry
+    /// ("&lt;unix ms&gt; &lt;reason&gt;"; an admitted launch deletes it); null = none.</summary>
+    internal static string? Refused(string exe)
+    {
+        string text;
+        try { text = File.ReadAllText(LedgerFile(exe) + ".refused"); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
+        return (text.Split(' ', 2) is [_, var w] ? w.Trim() : "") switch
+        {
+            "" => null,
+            "not armed" => "SCSKiller hadn't checked the game folder for anti-cheat since it last changed (keep SCSKiller running when you start the game)",
+            "disarmed while deciding" => "the game folder changed as the game started",
+            var why => why,
+        };
+    }
+
+    /// <summary>False when the exe's armed file names another size or write time than the exe has now (the proxy refuses it).</summary>
+    static bool ExeAsArmed(Game g)
+    {
+        try
+        {
+            var lines = File.ReadAllLines(ArmedFileOf(g.ExePath));
+            string? Value(string k) => lines.FirstOrDefault(l => l.StartsWith(k + "=", StringComparison.Ordinal))?[(k.Length + 1)..];
+            if (Value("armed") != "1") return true;
+            var f = new FileInfo(g.ExePath);
+            return Value("exe_size") == f.Length.ToString() && Value("exe_time") == f.LastWriteTimeUtc.ToFileTimeUtc().ToString();
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return true; }   // none, or unreadable: nothing armed to take back here
     }
 
     /// <summary>Armed now: the exe's ledger entry and its armed file are there (their nonces are the proxy's check).</summary>
@@ -4125,6 +4286,13 @@ public sealed partial class ScsKiller : IScsKiller
     /// <summary>The app's ledger of armed exes, outside every game folder: an entry per exe holds the nonce its
     /// <see cref="ArmedFile"/> must hold too. The proxy finds it through FOLDERID_LocalAppData.</summary>
     internal static string LedgerDir { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SCSKiller", "armed");   // replaceable for tests
+
+    /// <summary>Deletes the exe's revocation mark, on which the proxy refuses. Throws when it can't.</summary>
+    internal static void DeleteRevocationMark(string exe)
+    {
+        Directory.CreateDirectory(LedgerDir);   // File.Delete throws on a missing folder: a fresh PC has no ledger yet
+        File.Delete(LedgerFile(exe) + ".revoked");
+    }
 
     /// <summary>The ledger entry of an exe: the SHA-1 of its full path (UTF-16LE, A-Z lowered) in hex, as the proxy names it.</summary>
     internal static string LedgerFile(string exe)

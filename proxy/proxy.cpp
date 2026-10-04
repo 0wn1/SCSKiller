@@ -310,6 +310,24 @@ static bool armed(bool& bound) {
         return false;
     return bound = true;
 }
+// A pass-through writes nothing in the game folder: its reason goes beside the ledger entry (<entry>.refused, "unix_ms why"),
+// where the app shows it on the game's page; an admitted run deletes it.
+static void refused(const char* why) {
+    const std::wstring ledger = ledger_path();
+    if (ledger.empty()) return;
+    const std::wstring file = ledger + L".refused";
+    if (!why) return (void)DeleteFileW(file.c_str());
+    // a PC the app never armed a game on has no ledger folder yet
+    const std::wstring dir = ledger.substr(0, ledger.find_last_of(L'\\'));
+    CreateDirectoryW(dir.substr(0, dir.find_last_of(L'\\')).c_str(), nullptr), CreateDirectoryW(dir.c_str(), nullptr);
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char b[160];
+    int n = snprintf(b, sizeof b, "%lld %s", unix_ms(), why);
+    DWORD w;
+    WriteFile(h, b, (DWORD)std::clamp(n, 0, (int)sizeof b - 1), &w, nullptr);
+    CloseHandle(h);
+}
 static bool admitted() {
     if (g_warm) return true;  // scskiller_warm's staged child replays; it is never a game
     static std::once_flag once;
@@ -322,10 +340,13 @@ static bool admitted() {
         if (!why) why = anti_cheat_beside(markers) ? "anti-cheat next to the exe" : anti_cheat_loaded() ? "anti-cheat client loaded" : nullptr;
         if (wchar_t ms[16]; !why && GetEnvironmentVariableW(L"SCSKILLER_TEST_ADMIT_PAUSE_MS", ms, 16)) Sleep(_wtoi(ms));  // tests: a change in between
         if (!why && armed_text() != attested) why = "disarmed while deciding";  // the app disarmed it meanwhile (an install change)
-        std::lock_guard l(g_early_mx);
-        if (!why && (g_log = _wfopen((g_dir + L"scskiller.log").c_str(), L"a"))) fputs(g_early.c_str(), g_log), fflush(g_log);
-        g_early.clear(), g_log_deferred = false;
-        g_admission = why ? -1 : 1;
+        {
+            std::lock_guard l(g_early_mx);
+            if (!why && (g_log = _wfopen((g_dir + L"scskiller.log").c_str(), L"a"))) fputs(g_early.c_str(), g_log), fflush(g_log);
+            g_early.clear(), g_log_deferred = false;
+            g_admission = why ? -1 : 1;
+        }
+        refused(why);
     });
     return g_admission > 0;
 }
