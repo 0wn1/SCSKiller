@@ -39,22 +39,6 @@ dotnet build SCSKiller.slnx -c Release
 The CMake configure downloads AMD's `amd_ags_x64.dll`, pinned by SHA-256. Without it, AMD warms of AGS games use a plain
 device.
 
-## Tests
-
-```
-dotnet test tests/SCSKiller.Tests -c Release --filter "Needs!=Gpu&Needs!=Game"
-```
-
-It must pass on a Windows machine with no games and no GPU. Tests that need more carry a trait:
-`[Trait("Needs", "Gpu")]` drives a real GPU and its driver cache, `[Trait("Needs", "Game")]` reads installed games,
-launchers or recordings. Such a test returns early when what it needs isn't there. Run them locally
-(`dotnet test tests/SCSKiller.Tests -c Release`) when your change touches their area.
-
-- No machine paths in tests. `TestEnv` finds games through Steam's library list, the `XboxGames` folders, GOG and
-  `SCSKILLER_TEST_GAMES_ROOT` (`;`-separated folders of game install folders). GPU tests take a lock in
-  `SCSKILLER_DEV_DIR` (default `%TEMP%\scskiller-test`).
-- Tests never write into a game folder, change the driver's cache size or settings, or register scheduled tasks.
-
 ## Style
 
 - Match the code around your change. One topic per PR, kept small.
