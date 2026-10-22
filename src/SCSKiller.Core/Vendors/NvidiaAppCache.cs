@@ -17,11 +17,25 @@ public sealed class NvidiaAppCache(string dir) : IAppCache
         && ulong.TryParse(fileName.AsSpan(0, 16), System.Globalization.NumberStyles.HexNumber, null, out _)
             ? fileName.Substring(8, 8).ToLowerInvariant() : null;
 
+    /// <summary>Older drivers' D3D cache folder below LocalLow, of .bin and .toc pairs keyed by their name without the
+    /// extension, with <see cref="LegacyPrefix"/>: no name format is read.</summary>
+    public static readonly string[] LegacyTail = ["NVIDIA", "PerDriverVersion", "DXCache"];
+    public const string LegacyPrefix = "nvdx:";
+    static readonly string[] LegacyTypes = [".bin", ".toc"];
+
+    /// <summary>The key of a .bin or .toc directly in a <see cref="LegacyTail"/> folder; null for any other file. Never a
+    /// subfolder's: a link could replace it between the listing and the delete.</summary>
+    public static string? LegacyKey(string path) =>
+        LegacyTypes.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase) && Path.GetDirectoryName(Path.GetFullPath(path)) is { } dir && IsLegacy(dir)
+            ? LegacyPrefix + Path.GetFileNameWithoutExtension(path).ToLowerInvariant() : null;
+
+    public static bool IsLegacy(string dir) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)).Split(Path.DirectorySeparatorChar) is var parts
+        && parts.Length > LegacyTail.Length && parts[^LegacyTail.Length..].SequenceEqual(LegacyTail, StringComparer.OrdinalIgnoreCase);
+
     public IReadOnlyList<FileInfo> FilesOf(IEnumerable<string> keys)
     {
         var set = keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        return set.Count == 0 || !AppCacheFiles.Readable(Dir) ? []
-            : new DirectoryInfo(Dir).EnumerateFiles("*.nvph").Where(f => Key(f.Name) is { } k && set.Contains(k)).ToList();
+        return set.Count == 0 ? [] : All().Where(f => set.Contains(f.Key)).Select(f => new FileInfo(f.Path)).ToList();
     }
 
     public long SizeOf(IEnumerable<string> keys) => FilesOf(keys).Sum(f => f.Length);
@@ -41,12 +55,12 @@ public sealed class NvidiaAppCache(string dir) : IAppCache
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
     }
 
-    public IReadOnlySet<string> KeysOpenBy(string exeFileName) => !AppCacheFiles.Readable(Dir) ? new HashSet<string>()
-        : AppCacheFiles.KeysOpenBy(exeFileName, Directory.EnumerateFiles(Dir, "*.nvph")
-            .Select(f => (Path: f, Key: Key(Path.GetFileName(f))!)).Where(f => f.Key != null));
+    public IReadOnlySet<string> KeysOpenBy(string exeFileName) => AppCacheFiles.KeysOpenBy(exeFileName, All());
 
     public int Delete(IEnumerable<string> keys) => AppCacheFiles.DeleteAll(FilesOf(keys));
 
-    public IReadOnlySet<string> AllKeys() => !Directory.Exists(Dir) ? new HashSet<string>()
-        : Directory.EnumerateFiles(Dir, "*.nvph").Select(f => Key(Path.GetFileName(f))).OfType<string>().ToHashSet(StringComparer.OrdinalIgnoreCase);
+    public IReadOnlySet<string> AllKeys() => All().Select(f => f.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    IEnumerable<(string Path, string Key)> All() => !AppCacheFiles.Readable(Dir) ? []
+        : Directory.EnumerateFiles(Dir).Select(f => (Path: f, Key: (Key(Path.GetFileName(f)) ?? LegacyKey(f))!)).Where(f => f.Key != null);
 }

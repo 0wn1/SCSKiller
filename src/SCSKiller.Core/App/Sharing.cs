@@ -27,9 +27,15 @@ public sealed record UploadDll(string Name, string Sha1);
 /// <summary>The first-launch outcome report, POST /v1/report's body as snake_case
 /// JSON. <see cref="GpuModel"/>: the adapter's name only. <see cref="Cold"/>: the pipeline creates the driver compiled;
 /// <see cref="Keys"/>: four base64url strings, each the record keys (20 bytes each, back to back) whose slowest create took
-/// under 10 ms, 10-50, 50-200, and 200 ms or more.</summary>
+/// under 10 ms, 10-50, 50-200, and 200 ms or more. <see cref="HitCheck"/>: the run's misses read from the game's adapter db,
+/// sent only to a server that takes them ("hitcheck"). A run the recorder didn't log has no cold creates and no keys:
+/// both are left out, never 0 (<see cref="HitCheckOnly"/>).</summary>
 public sealed record OutcomeReport(string ContentHash, string Vendor, string? GpuModel, string? DriverVersion, string AppVersion, string? RsRule,
-    int PlannerVersion, long Cold = 0, string[]? Keys = null)
+    int PlannerVersion,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? Cold = 0,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string[]? Keys = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IdentityReport? Identity = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] HitCheck? HitCheck = null)
 {
     // A ceiling, not a sample: 100,000 keys of 20 bytes in base64url are 2.7 MB, within the edge's 4 MB with room to spare
     public const int MaxKeys = 100_000;
@@ -44,7 +50,7 @@ public sealed record OutcomeReport(string ContentHash, string Vendor, string? Gp
     /// keys kept, into <paramref name="about"/>. The game's own pipeline library and ray tracing state objects are left
     /// out: a cached state object can take 25 ms.</summary>
     public static OutcomeReport? Build(string csvPath, string? exeFileName, DateTimeOffset after, PlayWindow? played, IReadOnlySet<string>? rayQuery,
-        OutcomeReport about, long minCreates = 1)
+        OutcomeReport about, long minCreates = 1, PlayWindow? hitRun = null)
     {
         var launches = SessionLog.Launches(csvPath).ToList();
         for (var i = 0; i < launches.Count; i++)
@@ -66,10 +72,20 @@ public sealed record OutcomeReport(string ContentHash, string Vendor, string? Gp
             var buckets = new List<byte>[] { [], [], [], [] };
             foreach (var (key, ms) in slowest.OrderByDescending(k => k.Value).ThenBy(k => k.Key, StringComparer.Ordinal).Take(MaxKeys))
                 buckets[ms < 10 ? 0 : ms < 50 ? 1 : ms < 200 ? 2 : 3].AddRange(Convert.FromHexString(key));
-            return about with { Cold = cold, Keys = [.. buckets.Select(b => Base64Url.EncodeToString([.. b]))] };
+            // the hit check goes only with the launch it was read after: a skipped short run's would describe another
+            var hits = hitRun is { } w && w.From.ToUnixTimeMilliseconds() <= start && start <= w.To.ToUnixTimeMilliseconds() ? about.HitCheck : null;
+            return about with { Cold = cold, Keys = [.. buckets.Select(b => Base64Url.EncodeToString([.. b]))], HitCheck = hits };
         }
         return null;
     }
+
+    /// <summary>For a warm whose first run the recorder didn't log (no launch of <paramref name="exeFileName"/> after
+    /// <paramref name="after"/> in the csv): <paramref name="about"/>'s content hash, vendor, versions and hit check, nothing
+    /// else. Null when it has no hit check or the recorder logged a launch, which <see cref="Build"/> reports.</summary>
+    public static OutcomeReport? HitCheckOnly(string csvPath, string? exeFileName, DateTimeOffset after, OutcomeReport about) =>
+        about.HitCheck is { } h && !SessionLog.Launches(csvPath).Any(l => l.Start is { } s && s > after.ToUnixTimeMilliseconds() && !SessionLog.OtherExe(l.Exe, exeFileName))
+            ? new(about.ContentHash, about.Vendor, null, null, about.AppVersion, null, about.PlannerVersion, Cold: null, HitCheck: h)
+            : null;
 
     /// <summary>This report with only its <paramref name="max"/> slowest keys: the buckets slowest first, each in that
     /// order already.</summary>
@@ -85,6 +101,19 @@ public sealed record OutcomeReport(string ContentHash, string Vendor, string? Gp
         }
         return this with { Keys = kept };
     }
+}
+
+/// <summary>An outcome report's D3DSCache identity, sent only to a server that takes it ("identity", <see cref="Sharing.AcceptsAsync"/>):
+/// the registry read at the fold (<see cref="RegistryRead"/>) with the identities registered, what the fold stamped and why
+/// (<see cref="IdentityStamp"/>; null: nothing), and what the game's adapter db holds after the launch (null: not read).
+/// A stamp the game's db doesn't hold after it is a db the runtime emptied. <see cref="Asd"/>: the game's delivery then.</summary>
+public sealed record IdentityReport(string Read, AppIdentity[] Registered, string Source, string? Rule, AppIdentity? Stamped, AppIdentity? Game, AsdReport Asd)
+{
+    /// <summary>The report of <paramref name="s"/>, the fold's stamp, with <paramref name="game"/>; null when a value isn't one a
+    /// report takes (<see cref="AppIdentity.Valid"/>, at most 8 registrations).</summary>
+    public static IdentityReport? Of(IdentityStamp s, AppIdentity? game, AsdReport asd) =>
+        s.Read.Registered is { Length: <= 8 } reg && reg.All(r => r.Valid) && s.Stamped?.Valid != false && game?.Valid != false
+            ? new(s.Read.Kind, reg, s.Source, s.Rule, s.Stamped, game, asd) : null;
 }
 
 /// <summary>What sharing did with a game's recording (games\&lt;id&gt;\shared.json). <see cref="Stamp"/>: the recording and
@@ -410,6 +439,37 @@ public sealed class Sharing
     /// <summary>The warm whose outcome report was sent (or refused for good), in a game's data folder.</summary>
     public const string ReportedFile = "reported.txt";
 
+    /// <summary>Whether the server takes <paramref name="what"/> ("identity": an outcome report's identity block), as GET
+    /// /v1/upload lists them: asked once a day, again after it couldn't be reached. A server from before them has no such list
+    /// (404 at the edge, 405 at the origin) and would refuse them, so none go there.</summary>
+    public async Task<bool> AcceptsAsync(string what, CancellationToken ct = default)
+    {
+        if (!enabled() || clock.GetUtcNow() < backoffUntil) return false;
+        if (accepts == null || clock.GetUtcNow() - acceptsAt > TimeSpan.FromDays(1))
+            try
+            {
+                using var r = await http.GetAsync(new Uri(routes.Primary, "v1/upload"), ct);
+                if (r.StatusCode == HttpStatusCode.OK)
+                    accepts = [.. (await r.Content.ReadFromJsonAsync<JsonElement>(ct)).GetProperty("accepts").EnumerateArray().Select(a => a.GetString() ?? "")];
+                else if (r.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed or HttpStatusCode.NotImplemented) accepts = [];
+                else
+                {
+                    BackOff(r);
+                    return false;
+                }
+                acceptsAt = clock.GetUtcNow();
+            }
+            catch (Exception) when (!ct.IsCancellationRequested)   // offline, or an answer this version can't read
+            {
+                backoffUntil = clock.GetUtcNow() + TimeSpan.FromMinutes(5);
+                return false;
+            }
+        return accepts?.Contains(what) == true;
+    }
+
+    HashSet<string>? accepts;
+    DateTimeOffset acceptsAt;
+
     /// <summary>Sends the outcome report of the warm <paramref name="warm"/> once, when sharing is on, with no token or
     /// identifier of any kind (never the upload device); <paramref name="report"/> is built only for a warm not reported yet
     /// (null: nothing to report yet). A report of more than <see cref="OutcomeReport.OldMaxKeys"/> keys refused with 400 or
@@ -430,6 +490,14 @@ public sealed class Sharing
         try
         {
             var res = await Post(r);
+            // a server rolled back to before identity or hitcheck blocks refuses them: asked again, and the report goes without
+            // (a report without keys has only its hit check: refused as it is)
+            if (res.StatusCode is HttpStatusCode.BadRequest && r.Keys != null && (r.Identity != null || r.HitCheck != null))
+            {
+                res.Dispose();
+                accepts = null;
+                res = await Post(r = r with { Identity = null, HitCheck = null });
+            }
             if (res.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.RequestEntityTooLarge
                 && r.Keys?.Sum(k => Base64Url.DecodeFromChars(k).Length) > OutcomeReport.OldMaxKeys * 20)
             {

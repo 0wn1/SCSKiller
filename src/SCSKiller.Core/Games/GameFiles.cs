@@ -512,6 +512,8 @@ public static class GameFiles
         ("Warframe.x64.exe", AntiCheat.Other),   // Digital Extremes' own client-side detection: no driver or folder of its own
         ("ONCE_HUMAN.exe", AntiCheat.Other),   // NetEase's anti-cheat installs outside the game folder (also AntiCheatIds)
         ("forzahorizon6.exe", AntiCheat.Other),   // Playground's own detection leaves no file of its own (also AntiCheatIds)
+        ("RobloxPlayerBeta.exe", AntiCheat.Other), ("RobloxPlayerBeta.dll", AntiCheat.Other), ("RobloxPlayerLauncher.exe", AntiCheat.Other),
+        ("RobloxPlayerInstaller.exe", AntiCheat.Other),   // Hyperion is built into the player, no file of its own
         ("arbiter.dll", AntiCheat.Other),   // Arbiter, Halo Infinite's own anti-cheat, in the game's root
         ("gameguard.des", AntiCheat.Other),
         ("DenuvoAC", AntiCheat.Other), ("denuvo-anti-cheat.sys", AntiCheat.Other), ("denuvo-anti-cheat-runtime.dll", AntiCheat.Other),

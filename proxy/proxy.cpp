@@ -57,6 +57,7 @@
 #include <deque>
 #include <format>
 #include <functional>
+#include <list>
 #include <map>
 #include <mutex>
 #include <set>
@@ -131,6 +132,8 @@ static std::vector<std::string> g_plan;                          // warm mode on
 static std::vector<std::string> g_items11;                       // warm mode only: D3D11 items, the tag ('1', '2', '3') + the payload
 static HashSet g_known_tuples;                                   // (stages + root sig) tuples known at launch
 static uint64_t g_lib_loads, g_db_records_at_start, g_creates, g_known_hits, g_tuple_hits, g_slow_known, g_slow_tuple, g_slow_unknown, g_unsupported;
+static std::atomic<uint64_t> g_dd_hits, g_dd_held, g_dd_hits_slow, g_dd_held_slow;  // dedupe: re-creates answered, and those whose kept
+                                                                                  // pipeline the game still held (driver call); slow: >= 10 ms
 static uint64_t g_repeats, g_slow_repeats;  // creates of a desc this process created before, and those over the slow mark
 static HashSet g_created;                    // every key this process created (note)
 static std::atomic<uint64_t> g_warm_ok, g_warm_fail, g_warm_crash;  // crash: skipped, it removed the device in an earlier run
@@ -258,7 +261,9 @@ static const wchar_t* const kAntiCheatMarkers[] = {  // GameFiles.Markers; "*x":
     L"NeacClient.exe", L"NeacSafe64.sys", L"NeacSafe64_ex.sys",
     L"NEP2.dll", L"NEPCleaner.exe",
     L"BlackCall.aes", L"BlackCall64.aes", L"BlackCat64.sys", L"HShield", L"PunkBuster", L"PnkBstrA.exe", L"pbsvc.exe", L"pbsv.dll",
-    L"equ8_conf.json", L".build.info", L".product.db", L"Warframe.x64.exe", L"ONCE_HUMAN.exe", L"forzahorizon6.exe", L"arbiter.dll", L"gameguard.des", L"DenuvoAC", L"denuvo-anti-cheat.sys", L"denuvo-anti-cheat-runtime.dll",
+    L"equ8_conf.json", L".build.info", L".product.db", L"Warframe.x64.exe", L"ONCE_HUMAN.exe", L"forzahorizon6.exe",
+    L"RobloxPlayerBeta.exe", L"RobloxPlayerBeta.dll", L"RobloxPlayerLauncher.exe", L"RobloxPlayerInstaller.exe",
+    L"arbiter.dll", L"gameguard.des", L"DenuvoAC", L"denuvo-anti-cheat.sys", L"denuvo-anti-cheat-runtime.dll",
     L"denuvo-anti-cheat-update-service.exe", L"Denuvo Anti-Cheat Installer.exe", L"Elytra", L"Elytra.exe", L"Elytra-Setup.exe", L"*.xem", L"*_BE.exe"};
 static const size_t kEasyAntiCheatMarkers = 5;  // the list's first entries
 static std::atomic<int> g_admission;  // 0 undecided, 1 records, -1 pass-through
@@ -933,6 +938,10 @@ struct Writer {
     std::vector<std::pair<Hash, std::string_view>> blobs;  // shader bytes live in game memory during the call
     std::vector<Hash> rsigs;
     Hash rsh{};
+    void* rsp = nullptr;  // the root signature object: the dedupe key's identity, never written to the record
+    D3D12_CACHED_PIPELINE_STATE cached{};  // the CachedPSO blob, likewise: hashed only for a dedupe
+    uint32_t rast = 0;    // the stream output's rasterized stream, which a desc without entries doesn't record
+    bool no_dedupe = false;  // a stream with two CachedPSO subobjects: the runtime refuses it, a hit mustn't
     Tuple tup;
     NvExt nv = nv_now(tag);  // at the hook's entry, on the creating thread
     bool below = false;   // a create under a layer: its root signatures are the ones the layer gave the device
@@ -941,6 +950,7 @@ struct Writer {
     template <class T> void pod(T& v) { raw(&v, sizeof v); }
     void u32(uint32_t v) { raw(&v, 4); }
     void hash(const Hash& h) { raw(h.data(), 20); }
+    void cached_pso(const D3D12_CACHED_PIPELINE_STATE& c) { no_dedupe |= cached.pCachedBlob != nullptr, cached = c; }
     void sh(D3D12_SHADER_BYTECODE& b, uint32_t stage) {
         if (!b.pShaderBytecode || !b.BytecodeLength) return hash(kZero);
         size_t n = shader_len(b);
@@ -959,13 +969,14 @@ struct Writer {
         if (auto it = g_rs_of.find(p); !h && it != g_rs_of.end()) h = &it->second;
         if (!h) { ok = false, why = "root signature was not created through a hooked device"; return; }
         rsigs.push_back(*h);
-        rsh = *h;
+        rsh = *h, rsp = p;
         hash(*h);
     }
     // Stream output, only when it declares entries (NumEntries 0 = no SO, written as nothing: older records keep their
     // keys): u32 n, n x (u32 stream, str8 semantic, u32 index, start component, component count, output slot),
     // u32 strides n + strides, u32 rasterized stream. 'G': after the desc's last field; 'S': as subobject kSoDecl.
     void so(D3D12_STREAM_OUTPUT_DESC& d) {
+        rast = d.RasterizedStream;
         if (!d.NumEntries) return;
         if (!d.pSODeclaration) { ok = false, why = "stream output entries without a declaration"; return; }
         u32(d.NumEntries);
@@ -1215,6 +1226,7 @@ static void write_stream(Writer& w, const D3D12_PIPELINE_STATE_STREAM_DESC& d) {
         size_t in = align(pos + 4, s.align);
         bool decl = t == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT && ((D3D12_STREAM_OUTPUT_DESC*)(base + in))->NumEntries;
         if (t != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO) w.u32(decl ? kSoDecl : t), io_sub(w, t, base + in), ++count;
+        else w.cached_pso(*(D3D12_CACHED_PIPELINE_STATE*)(base + in));
         pos = align(in + s.size, sizeof(void*));
     }
     memcpy(&w.s[count_at], &count, 4);
@@ -1880,8 +1892,9 @@ static void note(Writer& w, double ms, bool lib, double pre_ms) {
                 GetCurrentThreadId(), (int)t_presenting);
     }
     if (g_creates % 500 == 0) {
-        logf("creates=%llu (library loads %llu) known=%llu tuple_known=%llu | slow: known=%llu tuple_only=%llu unknown=%llu | repeats=%llu slow=%llu | unsupported=%llu db=%zu nvapi_state=%llu",
-             g_creates, g_lib_loads, g_known_hits, g_tuple_hits, g_slow_known, g_slow_tuple, g_slow_unknown, g_repeats, g_slow_repeats, g_unsupported, g_keys.size(), g_nv_creates);
+        logf("creates=%llu (library loads %llu) known=%llu tuple_known=%llu | slow: known=%llu tuple_only=%llu unknown=%llu | repeats=%llu slow=%llu | unsupported=%llu db=%zu nvapi_state=%llu dedupe=%llu held=%llu slow: dedupe=%llu held=%llu",
+             g_creates, g_lib_loads, g_known_hits, g_tuple_hits, g_slow_known, g_slow_tuple, g_slow_unknown, g_repeats, g_slow_repeats, g_unsupported, g_keys.size(), g_nv_creates,
+             g_dd_hits.load(), g_dd_held.load(), g_dd_hits_slow.load(), g_dd_held_slow.load());
     }
 }
 
@@ -2931,7 +2944,130 @@ static HRESULT STDMETHODCALLTYPE hk_rs(ID3D12Device* dev, UINT mask, const void*
 
 static thread_local Hash t_asked;  // the key of the game's create in flight on this thread (zero: none, or not recordable)
 
-template <class F> static HRESULT timed_create(ID3D12Device* dev, void** pp, Writer& w, F&& call, bool lib = false) {
+static std::wstring cfg(const wchar_t* var, const wchar_t* key, const wchar_t* def);
+template <class T> static void patch(void** vt, int slot, void* hook, T& orig);
+
+// Re-create dedupe: a create identical to one made before on the same device, of a pipeline nothing but us holds any more,
+// gets that object back (QueryInterface, so AddRef'd and in the interface asked for) with no driver call. On NVIDIA from
+// 621 such re-creates stall together, all creating threads for ~50 ms every ~2 s in a game that re-creates 40% of its
+// PSOs. The key is the record key plus what the record leaves out: the device, the root signature object, the NVAPI state
+// and the CachedPSO blob. Never with a layer under our hooks (a mod's d3d12.dll, a wrapping layer): a hit would skip it.
+// SCSKILLER_DEDUPE / ini dedupe=: 0 off, 1 on, unset: on for NVIDIA. SCSKILLER_DEDUPE_MAX: objects kept (default 4096).
+// Private data other than a name on a kept object turns it off for the process: a layer's destruction callback
+// (ReShade's SetPrivateDataInterface) would fire while the object lives on, or reach the next holder.
+struct Dd { ID3D12PipelineState* o; std::list<Hash>::iterator at; };
+static std::mutex g_ddmx;  // map and LRU only: nothing under it calls out but D3D12Core's own AddRef
+static std::unordered_map<Hash, Dd, HashH> g_dd;
+static std::unordered_map<void*, Hash> g_dd_obj;  // kept object -> its key
+static std::list<Hash> g_ddlru;                   // front: least recently asked for
+static std::atomic<int> g_dd_mode{2};             // 0 off, 1 on, -1 NVIDIA only, 2 not read yet
+static std::atomic<bool> g_dd_layer;              // a layer's device is under our hooks (hook_below)
+static size_t g_dd_cap = 4096;
+static void** g_pso_vt;  // the PSO vtable whose private-data methods are hooked: only its objects are kept
+
+using PFN_SetPD = HRESULT(STDMETHODCALLTYPE*)(ID3D12Object*, REFGUID, UINT, const void*);
+using PFN_SetPDI = HRESULT(STDMETHODCALLTYPE*)(ID3D12Object*, REFGUID, const IUnknown*);
+enum { OBJ_SETPD = 4, OBJ_SETPDI = 5 };  // ID3D12Object, vtslots.cpp checks these
+static PFN_SetPD o_setpd;
+static PFN_SetPDI o_setpdi;
+
+static void dd_drop(std::unordered_map<Hash, Dd, HashH>::iterator it, std::vector<ID3D12PipelineState*>& out) {
+    out.push_back(it->second.o), g_dd_obj.erase(it->second.o), g_ddlru.erase(it->second.at), g_dd.erase(it);
+}
+static void dd_flush() {
+    std::vector<ID3D12PipelineState*> v;
+    {
+        std::lock_guard l(g_ddmx);
+        while (!g_dd.empty()) dd_drop(g_dd.begin(), v);
+    }
+    for (auto* o : v) o->Release();  // outside the lock: a PSO's teardown is the driver's
+}
+static void dd_private(void* o, REFGUID g) {
+    if (g == WKPDID_D3DDebugObjectName || g == WKPDID_D3DDebugObjectNameW || g_dd_mode == 0) return;
+    {
+        std::lock_guard l(g_ddmx);
+        if (!g_dd_obj.count(o)) return;
+    }
+    if (g_dd_mode.exchange(0) != 0) logf("dedupe: off, the game or a layer gave a pipeline private data");
+    dd_flush();
+}
+static HRESULT STDMETHODCALLTYPE hk_setpd(ID3D12Object* o, REFGUID g, UINT n, const void* p) { return dd_private(o, g), o_setpd(o, g, n, p); }
+static HRESULT STDMETHODCALLTYPE hk_setpdi(ID3D12Object* o, REFGUID g, const IUnknown* p) { return dd_private(o, g), o_setpdi(o, g, p); }
+
+static bool dd_on() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::wstring v = cfg(L"SCSKILLER_DEDUPE", L"dedupe", L"");
+        // a selftest host measures the driver's own re-creates: only when asked
+        bool host = GetProcAddress(GetModuleHandleW(nullptr), "SCSKiller_WarmHost") != nullptr;
+        int m = v == L"0" ? 0 : v == L"1" ? 1 : host ? 0 : -1;
+        if (wchar_t c[16]; env(L"SCSKILLER_DEDUPE_MAX", c) && _wtoi(c) >= 0) g_dd_cap = _wtoi(c);
+        int was = 2;
+        g_dd_mode.compare_exchange_strong(was, m);
+        logf("dedupe: %s, up to %zu kept", g_next || g_dd_layer ? "off (a layer is under the hooks)" : m == 0 ? "off" : m == 1 ? "on"
+                                           : g_ov_nvidia ? "on (NVIDIA)" : "off (not NVIDIA)", g_dd_cap);
+    });
+    int m = g_dd_mode;
+    return !g_next && !g_dd_layer && (m > 0 || (m < 0 && g_ov_nvidia));
+}
+
+static thread_local int t_dd;  // this create: 1 a dedupe hit, 2 its kept pipeline was still held
+template <class F> static HRESULT dd_create(ID3D12Device* dev, const Writer& w, const Hash& rk, REFIID riid, void** pp, F& call) {
+    if (rk == kZero || w.no_dedupe || !dd_on()) return call();
+    const Hash blob = w.cached.pCachedBlob && w.cached.CachedBlobSizeInBytes ? sha1(w.cached.pCachedBlob, w.cached.CachedBlobSizeInBytes) : kZero;
+    char b[20 + 2 * sizeof(void*) + sizeof(NvExt) + 4 + 20];
+    char* e = b;
+    for (auto [p, n] : {std::pair<const void*, size_t>{rk.data(), 20}, {&dev, sizeof dev}, {&w.rsp, sizeof w.rsp}, {&w.nv, sizeof w.nv},
+                        {&w.rast, 4}, {blob.data(), 20}})
+        memcpy(e, p, n), e += n;
+    const Hash k = sha1(b, e - b);
+    ID3D12PipelineState* pin = nullptr;
+    bool free = false;
+    t_dd = 0;
+    {
+        std::lock_guard l(g_ddmx);
+        if (auto it = g_dd.find(k); it != g_dd.end()) {
+            pin = it->second.o;
+            // ours + this pin: no holder left, so it's never shared with one. Claimed here: a second hit counts this pin.
+            free = pin->AddRef() == 2;
+            g_ddlru.splice(g_ddlru.end(), g_ddlru, it->second.at);
+        }
+    }
+    if (pin) {
+        // a removed device's create must fail as the driver's would: the game's recovery starts there
+        HRESULT hr = free && dev->GetDeviceRemovedReason() == S_OK ? pin->QueryInterface(riid, pp) : E_NOINTERFACE;
+        pin->Release();
+        if (SUCCEEDED(hr)) return t_dd = 1, ++g_dd_hits, hr;
+        if (!free) t_dd = 2, ++g_dd_held;
+    }
+    HRESULT hr = call();
+    ID3D12PipelineState* o = nullptr;
+    if (FAILED(hr) || !*pp || FAILED(((IUnknown*)*pp)->QueryInterface(IID_PPV_ARGS(&o)))) return hr;
+    std::vector<ID3D12PipelineState*> drop;
+    {
+        std::lock_guard l(g_ddmx);
+        if (!g_pso_vt) {
+            // only D3D12Core's own pipelines: one count for the whole object, which the claim's AddRef reads
+            void** vt = *(void***)o;
+            HMODULE m = nullptr;
+            wchar_t name[MAX_PATH] = {};
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)vt, &m);
+            if (m) GetModuleFileNameW(m, name, MAX_PATH);
+            const wchar_t* base = wcsrchr(name, L'\\');
+            if (base && !_wcsicmp(base + 1, L"D3D12Core.dll")) patch(vt, OBJ_SETPD, (void*)hk_setpd, o_setpd), patch(vt, OBJ_SETPDI, (void*)hk_setpdi, o_setpdi);
+            if (vt[OBJ_SETPD] == (void*)hk_setpd && vt[OBJ_SETPDI] == (void*)hk_setpdi) g_pso_vt = vt;
+            else g_dd_mode = 0, logf("dedupe: off, the pipelines aren't D3D12Core's own or their private data methods couldn't be hooked");
+        }
+        // a holder still has the kept one, or another thread made the same at once: the first stays
+        if (!g_pso_vt || *(void***)o != g_pso_vt || g_dd_mode == 0 || g_dd.count(k)) drop.push_back(o);
+        else g_dd[k] = {o, g_ddlru.insert(g_ddlru.end(), k)}, g_dd_obj[o] = k;
+        while (g_dd.size() > g_dd_cap) dd_drop(g_dd.find(g_ddlru.front()), drop);
+    }
+    for (auto* x : drop) x->Release();
+    return hr;
+}
+
+template <class F> static HRESULT timed_create(ID3D12Device* dev, void** pp, Writer& w, F&& call, bool lib = false, const IID* riid = nullptr) {
     if (t_in || !pp) return call();
     t_in = true;
     on_first_pso(dev);
@@ -2941,10 +3077,12 @@ template <class F> static HRESULT timed_create(ID3D12Device* dev, void** pp, Wri
     // tests: a create that takes this long, as a cold compile does on a GPU (WARP compiles in about a millisecond)
     static const bool host = GetProcAddress(GetModuleHandleW(nullptr), "SCSKiller_WarmHost") != nullptr;
     if (wchar_t v[16]; host && env(L"SCSKILLER_TEST_CREATE_MS", v)) Sleep(_wtoi(v));
-    HRESULT hr = call();
+    t_dd = 0;
+    HRESULT hr = riid ? dd_create(dev, w, t_asked, *riid, pp, call) : call();
     t_asked = kZero;
     // a chained mod's create reaches hk_*_below, whose recording is ours, not the driver's: proxy_ms, not ms
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - t_below_ms;
+    if (ms >= 10 && t_dd) ++(t_dd == 1 ? g_dd_hits_slow : g_dd_held_slow);
     if (SUCCEEDED(hr)) note(w, ms, lib, std::chrono::duration<double, std::milli>(t0 - w.t0).count() + t_below_ms);  // a failed library load is a miss: the game creates it next
     t_in = false;
     return hr;
@@ -2952,18 +3090,18 @@ template <class F> static HRESULT timed_create(ID3D12Device* dev, void** pp, Wri
 
 static HRESULT STDMETHODCALLTYPE hk_gfx(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** pp) {
     Writer w{'G'};
-    if (!t_in && pp) io_gfx(w, const_cast<D3D12_GRAPHICS_PIPELINE_STATE_DESC&>(*d));
-    return timed_create(dev, pp, w, [&] { return o_gfx(dev, d, riid, pp); });
+    if (!t_in && pp) io_gfx(w, const_cast<D3D12_GRAPHICS_PIPELINE_STATE_DESC&>(*d)), w.cached_pso(d->CachedPSO);
+    return timed_create(dev, pp, w, [&] { return o_gfx(dev, d, riid, pp); }, false, &riid);
 }
 static HRESULT STDMETHODCALLTYPE hk_cs(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID riid, void** pp) {
     Writer w{'C'};
-    if (!t_in && pp) io_cs(w, const_cast<D3D12_COMPUTE_PIPELINE_STATE_DESC&>(*d));
-    return timed_create(dev, pp, w, [&] { return o_cs(dev, d, riid, pp); });
+    if (!t_in && pp) io_cs(w, const_cast<D3D12_COMPUTE_PIPELINE_STATE_DESC&>(*d)), w.cached_pso(d->CachedPSO);
+    return timed_create(dev, pp, w, [&] { return o_cs(dev, d, riid, pp); }, false, &riid);
 }
 static HRESULT STDMETHODCALLTYPE hk_stream(ID3D12Device2* dev, const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID riid, void** pp) {
     Writer w{'S'};
     if (!t_in && pp) write_stream(w, *d);
-    return timed_create(dev, pp, w, [&] { return o_stream(dev, d, riid, pp); });
+    return timed_create(dev, pp, w, [&] { return o_stream(dev, d, riid, pp); }, false, &riid);
 }
 
 // A created state object's identity -> its record key, so records that build on it (links, additions) can name it.
@@ -3690,6 +3828,7 @@ static void hook_below(ID3D12Device* dev, const char* layer) {
     if (vt == g_hooked_vt) logf("below: the %s returned the system device itself: its creates are recorded as the game's", layer);
     else {
         logf("below: device %p vtable %p under the %s", (void*)dev, (void*)vt, layer);
+        g_dd_layer = true;
         auto put_below = [&](void** t, int slot, void* hook, auto& orig) {
             // the mod handed the game this interface of the system device: the game's hook is already there and records it
             if (t[slot] == (void*)hk_gfx || t[slot] == (void*)hk_cs || t[slot] == (void*)hk_rs || t[slot] == (void*)hk_stream) return;
@@ -4861,6 +5000,7 @@ static HRESULT device_created(HRESULT hr, IUnknown* adapter, D3D_FEATURE_LEVEL f
 
 extern "C" HRESULT WINAPI Proxy_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** pp) {
     if (!real_CreateDevice) return E_NOTIMPL;  // loaded as d3d11.dll
+    if (pp) dd_flush();  // our refs keep a released device alive, and the runtime hands out a live device again
     static std::once_flag once;
     std::call_once(once, [] {
         if (!(g_debug12 = GetEnvironmentVariableW(L"SCSKILLER_D3D12_DEBUG", nullptr, 0) > 0)) return;
@@ -4911,6 +5051,7 @@ static HRESULT STDMETHODCALLTYPE hk_factory_createdevice(ID3D12DeviceFactory* f,
     for (int i = 0, n = g_nfacvt.load(std::memory_order_acquire); i < n && !o; ++i)
         if (g_facvt[i].vt == vt) o = g_facvt[i].orig;
     if (!o) return E_FAIL;  // unreachable: only a vtable in the table points here
+    if (pp) dd_flush();
     return device_created(o(f, adapter, fl, riid, pp), adapter, fl, pp);
 }
 static void hook_factory(IUnknown* unk) {
@@ -4969,7 +5110,7 @@ extern "C" void WINAPI SCSKiller_StartWarm(IUnknown* unk) {
 extern "C" void WINAPI SCSKiller_WarmOptions(int threads, BOOL idle, uint64_t start) {
     g_staged = true;
     if (threads > 0) g_threads = threads;
-    g_prio = idle ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_BELOW_NORMAL;
+    g_prio = idle ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_ABOVE_NORMAL;  // in the child's below-normal class: base 7, below-normal as in a normal one
     g_start = start;
 }
 

@@ -10,6 +10,7 @@
 //                  [--ags <amd_ags_x64.dll> --ags-app <name> --ags-engine <name>] [--pass K] [--layer <folder>]
 //                  [--d3d12 <the game's Agility SDK folder>] [--d3d11 <the game's d3d11.dll>]
 //                  [--aftermath <the game's GFSDK_Aftermath_Lib.x64.dll> --aftermath-init <version>,<features>,<apis>,<dump flags>]
+//                  [--d3dscache-noflush 1]
 //
 // Protocol (JSON lines on stdout, exit codes): ARCHITECTURE.md. Stages <workdir>\stage-<pid>-<n>\<exe name> (a new folder
 // of this run's) + d3d12.dll (the proxy) + the dbs and runs that copy (the child), which prints the JSON. The caller only
@@ -31,6 +32,9 @@
 // as the game does, crash dumps (apis 0: none) before its device and DX12_Initialize on it, since with crash dumps on its
 // GenerateShaderDebugInfo (0x8) puts every pipeline under another driver cache key; if that fails it says why on stderr
 // and compiles without it.
+// --d3dscache-noflush 1: the child's d3dscache.dll (NVIDIA from 621 keeps compiled pipelines in its SQLite dbs) skips its
+// FlushFileBuffers while it creates, since those fsyncs under its writer lock cap the compile; they flush again before the
+// exit's checkpoint.
 #define NOMINMAX
 #include <windows.h>
 #include <d3d12.h>
@@ -44,6 +48,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <atomic>
 #include <vector>
 #include "warm_items.h"
 
@@ -95,6 +100,7 @@ struct Opts {
     uint32_t am[4] = {};         // version, feature flags, crash dump apis, crash dump flags
     UINT sdk = 0;                // set by the parent for its child: the staged D3D12Core.dll's SDK version
     int pass = -1;
+    bool ds_noflush = false;
 };
 
 static bool parse(int argc, wchar_t** argv, int i, Opts& o) {
@@ -114,6 +120,7 @@ static bool parse(int argc, wchar_t** argv, int i, Opts& o) {
         else if (k == L"--ags-app") o.ags_app = v;
         else if (k == L"--ags-engine") o.ags_engine = v;
         else if (k == L"--pass") o.pass = (int)wcstol(v.c_str(), &end, 10);
+        else if (k == L"--d3dscache-noflush") o.ds_noflush = v == L"1";
         else if (k == L"--layer") o.layer = v;
         else if (k == L"--d3d12") o.d3d12 = v;
         else if (k == L"--d3d11") o.d3d11 = v;
@@ -293,6 +300,33 @@ static std::wstring aftermath_init(const Opts& o, ID3D12Device* dev) {
 }
 
 // runs as <game exe name>; exit 0 = done printed, 1 = error printed, 3 = retry printed (a new process goes on from there)
+static std::atomic<bool> g_ds_noflush{false};
+static void* g_ds_flush;
+// A process that dies keeps what it wrote (the OS has it), only a crash of Windows itself may lose the unflushed tail.
+static BOOL WINAPI ds_flush(HANDLE f) { return g_ds_noflush || ((decltype(&FlushFileBuffers))g_ds_flush)(f); }
+
+// Points d3dscache.dll's FlushFileBuffers import at ds_flush; why not, empty when it did.
+static std::wstring ds_noflush() {
+    auto base = (BYTE*)LoadLibraryExW(L"d3dscache.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!base) return L"no d3dscache.dll";
+    auto& dir = ((IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew))->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    for (auto d = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); dir.Size && d->Name; ++d) {
+        if (!d->OriginalFirstThunk) continue;
+        auto slot = (IMAGE_THUNK_DATA*)(base + d->FirstThunk);
+        for (auto name = (IMAGE_THUNK_DATA*)(base + d->OriginalFirstThunk); name->u1.AddressOfData; ++name, ++slot) {
+            if (IMAGE_SNAP_BY_ORDINAL(name->u1.Ordinal) || strcmp(((IMAGE_IMPORT_BY_NAME*)(base + name->u1.AddressOfData))->Name, "FlushFileBuffers")) continue;
+            DWORD was;
+            if (!VirtualProtect(&slot->u1.Function, sizeof slot->u1.Function, PAGE_READWRITE, &was)) return L"its import table can't be written";
+            g_ds_flush = (void*)slot->u1.Function;
+            g_ds_noflush = true;
+            slot->u1.Function = (ULONG_PTR)ds_flush;
+            VirtualProtect(&slot->u1.Function, sizeof slot->u1.Function, was, &was);
+            return L"";
+        }
+    }
+    return L"d3dscache.dll imports no FlushFileBuffers";
+}
+
 static int child(DWORD parent_pid, const Opts& o) {
     for (int fd : {1, 2}) {  // a packaged child's output goes through the parent's pipes
         HANDLE h = CreateFileW(pipe_name(parent_pid, fd).c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -300,13 +334,17 @@ static int child(DWORD parent_pid, const Opts& o) {
         SetStdHandle(fd == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE, h);
         _dup2(_open_osfhandle((intptr_t)h, _O_WRONLY), fd);
     }
-    if (o.idle) SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
+    SetPriorityClass(GetCurrentProcess(), o.idle ? IDLE_PRIORITY_CLASS : BELOW_NORMAL_PRIORITY_CLASS);  // the driver's own compile threads start at the class's normal
     HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, parent_pid), beat_map = OpenFileMappingW(FILE_MAP_READ, FALSE, beat_name(parent_pid).c_str());
     wchar_t self[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     std::wstring dir = self, exe = dir.substr(dir.find_last_of(L'\\') + 1);
     dir.resize(dir.size() - exe.size());
     SetEnvironmentVariableW(L"SCSKILLER_MODE", L"warm");
+    if (o.ds_noflush) {
+        std::wstring why = ds_noflush();
+        if (!why.empty()) fwprintf(stderr, L"D3DSCache flushes stay on, so the compile runs at normal speed: %ls\n", why.c_str());
+    }
     D3D12SDKVersion = o.sdk;  // before the proxy loads the system d3d12.dll
     HMODULE m = LoadLibraryW((dir + L"d3d12.dll").c_str());
     auto proc = [m](const char* n) { return m ? (void*)GetProcAddress(m, n) : nullptr; };
@@ -407,6 +445,7 @@ static int child(DWORD parent_pid, const Opts& o) {
         emit("{\"event\":\"progress\",\"done\":%llu,\"total\":%llu,\"failed\":%llu,\"driverSkipped\":%llu,\"rate\":%.1f,\"workers\":%u,\"threads\":%u}", p[0], p[1], p[2],
              s[0], (p[0] - first) * 1000.0 / (now - t0), w[0], w[1]);
     }
+    g_ds_noflush = false;  // d3dscache's checkpoints from here on, its last at exit too, reach the disk
     uint64_t r[5];  // needed, from, ray tracing threads, failed before from, the item that failed alone (~0: none)
     retry(r);
     skipped(s);
@@ -426,8 +465,9 @@ static int child(DWORD parent_pid, const Opts& o) {
     if (p[0] < p[1] && !stopping) return fail(L"replay aborted after repeated faults, see stage\\scskiller.log");
     // stopped poisoned: items after the first unfinished one may be done, so it resumes from that one, not from the count
     const uint64_t done = r[0] ? r[1] : p[0], failed = r[0] ? r[3] : p[2], skips = r[0] ? s[1] : s[0];
-    emit("{\"event\":\"done\",\"done\":%llu,\"total\":%llu,\"failed\":%llu,\"driverSkipped\":%llu,\"seconds\":%.1f,\"stopped\":%s,\"crashed\":[%s]}", done, p[1], failed,
-         skips, (GetTickCount64() - t0) / 1000.0, done < p[1] ? "true" : "false", crashed);
+    // noflush: d3dscache.dll's flushes were skipped while it created (ds_noflush hooked them)
+    emit("{\"event\":\"done\",\"done\":%llu,\"total\":%llu,\"failed\":%llu,\"driverSkipped\":%llu,\"seconds\":%.1f,\"stopped\":%s,\"crashed\":[%s],\"noflush\":%s}", done,
+         p[1], failed, skips, (GetTickCount64() - t0) / 1000.0, done < p[1] ? "true" : "false", crashed, g_ds_flush ? "true" : "false");
     if (final_event) SetEvent(final_event);
     return 0;  // a normal exit: the driver writes its cache now
 }
@@ -443,7 +483,8 @@ int wmain(int argc, wchar_t** argv) {
               "                      [--skip-keys <sha1 hex>,...|@<file>] [--isolate i,j,...]\n"
               "                      [--ags <amd_ags_x64.dll> --ags-app <name> --ags-engine <name>] [--pass K]\n"
               "                      [--layer <folder>] [--d3d12 <folder>] [--d3d11 <dll>]\n"
-              "                      [--aftermath <dll> --aftermath-init <version>,<features>,<apis>,<dump flags>]\n", stderr);
+              "                      [--aftermath <dll> --aftermath-init <version>,<features>,<apis>,<dump flags>]\n"
+              "                      [--d3dscache-noflush 1]\n", stderr);
         return fail(L"bad arguments");
     }
     std::wstring work = argv[1], exe = argv[2];

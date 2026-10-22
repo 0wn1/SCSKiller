@@ -134,11 +134,13 @@ public sealed class ReEngineReader(string dataDir, Func<string, string?>? downlo
         if (paks.Error != null) throw new InvalidDataException(paks.Error);
         var final = paks.Final().ToList();
         int encrypted = 0, unreadable = 0;
-        var files = final.AsParallel().WithCancellation(ct).Where(f =>
+        var shaderFiles = new ConcurrentBag<(RePak Pak, int Index)>();
+        Parallel.ForEach(final, ReaderLoops.Options(ct), f =>
         {
-            if (f.Pak.Entries[f.Index].Encryption != 0) { Interlocked.Increment(ref encrypted); return false; }
-            return Magic(f.Pak, f.Index) is { } m && ShaderMagics.Contains(m);
-        }).ToList();
+            if (f.Pak.Entries[f.Index].Encryption != 0) Interlocked.Increment(ref encrypted);
+            else if (Magic(f.Pak, f.Index) is { } m && ShaderMagics.Contains(m)) shaderFiles.Add(f);
+        });
+        var files = shaderFiles.ToList();
         var probed = sw.Elapsed.TotalSeconds;
 
         var locs = new ConcurrentDictionary<string, Loc>();
@@ -148,7 +150,7 @@ public sealed class ReEngineReader(string dataDir, Func<string, string?>? downlo
         long bytes = 0, containers = 0, bad = 0;
         // ponytail: one decompressed material file per worker in memory (PRAGMATA: 5 MB average); cap the parallelism if a
         // title ships material files in the hundreds of MB
-        Parallel.ForEach(files, new ParallelOptions { TaskScheduler = TaskScheduler.Current, CancellationToken = ct }, f =>
+        Parallel.ForEach(files, ReaderLoops.Options(ct), f =>
         {
             byte[] data;
             try { data = f.Pak.Read(f.Pak.Entries[f.Index]); }

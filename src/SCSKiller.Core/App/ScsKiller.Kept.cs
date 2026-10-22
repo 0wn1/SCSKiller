@@ -144,11 +144,12 @@ public sealed partial class ScsKiller
     void ShowKept(string gameId)
     {
         var kept = KeptState(gameId);
-        var disk = Store.LoadGame(gameId).CacheKeys is { Count: > 0 } keys && AppCache != null ? AppCache.SizeOf(keys) : (long?)null;
+        var rec = Store.LoadGame(gameId);
+        var (disk, windows) = (rec.CacheKeys is { Count: > 0 } keys && AppCache != null ? AppCache.SizeOf(keys) : (long?)null, Games.FirstOrDefault(x => x.Game.Id == gameId) is { } listed ? WindowsCacheOf(listed.Game, rec) : null);
         GameState? state = null;
         lock (_lock)
-            if (_games.FindIndex(x => x.Game.Id == gameId) is var i and >= 0 && (_games[i].Kept != kept || _games[i].CacheOnDisk != disk))
-                _games[i] = state = _games[i] with { Kept = kept, CacheOnDisk = disk };
+            if (_games.FindIndex(x => x.Game.Id == gameId) is var i and >= 0 && (_games[i].Kept != kept || _games[i].CacheOnDisk != disk || _games[i].WindowsCache != windows))
+                _games[i] = state = _games[i] with { Kept = kept, CacheOnDisk = disk, WindowsCache = windows };
         if (state != null) GameChanged?.Invoke(state);
     }
 

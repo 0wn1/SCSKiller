@@ -77,14 +77,33 @@ public sealed unsafe class NvidiaBackend : IGpuVendorBackend, IRefreshableGpu
         RtCacheGranularity: RtCacheGranularity.Collection,   // selftest dxr: collections cached on their own; Jedi's recorded ones 42.7 -> 3.35 ms after synthesized ones
         PackageKeyed: true);
 
-    public static string CacheDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NVIDIA", "DXCache");
+    /// <summary>The D3D cache folder the driver writes: %LOCALAPPDATA%\NVIDIA\DXCache, or older drivers' folder below LocalLow
+    /// (<see cref="NvidiaAppCache.LegacyTail"/>) when it holds the newest file. No driver setting names the folder.
+    /// SCSKILLER_TEST_APPDATA: a test run's stand-in for %USERPROFILE%\AppData.</summary>
+    public static string CacheDir
+    {
+        get
+        {
+            var test = Environment.GetEnvironmentVariable("SCSKILLER_TEST_APPDATA") is { Length: > 0 } t ? t : null;
+            var local = test != null ? Path.Combine(test, "Local") : Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var current = Path.Combine(local, "NVIDIA", "DXCache");
+            var legacy = Path.Combine([test != null ? Path.Combine(test, "LocalLow") : local + "Low", .. NvidiaAppCache.LegacyTail]);
+            return Newest(legacy) > Newest(current) ? legacy : current;
+        }
+    }
+
+    static DateTime Newest(string dir) => AppCacheFiles.Readable(dir)
+        ? new DirectoryInfo(dir).EnumerateFiles("*", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint })
+            .Max(f => (DateTime?)f.LastWriteTimeUtc) ?? default
+        : default;
 
     /// <summary>The DXCache's per-application files.</summary>
+    // ponytail: the folder is picked once, so a driver update that moves it shows after a restart
     public NvidiaAppCache AppCache { get; } = new(CacheDir);
     IAppCache? IGpuVendorBackend.AppCache => AppCache;
 
-    public CacheUsage GetCacheUsage() => new(CacheDir, AppCacheFiles.Readable(CacheDir)
-        ? new DirectoryInfo(CacheDir).EnumerateFiles("*", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true }).Sum(f => f.Length)
+    public CacheUsage GetCacheUsage() => new(AppCache.Dir, AppCacheFiles.Readable(AppCache.Dir)
+        ? new DirectoryInfo(AppCache.Dir).EnumerateFiles("*", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true }).Sum(f => f.Length)
         : 0, UpperBound: true);
 
     /// <summary>The setting id plus its raw value in the base profile (null = not set there = driver default).</summary>

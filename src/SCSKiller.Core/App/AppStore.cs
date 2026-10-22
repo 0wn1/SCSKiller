@@ -39,7 +39,20 @@ public sealed class GameRecord
     public string? D3DSCacheFolder { get; set; }            // the game's own D3DSCache folder (named by its exe path), found again once emptied
     public string? D3DSCacheExe { get; set; }               // the exe path that folder's dbs name
     public bool WarmedD3DSCache { get; set; }               // the last complete warm's D3DSCache dbs were kept, not deleted
+    public Dictionary<string, long>? WarmedD3DSCacheBytes { get; set; }   // NVIDIA: the game's D3DSCache dbs and their lengths after that warm's fold; null = not recorded
+    public DateTimeOffset? WarmedD3DSCacheAt { get; set; }  // ...when they were read: a db made after it holds none of the warm's
     public string? D3DSCacheMade { get; set; }              // the D3DSCache folder SCSKiller made before the game's first run
+    public DateTime? D3DSCacheSince { get; set; }           // staged warms' runtime cache folders made since then aren't folded yet
+    public bool D3DSCacheDamaged { get; set; }              // a staged db failed SQLite's check at the fold: compile again
+    public IdentityStamp? D3DSCacheStamp { get; set; }      // the identity the last fold that put dbs in stamped, and why (outcome reports)
+    public DateTimeOffset? D3DSCacheStampAt { get; set; }   // ...when
+    public string? D3DSCacheStampFolder { get; set; }       // ...in which D3DSCache folder (a made one before the game named it)
+    public IdentityReport? D3DSCacheLaunch { get; set; }    // that stamp and the game's adapter db identity at the exit of the first run after the warm's fold
+    public DateTimeOffset? D3DSCacheLaunchAt { get; set; }  // ...the D3DSCacheStampAt it was read for
+    public FoldKeys? D3DSCacheFoldKeys { get; set; }       // NVIDIA: the game's adapter db right after the fold that put the last complete warm's dbs in
+    public HitCheck? HitCheck { get; set; }                 // the first run after that fold, read at its exit (outcome reports)
+    public DateTimeOffset? HitCheckAt { get; set; }         // ...the D3DSCacheFoldKeys.At it was read for
+    public PlayWindow? HitCheckRun { get; set; }           // ...the run it was read at the exit of: a csv report carries it only for that launch
     public long ResumeAt { get; set; }                       // Done of a stopped warm of the current plan
     public long ResumeItems { get; set; }                    // items the stopped segments of that warm created...
     public double ResumeSeconds { get; set; }                // ...and their time: a complete warm's time and rate include them
@@ -63,7 +76,7 @@ public sealed class GameRecord
     public long? LastWarmDriverSkipped { get; set; }         // ...and items skipped for that compile (WarmResult.DriverSkipped)
     public long? LastWarmUnbuilt { get; set; }               // ...and D3D11 items SCSKiller can't build a draw for yet (ScsKiller.Unbuilt11)
     public HashSet<string> CrashKeys { get; set; } = [];     // record keys of items whose create removed the D3D12 device or faulted in the driver: every warm skips them
-    public string? CrashKeysDriver { get; set; }             // the driver they crashed (ScsKiller.DriverId): a warm on another driver clears them (one retry each)
+    public string? CrashKeysDriver { get; set; }             // the driver they crashed (ScsKiller.DriverId): a warm on another driver creates each alone first, the first that still crashes keeps them all
     public string? WarmedIndexHash { get; set; }
     public string? WarmedExeStamp { get; set; }             // exe size + write time at the warm: a game patch changes it
     public string? WarmedGameVersion { get; set; }          // Game.Version (store build id) at the warm; preferred over the exe stamp
@@ -71,6 +84,7 @@ public sealed class GameRecord
     public string? WarmedIndexStamp { get; set; }           // IEngineReader.IndexStamp when the warm's index was taken; null = ""
     public double? BytesPerPso { get; set; }                // measured by the last complete warm onto a cold cache (ScsKiller.ColdWarm)
     public double? PsoPerSecond { get; set; }               // ...and this
+    public string? PsoPerSecondDriver { get; set; }         // the driver it was measured on (GpuSnapshot.Id); null = WarmedDriverId
     public DateTimeOffset? RecordingImportedAt { get; set; }  // when an import last added records
     public string? RecordingInbox { get; set; }             // the game folder's scskiller.db (size:write ticks) when last imported
     public string? RecordingIndexHash { get; set; }         // the index build whose shaders the recording names by hash only; null: not checked since an import
@@ -84,6 +98,7 @@ public sealed class GameRecord
     public string? RunsExeBuild { get; set; }               // either changed, RunsExe is dropped
     public DateTimeOffset? RunsExeAt { get; set; }          // when the watcher last followed it: the launch it ran in wasn't recorded,
     public string? RunsExeWas { get; set; }                 // ...the recorder was stamped for this exe then
+    public bool RunsExeProven { get; set; }                 // ...an Unreal game's exe beside its Shipping exe that ran alone and made a device (ScsKiller.FollowUnrealOther)
     public string? RecorderMoveTo { get; set; }              // ...and the game's exe it moves next to: the uninstall hook's running check covers both
     public DateTimeOffset? RecorderGoneSince { get; set; }   // the scan that first saw the game uninstalled with the recorder still in its folder (ScsKiller.CleanUninstalled)
     // null = not migrated: the first reconcile makes an installed recorder of ours On (the user put it there), else Default
@@ -110,6 +125,9 @@ public sealed class GameRecord
     public DateTimeOffset? LaunchedExeSeenAt { get; set; }  // when LaunchedExeName was seen: a later sighting replaces it
     public string? WarmedExeName { get; set; }              // the name the last complete warm staged; null = the install's file name
     public bool WarmedAftermath { get; set; }               // NVIDIA: the last complete warm started Aftermath as the game does (NvAftermath.Of)
+    public string? AftermathRetry { get; set; }             // NVIDIA: "<driver id>|<exe>" of the last complete warm that tried Aftermath after a miss (NvAftermath.Retry): once per driver and exe, a guessed one (0xa) "<build>|<exe>": once per build
+    public long? AftermathPlainHits { get; set; }           // ...a guessed one: the hits of the plain compile's first launch, which its own first launch must beat; null once judged
+    public bool AftermathLost { get; set; }                 // ...it didn't: the next compile is plain (until a complete one)
     public string? WarmedAgsApp { get; set; }               // AMD: the AGS app name the last complete warm registered; null = a plain device
     public bool AgsMissed { get; set; }                     // a launch after such a warm showed it missed the game: warms stay plain until the game is seen holding the AGS key
     public string? AgsSeenApp { get; set; }                 // AMD: the AGS app name the game's own process registered (the recorder's #ags line); null = none seen
@@ -437,8 +455,9 @@ public sealed class AppStore(string dataDir)
     public void SaveNotified(Dictionary<string, string> notified) => Save(Path.Combine(DataDir, "notified.json"), notified);
 
     /// <summary>Vendor -> warm rate (PSO/s) of the first complete warm measured on this PC, for games not warmed yet.</summary>
-    public Dictionary<GpuVendor, double> LoadWarmRates() => Load<Dictionary<GpuVendor, double>>(Path.Combine(DataDir, "warmrates.json")) ?? [];
-    public void SaveWarmRates(Dictionary<GpuVendor, double> rates) => Save(Path.Combine(DataDir, "warmrates.json"), rates);
+    // keyed "<vendor>|<driver id>"; an earlier build's vendor-only keys are never read
+    public Dictionary<string, double> LoadWarmRates() => Load<Dictionary<string, double>>(Path.Combine(DataDir, "warmrates.json")) ?? [];
+    public void SaveWarmRates(Dictionary<string, double> rates) => Save(Path.Combine(DataDir, "warmrates.json"), rates);
 
     /// <summary>Update channel -> signed_at of the newest signed feed accepted (FeedTrust: no replay of an older feed).</summary>
     public Dictionary<string, DateTimeOffset> LoadFeedTimes() => Load<Dictionary<string, DateTimeOffset>>(Path.Combine(DataDir, "feeds.json")) ?? [];

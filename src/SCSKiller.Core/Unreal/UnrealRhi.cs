@@ -228,19 +228,46 @@ public static class UnrealRhi
     /// defaults it to 1). Aftermath's GenerateShaderDebugInfo with crash dumps puts every pipeline under another NVIDIA cache
     /// key, so a warm's entries never serve the game. The generic r.GPUCrashDebugging takes no part: false only defers to
     /// the Aftermath cvar (UE::RHI::ShouldEnableGPUCrashFeature), and games set it false in BaseEngine.ini. The launch options
-    /// override both as that function and InitializeBeforeDeviceCreation read them.
-    /// ponytail: Engine ini only; a device profile or the user's Engine.ini that turns it off isn't read.</summary>
-    public static bool AftermathShaderDebug(IReadOnlyDictionary<string, string> configs, string project, string launch = "")
+    /// override both as that function and InitializeBeforeDeviceCreation read them. The cvars count from [ConsoleVariables],
+    /// else [SystemSettings], else any [/Script/...] section, of the Engine ini hierarchy (<paramref name="configs"/>, which
+    /// may hold the install's loose files, <see cref="WithLoose"/>) and the user's Engine.ini and GameUserSettings.ini.
+    /// ponytail: a device profile that turns it off isn't read.</summary>
+    public static bool AftermathShaderDebug(IReadOnlyDictionary<string, string> configs, string project, string launch = "", string? userDir = null) =>
+        Aftermath(configs, project, launch, userDir).ShaderDebug;
+
+    /// <summary>The config or the launch options turn NVIDIA Aftermath off (<see cref="AftermathShaderDebug"/>'s sources).</summary>
+    public static bool AftermathOff(IReadOnlyDictionary<string, string> configs, string project, string launch = "", string? userDir = null) =>
+        !Aftermath(configs, project, launch, userDir).On;
+
+    static (bool On, bool ShaderDebug) Aftermath(IReadOnlyDictionary<string, string> configs, string project, string launch, string? userDir)
     {
-        var engine = Ordered(EngineIni, configs, project).ToList();
-        string? CVar(string key) => Last(engine, "ConsoleVariables", key) ?? Last(engine, "SystemSettings", key);
+        var user = UserConfig(userDir);
+        string User(string file) => user != null && File.Exists(Path.Combine(user, file)) ? File.ReadAllText(Path.Combine(user, file)).TrimStart('﻿') : "";
+        var engine = Ordered(EngineIni, configs, project).Append(User("Engine.ini")).Append(User("GameUserSettings.ini")).ToList();
+        string? CVar(string key) => Last(engine, "ConsoleVariables", key) ?? Last(engine, "SystemSettings", key)
+            ?? Last(engine, s => s.StartsWith("/Script/", StringComparison.OrdinalIgnoreCase), key);
         bool On(string key) => CVar(key) is { } v && IsOn(v);
         bool Param(string name) => Regex.IsMatch(launch, $@"(?:^|\s)-{name}(?![=\w])", RegexOptions.IgnoreCase);
         var aftermath = !Param("nogpucrashdebugging") && (Param("gpucrashdebugging") || !(CVar("r.GPUCrashDebugging.Aftermath") is { } v && IsOff(v)));
         if (Regex.Match(launch, @"(?:^|\s)-nvaftermath=(\d+)", RegexOptions.IgnoreCase) is { Success: true } m) aftermath = m.Groups[1].Value.Trim('0').Length > 0;
         else if (Param("nvaftermath")) aftermath = true;
-        return aftermath && (On("r.GPUCrashDebugging.Aftermath.DumpShaderDebugInfo") || On("r.GPUCrashDebugging.Aftermath.TrackAll")
-            || Param("nvAftermathDumpShaderDebugInfo") || Param("nvaftermathall"));
+        return (aftermath, aftermath && (On("r.GPUCrashDebugging.Aftermath.DumpShaderDebugInfo") || On("r.GPUCrashDebugging.Aftermath.TrackAll")
+            || Param("nvAftermathDumpShaderDebugInfo") || Param("nvaftermathall")));
+    }
+
+    /// <summary><paramref name="configs"/> with the Engine ini hierarchy's files the paks don't hold read from the install
+    /// under <paramref name="root"/> (the folder above the project's): the engine reads a loose file the paks lack.</summary>
+    internal static IReadOnlyDictionary<string, string> WithLoose(IReadOnlyDictionary<string, string> configs, string root, string project)
+    {
+        Dictionary<string, string>? all = null;
+        foreach (var rel in EngineIni.Select(p => p.Replace("{P}", project)).Where(p => !configs.Keys.Any(k => k.Equals(p, StringComparison.OrdinalIgnoreCase))))
+            try
+            {
+                var file = Path.Combine(root, rel);
+                if (File.Exists(file)) (all ??= new(configs, StringComparer.OrdinalIgnoreCase))[rel] = File.ReadAllText(file);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException) { }
+        return all ?? configs;
     }
 
     static bool IsOn(string v) => v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase);
@@ -354,7 +381,11 @@ public static class UnrealRhi
     };
 
     /// <summary>Last value of section/key over ini texts in priority order; section "*" = any section.</summary>
-    static string? Last(IEnumerable<string> inis, string section, string key)
+    static string? Last(IEnumerable<string> inis, string section, string key) =>
+        Last(inis, s => section == "*" || s.Equals(section, StringComparison.OrdinalIgnoreCase), key);
+
+    /// <summary>Last value of key over ini texts in priority order, in the sections <paramref name="section"/> accepts.</summary>
+    static string? Last(IEnumerable<string> inis, Func<string, bool> section, string key)
     {
         string? v = null;
         foreach (var text in inis)
@@ -365,7 +396,7 @@ public static class UnrealRhi
                 var line = raw.Trim();
                 if (line.StartsWith('[')) { cur = line.Trim('[', ']'); continue; }
                 var eq = line.IndexOf('=');
-                if (cur != null && eq > 0 && (section == "*" || cur.Equals(section, StringComparison.OrdinalIgnoreCase))
+                if (cur != null && eq > 0 && section(cur)
                     && line[..eq].Trim().Equals(key, StringComparison.OrdinalIgnoreCase)) v = line[(eq + 1)..].Trim().Trim('"');
             }
         }

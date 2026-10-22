@@ -96,6 +96,7 @@ public static class Format
             _ when s.CompileUnreached => "This game needs a custom loader",
             GameStatus.Warmed when r == ScsKiller.OverCacheLimitReason => "Too big for the shader cache",
             GameStatus.Warmed when r == ScsKiller.CacheFullReason => "Shader cache full",
+            _ when ScsKiller.NotReached(r) => "Not in the game's cache yet",
             GameStatus.Warmed when ScsKiller.IsPartlyCompiled(s) => Sentence(ScsKiller.PartlyCompiledNote(s)),
             GameStatus.Warmed when partly => $"Driver {s.WarmedDriverVersion} · {s.Careful!.LaunchCompiled * 100:0}% still compiled",
             GameStatus.Warmed when ScsKiller.RtAfterRecording(s) && s.NoStutter == null => s.RecorderInstalled ? "Recorder on: play with ray tracing"

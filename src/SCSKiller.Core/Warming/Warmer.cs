@@ -20,7 +20,7 @@ namespace SCSKiller.Core.Warming;
 /// <paramref name="DriverSkipped"/> (progress, retry and done, counted like Failed): <see cref="WarmResult.DriverSkipped"/>.</summary>
 public sealed record WarmEvent(string Event, long Done, long Total, long Failed, double Rate, double Seconds, bool Stopped, string? Message,
     long From = 0, int RtThreads = 0, long FailedItem = -1, string? Reason = null, IReadOnlyList<string>? Crashed = null, IReadOnlyList<long>? Isolate = null,
-    string? Stage = null, int Workers = 0, int Threads = 0, long DriverSkipped = 0, IReadOnlyList<long>? Skip = null)
+    string? Stage = null, int Workers = 0, int Threads = 0, long DriverSkipped = 0, IReadOnlyList<long>? Skip = null, bool NoFlush = false)
 {
     static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -97,6 +97,10 @@ public sealed class Warmer(IGpuVendorBackend vendor, string? warmExe = null) : I
         if (AgilityDir(game.ExePath) is { } d3d12) ags = [.. ags, "--d3d12", d3d12];
         if (DxvkDll(vendor.Vendor, game.ExePath) is { } d3d11) ags = [.. ags, "--d3d11", d3d11];
         if (vendor.Vendor == GpuVendor.Nvidia && Aftermath?.Invoke(game) is { } am) ags = [.. ags, .. AftermathArgs(vendor.Vendor, am, NvAftermath.DllFor(game))];
+        // read here: a packaged (Xbox) child doesn't get this process's environment
+        if (options.D3DSCacheNoFlush && System.Environment.GetEnvironmentVariable("SCSKILLER_WARM_NO_FLUSH_HOOK") is { Length: > 0 })
+            Log?.Report($"{game.Name}: D3DSCache flushes stay on, so the compile runs at normal speed: turned off (SCSKILLER_WARM_NO_FLUSH_HOOK)");
+        else if (options.D3DSCacheNoFlush) ags = [.. ags, "--d3dscache-noflush", "1"];
         return new WarmRun(vendor, gpu, exe, game, workDir, options, progress, StuckAfter, stagePath, MaxRecoveries, Environment, ags, Log);
     }
 
@@ -233,6 +237,8 @@ sealed class WarmRun : IWarmRun
         var clock = Stopwatch.StartNew();
         var stderr = new System.Collections.Concurrent.ConcurrentQueue<string>();
         var skipKeys = new HashSet<string>(o.SkipKeys ?? [], StringComparer.OrdinalIgnoreCase);
+        // old crashers each process creates alone first: the proxy passes over those behind its start or of another pass
+        IReadOnlyList<long> probing = [.. (o.Probe?.Values ?? []).Order()];
         var passes = WarmPasses.Read(workDir);
         var (pass, from) = passes?.Locate(o.StartAt) ?? (0, o.StartAt);
         long Whole(long done) => passes?.Overall(pass, done) ?? done;
@@ -277,7 +283,7 @@ sealed class WarmRun : IWarmRun
             p.BeginErrorReadLine();
             return p;
         }
-        _p = Launch(from, 0, [], []);
+        _p = Launch(from, 0, [], probing);
         Completion = Task.Run(async () =>
         {
             try { return await Run(); }
@@ -334,7 +340,7 @@ sealed class WarmRun : IWarmRun
                         (pass, n, note, removals) = (pass + 1, 0, null, 0);   // each pass gets its own recoveries
                         skip.Clear();
                         skipKeys.UnionWith(crashed);
-                        _p = Launch(0, 0, skip, []);
+                        _p = Launch(0, 0, skip, probing);
                     }
                     continue;
                 }
@@ -348,7 +354,7 @@ sealed class WarmRun : IWarmRun
                         // what ran before filled the Aftermath key only: the plain key starts from the first item
                         (pass, carried, carriedSkips, lastCarried, removals, knownSkips, note) = (0, 0, 0, false, 0, 0, null);
                         skip.Clear();
-                        _p = Launch(0, 0, skip, []);
+                        _p = Launch(0, 0, skip, probing);
                     }
                     continue;
                 }
@@ -358,6 +364,12 @@ sealed class WarmRun : IWarmRun
                 skip.AddRange(r.Skip ?? []);
                 var blamed = skipKeys.Count;
                 skipKeys.UnionWith(r.Crashed ?? []);   // a retry also lists the known keys it skipped
+                // an old crasher that still crashes ends the probe: all of them are skipped, none costs another reset
+                if (probing.Count > 0 && ((r.Crashed ?? []).Any(o.Probe!.ContainsKey) || (r.Skip ?? []).Append(r.FailedItem).Any(probing.Contains)))
+                {
+                    skipKeys.UnionWith(o.Probe.Keys);
+                    probing = [];
+                }
                 var removed = r.Reason is "removed" or "fault" or "died";
                 var hung = r.Reason == "hang";
                 var rtThreads = r.RtThreads;
@@ -397,7 +409,7 @@ sealed class WarmRun : IWarmRun
             return new WarmResult(outcome, Whole(last?.Done ?? from), passes?.Total ?? last?.Total ?? 0, failed, clock.Elapsed, growth,
                 Path.Combine(stage ?? Path.Combine(workDir, "stage"), "scskiller.log"), outcome == WarmOutcome.Failed ? error : null,
                 Crashed: crashed.Count > 0 ? crashed : null, DriverSkipped: skips, Resumable: resumable && outcome == WarmOutcome.Failed && _ended == null,
-                AftermathDropped: dropped);
+                AftermathDropped: dropped, D3DSCacheNoFlush: done is { Event: "done", NoFlush: true });
         }
     }
 

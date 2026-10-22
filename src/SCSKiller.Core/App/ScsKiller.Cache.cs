@@ -68,11 +68,12 @@ public sealed partial class ScsKiller
     public const string OtherApps = "Other apps and games", NoAppKey = "Files without an app key",
         CompileLeftovers = "Windows shader cache of earlier compiles";
 
-    static readonly (GpuVendor Vendor, string Label, string Folder)[] VendorFolders =
+    (GpuVendor Vendor, string Label, string Dir)[] VendorFolders() =>
     [
-        (GpuVendor.Nvidia, "NVIDIA DirectX", @"NVIDIA\DXCache"), (GpuVendor.Nvidia, "NVIDIA OpenGL and Vulkan", @"NVIDIA\GLCache"),
-        (GpuVendor.Amd, "AMD DirectX 12", @"AMD\DxcCache"), (GpuVendor.Amd, "AMD DirectX 11", @"AMD\DxCache"),
-        (GpuVendor.Amd, "AMD Vulkan", @"AMD\VkCache"), (GpuVendor.Amd, "AMD OpenGL", @"AMD\GLCache"),
+        (GpuVendor.Nvidia, "NVIDIA DirectX", Path.Combine(LocalAppData, @"NVIDIA\DXCache")), (GpuVendor.Nvidia, "NVIDIA OpenGL and Vulkan", Path.Combine(LocalAppData, @"NVIDIA\GLCache")),
+        (GpuVendor.Nvidia, "NVIDIA DirectX, older drivers", Path.Combine([LocalAppData + "Low", .. NvidiaAppCache.LegacyTail])),
+        (GpuVendor.Amd, "AMD DirectX 12", Path.Combine(LocalAppData, @"AMD\DxcCache")), (GpuVendor.Amd, "AMD DirectX 11", Path.Combine(LocalAppData, @"AMD\DxCache")),
+        (GpuVendor.Amd, "AMD Vulkan", Path.Combine(LocalAppData, @"AMD\VkCache")), (GpuVendor.Amd, "AMD OpenGL", Path.Combine(LocalAppData, @"AMD\GLCache")),
     ];
 
     public CacheInventory CacheInventory()
@@ -96,18 +97,30 @@ public sealed partial class ScsKiller
         }
 
         var oldBefore = OldDriverBefore(fresh: true);
-        string? KeyOf(FileInfo f, bool d3d12) => own == GpuVendor.Nvidia ? NvidiaAppCache.Key(f.Name) : AmdAppCache.Key(f.Name, d3d12);
+        string? KeyOf(FileInfo f, bool d3d12) => own == GpuVendor.Nvidia ? NvidiaAppCache.Key(f.Name) ?? NvidiaAppCache.LegacyKey(f.FullName) : AmdAppCache.Key(f.Name, d3d12);
         var shown = new List<CacheFolder>();
         foreach (var (label, dir, d3d12) in folders)
         {
             shown.Add(Read(dir, out var files) with { Label = label, Cap = AppCache is AmdAppCache amd && dir == amd.DxcDir ? AmdAppCache.DxcCacheCap : null });
+            var old = oldBefore != null ? OldDriverFiles(files, oldBefore) : [];
             foreach (var f in files)
             {
                 var key = KeyOf(f, d3d12);
                 var (kind, name, ids) = Owner(claims, key);
-                if (f.LastWriteTimeUtc < oldBefore) Add(CacheGroupKind.OldDriver, ids != null ? name : OtherApps, [f]);
+                if (old.Contains(f.FullName)) Add(CacheGroupKind.OldDriver, ids != null ? name : OtherApps, [f]);
                 else Add(kind, name, [f], ids);
             }
+        }
+
+        // a listed game's own D3DSCache folder is its cache, never an earlier compile's: shown here, deleted only by Clear cache
+        var gameD3ds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in Games)
+        {
+            var rec = Store.LoadGame(s.Game.Id);
+            // a kept or killed compile's staged folders wait for their fold (MergeD3DSCache): the game's, never leftovers
+            var unfolded = OperatingSystem.IsWindows() && rec.D3DSCacheSince is { } since
+                ? D3DSCache.Made(Path.Combine(LocalAppData, "D3DSCache"), WorkDirs(Store.GameDir(s.Game.Id)), since).SelectMany(D3DSCache.CacheFiles) : [];
+            Add(CacheGroupKind.Installed, s.Game.Name, GameD3DSCacheFiles(s.Game, rec).Concat(unfolded).Where(f => gameD3ds.Add(f.FullName)).ToList(), [s.Game.Id]);
         }
 
         var gamesDir = Path.Combine(Store.DataDir, "games");
@@ -115,13 +128,13 @@ public sealed partial class ScsKiller
         // ponytail: reads every D3DSCache WAL made since the games folder; cache the verdict per folder if that gets slow
         if (Directory.Exists(gamesDir))
             Add(CacheGroupKind.OldBuild, CompileLeftovers, D3DSCache.Made(Path.Combine(LocalAppData, "D3DSCache"), gamesDir,
-                Directory.GetCreationTimeUtc(gamesDir)).SelectMany(D3DSCache.CacheFiles));
+                Directory.GetCreationTimeUtc(gamesDir), RunningD3DSCache()).SelectMany(D3DSCache.CacheFiles).Where(f => !gameD3ds.Contains(f.FullName)));
 
         // the vendor's OpenGL and Vulkan caches: their files carry no key SCSKiller learns
         var read = folders.Select(f => GameFiles.DirKey(f.Item2)).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var (_, label, folder) in VendorFolders.Where(f => f.Vendor == own && !read.Contains(GameFiles.DirKey(Path.Combine(LocalAppData, f.Folder)))))
+        foreach (var (_, label, dir) in VendorFolders().Where(f => f.Vendor == own && !read.Contains(GameFiles.DirKey(f.Dir))))
         {
-            Read(Path.Combine(LocalAppData, folder), out var files, recurse: true);
+            Read(dir, out var files, recurse: true);
             Add(CacheGroupKind.Unattributed, label, files);
         }
 
@@ -129,9 +142,9 @@ public sealed partial class ScsKiller
         var gpus = (Adapters ?? GpuBackends.Adapters)().Select(a => a.Gpu.Vendor).ToHashSet();
         foreach (var vendor in new[] { GpuVendor.Nvidia, GpuVendor.Amd }.Where(v => v != own))
         {
-            foreach (var (_, label, folder) in VendorFolders.Where(f => f.Vendor == vendor))
+            foreach (var (_, label, dir) in VendorFolders().Where(f => f.Vendor == vendor))
             {
-                Read(Path.Combine(LocalAppData, folder), out var files, recurse: true);
+                Read(dir, out var files, recurse: true);
                 Add(CacheGroupKind.OtherVendor, label, files);
             }
             if (gpus.Contains(vendor)) note = $"This PC also has an {(vendor == GpuVendor.Nvidia ? "NVIDIA" : "AMD")} GPU. Apps that run on it use this cache.";
@@ -149,7 +162,7 @@ public sealed partial class ScsKiller
                     .OrderByDescending(p => p.Bytes).ToList(),
                 g.Key == CacheGroupKind.OtherVendor ? note : null))
             .ToList();
-        return new(shown, groups, oldBefore);
+        return new(shown, groups, oldBefore?.At);
     }
 
     /// <summary>Driver cache key -> the games that claim it: learned keys, on AMD the exe name's hash, and on NVIDIA every game
@@ -226,30 +239,57 @@ public sealed partial class ScsKiller
         return UninstalledExe(rec) is { Length: > 0 } exe ? $"{exe} ({folder})" : folder;
     }
 
-    sealed record OldBefore(string? DriverId, DateTime? At);
+    /// <summary>At: the cutoff (null = no Old driver group). Used: keys a compile or a game used under the current driver.</summary>
+    sealed record OldBefore(string? DriverId, DateTime? At, IReadOnlySet<string> Used);
     OldBefore? _oldBefore;
 
-    /// <summary>NVIDIA: files last written before this are an older driver's. The active driver's install time, bounded by
+    /// <summary>NVIDIA: files last written before At may be an older driver's. The active driver's install time, bounded by
     /// the earliest compile under it: a Windows upgrade or a reinstall of the same driver makes its DriverStore folder anew.
     /// Kept per driver unless <paramref name="fresh"/>.</summary>
-    DateTime? OldDriverBefore(bool fresh)
+    OldBefore? OldDriverBefore(bool fresh)
     {
         if (AppCache is not NvidiaAppCache) return null;
         var id = DriverId;
-        if (!fresh && _oldBefore is { } known && known.DriverId == id) return known.At;
+        if (!fresh && _oldBefore is { } known && known.DriverId == id) return known;
         var at = DriverInstalledAt();
-        foreach (var rec in Games.Select(s => Store.LoadGame(s.Game.Id)).Concat(UninstalledRecords(Games).Select(r => r.Rec)))
-            if (rec.WarmedDriverId != null && rec.WarmedDriverId == id && rec.WarmedAt?.UtcDateTime < at) at = rec.WarmedAt.Value.UtcDateTime;
-        _oldBefore = new(id, at);
-        return at;
+        var recs = Games.Select(s => s.Game).Concat(HiddenGames).Select(g => Store.LoadGame(g.Id)).Concat(UninstalledRecords(Games).Select(r => r.Rec)).ToList();
+        var warmed = recs.Where(r => r.WarmedDriverId != null && r.WarmedDriverId == id).ToList();
+        foreach (var rec in warmed)
+            if (rec.WarmedAt?.UtcDateTime < at) at = rec.WarmedAt.Value.UtcDateTime;
+        var used = warmed.SelectMany(r => r.WarmedKeys ?? r.CacheKeys)
+            .Concat(recs.Where(r => r.LastPlay is { } p && !(p.To.UtcDateTime < at)).SelectMany(r => r.GameKeys))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return _oldBefore = new(id, at, used);
     }
 
-    /// <summary>Bytes of the NVIDIA cache files an older driver wrote (the Cache page's Old driver group), read without the
-    /// rest of the inventory.</summary>
-    public long OldDriverBytes() =>
-        OldDriverBefore(fresh: false) is { } before && AppCache is NvidiaAppCache nv && AppCacheFiles.Readable(nv.Dir)
-            ? new DirectoryInfo(nv.Dir).EnumerateFiles("*", new EnumerationOptions { IgnoreInaccessible = true }).Where(f => f.LastWriteTimeUtc < before).Sum(f => f.Length)
-            : 0;
+    /// <summary>Paths of <paramref name="files"/> (an NVIDIA cache folder's) an older driver left, by whole app key: every
+    /// file of the key last written before the cutoff and of a type the current driver hasn't written since (it reuses an
+    /// older driver's files of the types it still writes), the key not used under it, no file of it held open. None while
+    /// the current driver wrote nothing yet: which types it reads is unknown then.</summary>
+    static HashSet<string> OldDriverFiles(IEnumerable<FileInfo> files, OldBefore old)
+    {
+        var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (old.At is not { } before) return found;
+        var keyed = files.Where(f => NvidiaAppCache.Key(f.Name) != null).ToList();
+        var since = keyed.Where(f => f.LastWriteTimeUtc >= before).ToList();
+        if (since.Count == 0) return found;
+        var types = since.Select(f => f.Name[..4]).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var current = since.Select(f => NvidiaAppCache.Key(f.Name)!).Concat(old.Used).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var key in keyed.GroupBy(f => NvidiaAppCache.Key(f.Name)!, StringComparer.OrdinalIgnoreCase))
+            if (!current.Contains(key.Key) && key.All(f => f.LastWriteTimeUtc < before && !types.Contains(f.Name[..4]))
+                && key.All(f => AppCacheFiles.InUse(f.FullName) == false))
+                found.UnionWith(key.Select(f => f.FullName));
+        return found;
+    }
+
+    /// <summary>The Old driver group's files in the NVIDIA cache folder now; none off NVIDIA.</summary>
+    HashSet<string> OldDriverFiles(bool fresh) =>
+        OldDriverBefore(fresh) is { } old && AppCache is NvidiaAppCache nv && AppCacheFiles.Readable(nv.Dir)
+            ? OldDriverFiles(new DirectoryInfo(nv.Dir).EnumerateFiles("*", new EnumerationOptions { IgnoreInaccessible = true }).ToList(), old)
+            : new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Bytes of the Old driver group, read without the rest of the inventory.</summary>
+    public long OldDriverBytes() => OldDriverFiles(fresh: false).Sum(p => new FileInfo(p) is { Exists: true } f ? f.Length : 0);
 
     /// <summary>The folder as the page shows it, and its files: none when it is missing or can't be read. A link below it is
     /// never followed: its files may be anything.</summary>
@@ -277,7 +317,7 @@ public sealed partial class ScsKiller
     /// <summary>The folders a Cache page delete may take files from: the driver caches of both vendors and D3DSCache.</summary>
     IEnumerable<string> CacheRoots() =>
         (AppCache switch { NvidiaAppCache nv => [nv.Dir], AmdAppCache amd => new[] { amd.DxcDir, amd.DxDir }, _ => [] })
-            .Concat(VendorFolders.Select(f => Path.Combine(LocalAppData, f.Folder)))
+            .Concat(VendorFolders().Select(f => f.Dir))
             .Append(Path.Combine(LocalAppData, "D3DSCache"))
             .Distinct(StringComparer.OrdinalIgnoreCase);
 
@@ -301,6 +341,8 @@ public sealed partial class ScsKiller
         var own = AppCache switch { NvidiaAppCache => GpuVendor.Nvidia, AmdAppCache => GpuVendor.Amd, _ => GpuVendor.Unknown };
         var claims = Claims(own);   // who claims each key now: a game seen running since the page read may have learned one
         var held = new Dictionary<string, FileStream?>();   // one lock per game: an id in two items is the same lock
+        var gameD3ds = Games.Select(s => s.Game).Concat(HiddenGames).SelectMany(g => GameD3DSCacheDirs(g, Store.LoadGame(g.Id)))
+            .Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
         try
         {
             foreach (var item in items)
@@ -320,11 +362,15 @@ public sealed partial class ScsKiller
                     continue;
                 }
                 var deleted = false;
+                // the Old driver group as it is now: a key the driver or a process took up since the page read stays
+                var oldNow = item.Kind == CacheGroupKind.OldDriver ? OldDriverFiles(fresh: true) : null;
                 foreach (var unit in item.Files.GroupBy(f => (Dir: Path.GetDirectoryName(f.Path)!, Key: UnitKey(f.Path))))
                 {
                     var key = OwnKey(unit.First().Path);
                     var owner = key != null && item.Kind != CacheGroupKind.OldDriver ? Owner(claims, key) : default;
-                    var why = Unsafe(unit.ToList(), roots)
+                    var why = (item.Kind == CacheGroupKind.OldDriver && !unit.All(f => oldNow!.Contains(Path.GetFullPath(f.Path))) ? "the current driver uses these files" : null)
+                        ?? (gameD3ds.Contains(Path.GetFullPath(unit.Key.Dir)) ? "it is a game's own Windows shader cache, Clear cache on its page deletes it" : null)
+                        ?? Unsafe(unit.ToList(), roots)
                         ?? Incomplete(unit.Key.Dir, unit.Key.Key, item.Seen.Concat(unit.Select(f => f.Path)))
                         ?? (owner.Ids is { } ids && (owner.Kind != item.Kind || ids.Except(item.GameIds).Any()) ? $"these files are now {owner.Name}'s" : null);
                     if (why != null)
@@ -356,7 +402,8 @@ public sealed partial class ScsKiller
     }
 
     /// <summary>Files go in units, whole or not at all: one app key's, else one folder's (a D3DSCache folder's db with its WAL).</summary>
-    internal static string? UnitKey(string path) => NvidiaAppCache.Key(Path.GetFileName(path)) ?? AmdAppCache.Key(Path.GetFileName(path), false);
+    internal static string? UnitKey(string path) => NvidiaAppCache.Key(Path.GetFileName(path)) ?? AmdAppCache.Key(Path.GetFileName(path), false)
+        ?? NvidiaAppCache.LegacyKey(path);
 
     /// <summary>The key the active driver's claims use for a file in one of its cache folders; null elsewhere.</summary>
     string? OwnKey(string path)
@@ -365,7 +412,7 @@ public sealed partial class ScsKiller
         bool In(string d) => string.Equals(GameFiles.DirKey(d), GameFiles.DirKey(dir!), StringComparison.OrdinalIgnoreCase);
         return AppCache switch
         {
-            NvidiaAppCache nv when In(nv.Dir) => NvidiaAppCache.Key(Path.GetFileName(path)),
+            NvidiaAppCache nv when In(nv.Dir) => NvidiaAppCache.Key(Path.GetFileName(path)) ?? NvidiaAppCache.LegacyKey(path),
             AmdAppCache amd when In(amd.DxcDir) => AmdAppCache.Key(Path.GetFileName(path), true),
             AmdAppCache amd when In(amd.DxDir) => AmdAppCache.Key(Path.GetFileName(path), false),
             _ => null,
@@ -413,4 +460,10 @@ public sealed partial class ScsKiller
         + "their cache as you play. " + (withOthers
             ? $"The {OtherApps.ToLowerInvariant()} group ({Format.Bytes(inv.Bytes(CacheGroupKind.Unattributed))}) is included: apps and games outside SCSKiller build their caches again too."
             : $"The {OtherApps.ToLowerInvariant()} group ({Format.Bytes(inv.Bytes(CacheGroupKind.Unattributed))}) is kept unless you tick it.");
+
+    /// <summary>The D3DSCache folders of the games running now, whose dbs the runtime holds open: never read.</summary>
+    HashSet<string> RunningD3DSCache() => Games.Where(s => GameRunning(s.Game))
+        .SelectMany(s => D3DSCacheNames(Store.LoadGame(s.Game.Id)).Append(D3DSCache.FolderName(s.Game.ExePath))
+            .Concat(s.Game.Store == Core.Store.Xbox && XboxSource.LaunchPath(s.Game) is { } x ? [D3DSCache.FolderName(x)] : []))
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
 }

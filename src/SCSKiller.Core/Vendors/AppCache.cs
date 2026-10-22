@@ -58,17 +58,22 @@ public static class AppCacheFiles
     static string Describe(nuint pid) =>
         Warming.ProcessTree.Snapshot().FirstOrDefault(p => (nuint)p.Pid == pid).Exe is { } exe ? $"{exe} (pid {pid})" : $"pid {pid}";   // exited meanwhile
 
-    public static HashSet<nuint> ProcessesUsing(string path)
+    public static HashSet<nuint> ProcessesUsing(string path) => Using(path) ?? [];
+
+    /// <summary>A process has the file open; null when that can't be told.</summary>
+    public static bool? InUse(string path) => Using(path) is { } pids ? pids.Count > 0 : null;
+
+    static HashSet<nuint>? Using(string path)
     {
         var pids = new HashSet<nuint>();
         using var h = CreateFileW(path, 0x80 /* FILE_READ_ATTRIBUTES */, 7 /* share all */, 0, 3 /* OPEN_EXISTING */, 0, 0);
-        if (h.IsInvalid) return pids;
+        if (h.IsInvalid) return null;
         var buf = new nuint[64];   // FILE_PROCESS_IDS_USING_FILE_INFORMATION: count, pad, pids
         for (int status; ; buf = new nuint[buf.Length * 4])
         {
             status = NtQueryInformationFile(h, out _, buf, buf.Length * nint.Size, 47 /* FileProcessIdsUsingFileInformation */);
             if (status == unchecked((int)0xC0000004) /* STATUS_INFO_LENGTH_MISMATCH */ && buf.Length < 1 << 16) continue;
-            if (status < 0) return pids;
+            if (status < 0) return null;
             break;
         }
         for (int i = 0; i < (int)(uint)buf[0]; i++) pids.Add(buf[1 + i]);

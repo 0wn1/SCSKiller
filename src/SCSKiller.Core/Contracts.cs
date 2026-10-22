@@ -26,12 +26,13 @@ public sealed record EngineInfo(
     string? Unsupported,    // why it can't be indexed (e.g. "shaders stored inside materials"); null = indexable
     bool NoRtPipelines = false,    // the game never builds a ray tracing state object (Unreal: r.RayTracing or r.RayTracing.AllowPipeline=0): its DXIL libraries go unused
     bool NoRayTracing = false,     // ray tracing is off altogether (Unreal: r.RayTracing=0), inline too; implies NoRtPipelines
-    bool AftermathShaderDebug = false,    // NVIDIA Aftermath shader debug info is on (UnrealRhi.AftermathShaderDebug): the NVIDIA driver files the game's pipelines under another key than a warm's
+    bool AftermathShaderDebug = false,    // not set or read: a warm's Aftermath follows only the game's own run (NvAftermath.Resolve), never its config
     bool VersionGuessed = false,          // Version is a guess (Unreal: UnrealReader.DetectEngine's last fallback)
     bool ApiGuessed = false,              // GraphicsApi is the engine's default for Version, nothing in the game names one (Unreal: UnrealRhi.Resolve)
     string? Game = null,                  // "<Game.Id>[@<Game.Version>]", for an engine whose root-signature rule is one game's (Nixxes ports: RuleMatch.Games)
     int? MaxAnisotropy = null,            // the player's texture filtering from the game's config (Unreal: UnrealRhi.MaxAnisotropy); null = not known
-    string? Note = null);                 // a line for the game page about what the compile leaves out (FromSoftware: an archive no key opens)
+    string? Note = null,                  // a line for the game page about what the compile leaves out (FromSoftware: an archive no key opens)
+    bool AftermathOff = false);           // not set or read, as AftermathShaderDebug
 
 /// <summary>Shader stage, numbered like D3D12_PIPELINE_STATE_SUBOBJECT_TYPE (the proxy's db uses the same numbers).</summary>
 public enum Stage { Vertex = 1, Pixel = 2, Domain = 3, Hull = 4, Geometry = 5, Compute = 6, Amplification = 24, Mesh = 25, Library = 100 }
@@ -99,6 +100,15 @@ public interface IEngineReader
     ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, IProgress<(int Done, int Total)>? progress, CancellationToken ct) => Index(game, engine, log, ct);
     /// <summary>Streams container bytes (hash convention above) for the requested shaders; the sink is called sequentially.</summary>
     void ReadShaders(Game game, EngineInfo engine, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct);
+}
+
+/// <summary>Every reader's parallel loop: on the caller's scheduler (a compile's below-normal pool, sized to its threads)
+/// and at most as wide, never wider than the machine.</summary>
+public static class ReaderLoops
+{
+    public static int Width => Math.Min(Environment.ProcessorCount, TaskScheduler.Current.MaximumConcurrencyLevel);
+    public static ParallelOptions Options(CancellationToken ct = default) =>
+        new() { TaskScheduler = TaskScheduler.Current, CancellationToken = ct, MaxDegreeOfParallelism = Width };
 }
 
 // Adding a GPU vendor = one IGpuVendorBackend + its VendorCaps; the planner and warmer only read the caps.
@@ -236,7 +246,9 @@ public enum WarmPriority { BelowNormal, Idle }
 public sealed record WarmOptions(int Threads, WarmPriority Priority, long StartAt = 0,
     int MemoryMB = 0,    // the staged warm process's private memory budget (scskiller_warm --memory-mb); 0 = none
     IReadOnlyCollection<string>? SkipKeys = null,   // record keys of items that crashed the GPU driver before: never replayed
-    int CarefulThreads = 0);   // a careful warm's passes (a pass file in the work folder): their threads; 0 = Threads
+    int CarefulThreads = 0,    // a careful warm's passes (a pass file in the work folder): their threads; 0 = Threads
+    IReadOnlyDictionary<string, long>? Probe = null,   // record keys of items that crashed another driver, by item: each created alone first, the first that crashes again skips them all
+    bool D3DSCacheNoFlush = false);   // NVIDIA from 621: the warm skips d3dscache.dll's flushes while it creates (scskiller_warm --d3dscache-noflush)
 /// <param name="Failed">PSOs the driver rejected (only that: one naming a shader this install lacks is never replayed)</param>
 /// <param name="Skipped">PSOs of the plan / recording not replayed because a shader is not in this install (another game
 /// build, built at run time, a middleware DLL without it); not in <paramref name="Total"/>. Set by the app from
@@ -256,7 +268,8 @@ public enum WarmOutcome { Completed, Stopped, Failed }
 /// <param name="Resumable">a Failed warm that stopped at a clean point (it gave up on device removals or hangs): Done is where the
 /// next compile goes on</param>
 public sealed record WarmResult(WarmOutcome Outcome, long Done, long Total, long Failed, TimeSpan Elapsed, long CacheGrowthBytes, string LogPath, string? Error,
-    long Skipped = 0, IReadOnlyCollection<string>? Crashed = null, long DriverSkipped = 0, bool Resumable = false, bool AftermathDropped = false);
+    long Skipped = 0, IReadOnlyCollection<string>? Crashed = null, long DriverSkipped = 0, bool Resumable = false, bool AftermathDropped = false,
+    bool D3DSCacheNoFlush = false);   // the warm's last process skipped d3dscache.dll's flushes (WarmOptions.D3DSCacheNoFlush and its hook went in)
 
 public interface IWarmRun
 {
@@ -355,8 +368,14 @@ public sealed record GameState(
     KeptCache? Kept = null,   // AMD: its compiled cache kept aside (Settings.KeepCachesAside); null = none kept
     long? LastWarmUnbuilt = null,   // the last complete warm: D3D11 items SCSKiller can't build a draw for yet (ScsKiller.Unbuilt11)
     bool Dxvk = false,              // DXVK as its d3d11.dll or dxgi.dll (Games.ReShade.Dxvk): it runs on Vulkan, a compile isn't used
-    bool DxvkCompiled = false)      // ... except DXVK's d3d11.dll on NVIDIA: the warm runs through it (Warmer.DxvkDll)
+    bool DxvkCompiled = false,      // ... except DXVK's d3d11.dll on NVIDIA: the warm runs through it (Warmer.DxvkDll)
+    long? WindowsCache = null,   // NVIDIA from 621: the bytes of its own D3DSCache folders on record, not in CacheOnDisk; null = none
+    long? DeliveredShaders = null,   // the bytes of its Advanced Shader Delivery dbs (D3DSCache.Delivered); null = none
+    bool? DeliveryFits = null)   // one of them was compiled by this driver (D3DSCache.Fits); null = not known, or none
 {
+    /// <summary>What its compiled cache takes on disk: the driver's part and Windows'. Null = unknown.</summary>
+    public long? DiskBytes => CacheOnDisk is null && WindowsCache is null ? null : (CacheOnDisk ?? 0) + (WindowsCache ?? 0);
+
     /// <summary>A client anti-cheat (any value but None, Other included) or VAC: never recorded outside a confirmed risk or offline session.</summary>
     public bool AnyAntiCheat => AntiCheat != AntiCheat.None || Vac;
 }

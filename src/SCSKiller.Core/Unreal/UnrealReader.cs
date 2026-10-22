@@ -91,7 +91,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
         notes = keyNote.Length > 0 ? $"{why}; AES key: {keyNote}" : why;
         var rtOff = UnrealRhi.RayTracingOff(s.Configs, project, userDir, launch);
         return new EngineInfo("Unreal", version, fork?.ToString(), api, encrypted, unsupported, rtOff || UnrealRhi.RtPipelinesOff(s.Configs, project), rtOff,
-            UnrealRhi.AftermathShaderDebug(s.Configs, project, launch) && ShipsAftermath(paks), guessed, apiGuessed,
+            false, guessed, apiGuessed,
             MaxAnisotropy: UnrealRhi.MaxAnisotropy(version.StartsWith('4') ? 4 : 5, s.Configs, project, userDir, launch));
     }
 
@@ -372,7 +372,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
             if (arc == null) { log?.Report($"{lib.File.Path}: unsupported shader archive layout, skipped"); continue; }
             var sha = new string[arc.Count];
             var (bad, failed) = (0, 0);
-            Parallel.ForEach(arc.Codes, new ParallelOptions { TaskScheduler = TaskScheduler.Current, CancellationToken = ct }, work =>
+            Parallel.ForEach(arc.Codes, ReaderLoops.Options(ct), work =>
             {
                 IEnumerable<(int, byte[])> codes;
                 try { codes = work(); }
@@ -520,7 +520,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
             if (left.IsEmpty) break;
             using var arc = opener.Open(provider, lib.File, out _);   // skipped at indexing too
             if (arc == null) continue;
-            Parallel.ForEach(arc.Codes, new ParallelOptions { TaskScheduler = TaskScheduler.Current, CancellationToken = ct }, work =>
+            Parallel.ForEach(arc.Codes, ReaderLoops.Options(ct), work =>
             {
                 IEnumerable<(int, byte[])> codes;
                 try { codes = work(); }
@@ -721,7 +721,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
         try
         {
-            Parallel.ForEach(items, new ParallelOptions { TaskScheduler = TaskScheduler.Current, CancellationToken = stop.Token, MaxDegreeOfParallelism = Environment.ProcessorCount },
+            Parallel.ForEach(items, ReaderLoops.Options(stop.Token),
                 () =>
                 {
                     var was = Thread.CurrentThread.Priority;
@@ -1047,7 +1047,7 @@ public sealed partial class UnrealReader(string? dataDir = null) : IEngineReader
         var maps = new ConcurrentBag<ShaderMap>();
         var n = 0;
         var budget = ByteBudget.FromFreeMemory();
-        Parallel.ForEach(provider.Files.Values.Where(f => f.IsUePackage || IsGlobalCache(f)).ToList(), new ParallelOptions { TaskScheduler = TaskScheduler.Current, CancellationToken = ct, MaxDegreeOfParallelism = Environment.ProcessorCount }, f =>
+        Parallel.ForEach(provider.Files.Values.Where(f => f.IsUePackage || IsGlobalCache(f)).ToList(), ReaderLoops.Options(ct), f =>
         {
             var global = IsGlobalCache(f);
             if (!global && OwnsShaderMaps(provider, f) == false) return;
