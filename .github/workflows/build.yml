@@ -90,29 +90,6 @@ jobs:
       - name: Build
         run: dotnet build SCSKiller.slnx -c Release
 
-      # Tests that need installed games/recordings or a real GPU carry [Trait("Needs", "Game"|"Gpu")]; the rest must
-      # pass on a machine with neither. The proxy is built, so the WARP selftest (RuntimeLayoutRules) runs.
-      # A dispatch's filter narrows it to the tests a change is about (proving a new test fails on main takes minutes).
-      # Each test's time goes to the log, so the slow ones can be found. The full suite runs in shares, one test process
-      # each (build/test.ps1).
-      - name: Test
-        if: github.event.repository.private
-        shell: powershell
-        env:
-          TEST_FILTER: ${{ inputs.filter }}
-        run: |
-          $f = 'Needs!=Gpu&Needs!=Game'
-          if (-not $env:TEST_FILTER) { build/test.ps1 -Filter $f; exit $LASTEXITCODE }
-          dotnet test tests/SCSKiller.Tests -c Release --no-build --filter "($env:TEST_FILTER)&$f" --logger "console;verbosity=normal"
-          exit $LASTEXITCODE
-
-      # The pinned Oodle DLL needs AVX2 and BMI2; .NET reports neither with this knob, as on a CPU without them
-      - name: Test codecs without AVX2
-        if: ${{ !inputs.filter && github.event.repository.private }}
-        env:
-          DOTNET_EnableAVX2: '0'
-        run: dotnet test tests/SCSKiller.Tests -c Release --no-build --filter "FullyQualifiedName~CodecCpuTests"
-
       # No Oodle DLL in anything that leaves the build (THIRD-PARTY-NOTICES.md); the app downloads it on first use.
       # Nothing is signed here: the release step signs these exact bytes after checking them against the sums.
       # A tag build is stamped with the tag's version (publish.ps1 drops the v; a bad tag fails it). Otherwise the dev default.

@@ -36,6 +36,10 @@ public sealed class GameRecord
     public string? PlanCommunity { get; set; }              // the community recording (object id) the plan was built with; null = none
     public string? PlanOfficial { get; set; }               // the official recording (object id) the plan was built with; null = none
     public string? PlanMaps { get; set; }                   // ScsKiller.MapsFingerprint of the index the plan was built from
+    public string? D3DSCacheFolder { get; set; }            // the game's own D3DSCache folder (named by its exe path), found again once emptied
+    public string? D3DSCacheExe { get; set; }               // the exe path that folder's dbs name
+    public bool WarmedD3DSCache { get; set; }               // the last complete warm's D3DSCache dbs were kept, not deleted
+    public string? D3DSCacheMade { get; set; }              // the D3DSCache folder SCSKiller made before the game's first run
     public long ResumeAt { get; set; }                       // Done of a stopped warm of the current plan
     public long ResumeItems { get; set; }                    // items the stopped segments of that warm created...
     public double ResumeSeconds { get; set; }                // ...and their time: a complete warm's time and rate include them

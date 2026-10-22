@@ -111,8 +111,7 @@ public static class D3DSCache
     /// <summary>False when not a readable SQLite db; one without the table yet (rows still in the WAL) adds nothing.</summary>
     static bool ReadAppIds(string file, HashSet<string> paths)
     {
-        var uri = "file:" + file.Replace('\\', '/').Replace("%", "%25").Replace("#", "%23").Replace("?", "%3f") + "?immutable=1";
-        var rc = sqlite3_open_v2(uri, out var db, 0x01 /* READONLY */ | 0x40 /* URI */, 0);
+        var rc = sqlite3_open_v2(Immutable(file), out var db, 0x01 /* READONLY */ | 0x40 /* URI */, 0);
         try
         {
             if (rc != 0) return false;
@@ -124,6 +123,174 @@ public static class D3DSCache
             });
         }
         finally { sqlite3_close_v2(db); }
+    }
+
+    /// <summary>The folder name the runtime opens for a process started from <paramref name="exePath"/>, exactly as the
+    /// process sees it (GetModuleFileNameW, case kept): its CRC-64 over UTF-16LE in lowercase hex, no leading zeros.</summary>
+    public static string FolderName(string exePath)
+    {
+        // D3DSCache.dll GetFilenameInAppDataStorageForCurrentApp: reflected poly 0x92C64265D32139A4, this init, no final xor
+        var crc = 0x012345678ABCDEF0UL;
+        foreach (var b in MemoryMarshal.AsBytes(exePath.AsSpan()))
+        {
+            crc ^= b;
+            for (var i = 0; i < 8; i++) crc = (crc & 1) != 0 ? crc >> 1 ^ 0x92C64265D32139A4UL : crc >> 1;
+        }
+        return crc.ToString("x");
+    }
+
+    /// <summary>The game's folder a compile's dbs go to, with the one exe path its dbs name, which must still exist (an Xbox
+    /// game's earlier versions each have a folder too): the one written last.</summary>
+    public static (string Dir, string Exe)? GameFolder(string root, Game g)
+    {
+        foreach (var d in FoldersOf(root, g).Select(d => new DirectoryInfo(d)).Where(d => !d.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                     .OrderByDescending(d => d.LastWriteTimeUtc))
+            if (ExePaths(d.FullName) is { Count: 1 } exe && File.Exists(exe.Single())) return (d.FullName, exe.Single());
+        return null;
+    }
+
+    /// <summary>Puts every db of a staged exe's folder into the game's: NVIDIA from 621 keeps compiled pipelines there, keyed by
+    /// content, so they hit under any exe path. A missing db is copied in naming <paramref name="exe"/>; an existing one gains
+    /// the missing rows in one transaction, only with the same schema and compiler. False on doubt, that db unchanged then: a
+    /// db held open by any process, another compiler, a db that fails SQLite's check, a link.</summary>
+    public static bool MergeInto(string from, string to, string exe)
+    {
+        var ok = true;
+        foreach (var f in Directory.GetFiles(from, "*.dxcache"))
+            try { ok &= MergeDb(f, Path.Combine(to, Path.GetFileName(f)), exe); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { ok = false; }
+        return ok;
+    }
+
+    /// <summary>True when an adapter db both folders hold names another compiler in each; false on doubt.</summary>
+    public static bool OtherCompiler(string a, string b)
+    {
+        foreach (var f in Directory.GetFiles(a, "*_VEN_*.dxcache"))
+            if (Path.Combine(b, Path.GetFileName(f)) is var other && File.Exists(other)
+                && !LinkedDb(f) && !LinkedDb(other) && Compiler(f) is { Length: > 0 } x && Compiler(other) is { Length: > 0 } y && x != y) return true;
+        return false;
+    }
+
+    static string? Compiler(string file)
+    {
+        if (sqlite3_open_v2(file, out var db, 0x01 /* READONLY */, 0) != 0) { sqlite3_close_v2(db); return null; }
+        try { return Text(db, string.Format(CompilerSql, "main")); }
+        finally { sqlite3_close_v2(db); }
+    }
+
+    const string SchemaSql = "select group_concat(name || ':' || sql, '|') from (select name, sql from {0}.sqlite_master order by name)";
+    const string CompilerSql = "select group_concat(abi || ':' || version || ':' || family, '|') from (select * from {0}.compiler_id order by id)";
+
+    static bool MergeDb(string from, string to, string exe)
+    {
+        if (!CacheFile.IsMatch(Path.GetFileName(from)) || LinkedDb(from) || LinkedDb(to) || Held(from) || Held(from + "-wal")) return false;
+        var copy = !File.Exists(to);
+        if (!Open(from, out var src)) return false;
+        try
+        {
+            long busy = -1;
+            // the copy takes the main file only: every WAL frame must be in it
+            if (copy && (!Rows(src, "pragma wal_checkpoint(TRUNCATE)", st => busy = sqlite3_column_int64(st, 0)) || busy != 0)) return false;
+            if (Text(src, "pragma quick_check") != "ok" || Text(src, string.Format(SchemaSql, "main")) is not { } schema
+                || !schema.Contains("keys:") || !schema.Contains("vals:") || !schema.Contains("app_id:")) return false;
+        }
+        finally { sqlite3_close_v2(src); }
+        if (copy)
+        {
+            if (File.Exists(to + "-wal") || File.Exists(from + "-wal") && new FileInfo(from + "-wal").Length > 0) return false;   // a WAL would replay into the copy
+            if (string.Equals(Path.GetPathRoot(Path.GetFullPath(from)), Path.GetPathRoot(Path.GetFullPath(to)), StringComparison.OrdinalIgnoreCase))
+            {
+                // one volume: the staged db (ours) is named for the game where it is, then renamed into the game's folder
+                if (!Open(from, out var own)) return false;
+                try { if (!NameFor(own, exe)) return false; }
+                finally { sqlite3_close_v2(own); }   // the last connection checkpoints into the file
+                if (File.Exists(from + "-wal") || Held(from)) return false;
+                File.Move(from, to);   // fails when the runtime made one meanwhile: merged next time
+                File.Delete(from + "-shm");
+                return true;
+            }
+            var tmp = to + "." + Guid.NewGuid().ToString("N") + ".scskiller-tmp";
+            try
+            {
+                // no other writer while the bytes are read: the checkpointed file is the whole db
+                using (var s = new FileStream(from, FileMode.Open, FileAccess.Read, FileShare.Read))
+                using (var d = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    if (File.Exists(from + "-wal") && new FileInfo(from + "-wal").Length > 0) return false;
+                    s.CopyTo(d);
+                }
+                if (!Open(tmp, out var db)) return false;
+                try { if (!NameFor(db, exe)) return false; }
+                finally { sqlite3_close_v2(db); }   // the last connection checkpoints into tmp
+                if (File.Exists(tmp + "-wal")) return false;
+                File.Move(tmp, to);   // fails when the runtime made one meanwhile: merged next time
+                return true;
+            }
+            finally
+            {
+                File.Delete(tmp);
+                File.Delete(tmp + "-wal");
+                File.Delete(tmp + "-shm");
+            }
+        }
+        if (Held(to) || Held(to + "-wal") || !Open(to, out var t)) return false;
+        try
+        {
+            // no busy timeout: a game that opened it meanwhile keeps it, the dbs wait for the next try
+            if (!Exec(t, $"attach database {Quote(from)} as s")) return false;
+            var schema = Text(t, string.Format(SchemaSql, "main"));
+            if (schema == null || schema != Text(t, string.Format(SchemaSql, "s"))) return false;
+            if (schema.Contains("compiler_id:") && (Text(t, string.Format(CompilerSql, "main")) is not { Length: > 0 } mine || mine != Text(t, string.Format(CompilerSql, "s")))) return false;
+            if (!Exec(t, "begin immediate")) return false;
+            if (Text(t, "pragma main.quick_check") != "ok" || Text(t, $"select count(*) from main.app_id where exe_path is not {Quote(exe)}") != "0")
+            {
+                Exec(t, "rollback");
+                return false;
+            }
+            // groups stay out: no driver writes them yet
+            if (Exec(t, "insert into main.keys(key, last_accessed) select key, last_accessed from s.keys where key not in (select key from main.keys)")
+                && Exec(t, "insert into main.vals(keyid, type, value) select m.keyid, v.type, v.value from s.keys k join s.vals v on v.keyid = k.keyid "
+                    + "join main.keys m on m.key = k.key where not exists (select 1 from main.vals x where x.keyid = m.keyid and x.type = v.type)")
+                && Exec(t, "commit")) return true;
+            Exec(t, "rollback");
+            return false;
+        }
+        finally { sqlite3_close_v2(t); }
+    }
+
+    /// <summary>Every app_id row names <paramref name="exe"/>, and there is one.</summary>
+    static bool NameFor(nint db, string exe) => Exec(db, $"update app_id set exe_path = {Quote(exe)}")
+        && Text(db, $"select count(*) from app_id where exe_path is not {Quote(exe)}") == "0" && Text(db, "select count(*) from app_id") is { } n && n != "0";
+
+    /// <summary>The db or its -wal or -shm is a link: SQLite would follow it out of the folder.</summary>
+    static bool LinkedDb(string file) => new[] { file, file + "-wal", file + "-shm" }.Any(f => File.Exists(f) && new FileInfo(f).Attributes.HasFlag(FileAttributes.ReparsePoint));
+
+    /// <summary>Another handle on the file (the game's runtime, a warm): no exclusive open.</summary>
+    static bool Held(string file)
+    {
+        if (!File.Exists(file)) return false;
+        try { using var _ = new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None); return false; }
+        catch (IOException) { return true; }
+    }
+
+    static bool Open(string file, out nint db)
+    {
+        if (sqlite3_open_v2(file, out db, 0x02 /* READWRITE */, 0) == 0) return true;
+        sqlite3_close_v2(db);
+        return false;
+    }
+
+    static string Immutable(string file) =>
+        "file:" + file.Replace('\\', '/').Replace("%", "%25").Replace("#", "%23").Replace("?", "%3f") + "?immutable=1";
+
+    static string Quote(string s) => "'" + s.Replace("'", "''") + "'";
+
+    static bool Exec(nint db, string sql) => Rows(db, sql, _ => { });
+
+    static string? Text(nint db, string sql)
+    {
+        string? text = null;
+        return Rows(db, sql, st => text = Marshal.PtrToStringUTF8(sqlite3_column_text(st, 0)) ?? "") ? text : null;
     }
 
     static bool Rows(nint db, string sql, Action<nint> row)

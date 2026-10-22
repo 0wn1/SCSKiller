@@ -4,6 +4,13 @@ All notable changes to the SCSKiller app and command line. Versions follow [Sema
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-10-22
+
+**Fixed**
+
+- Compatible with NVIDIA driver 621.01.
+- Game caches are much smaller, as a result of how NVIDIA now handles the game shader cache.
+
 ## [1.3.0] - 2026-10-17
 
 **This is a very big update**, with everything from the 1.3.0 alphas and betas.

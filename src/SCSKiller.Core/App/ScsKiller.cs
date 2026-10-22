@@ -289,8 +289,23 @@ public sealed partial class ScsKiller : IScsKiller
         bool crashed = r.CrashKeysDriver != null && r.CrashKeysDriver != s.Id && CurrentDriver(s, null, r.CrashKeysDriver, adopting: true);
         if (warmed) r.WarmedDriverId = s.Id;
         if (crashed) r.CrashKeysDriver = s.Id;
-        return warmed | crashed;
+        // NVIDIA from 621 keeps compiled pipelines in D3DSCache, whose dbs a warm before WarmedD3DSCache deleted: compile again
+        bool lost = OperatingSystem.IsWindows() && s.Gpu.Vendor == GpuVendor.Nvidia && r is { WarmedAt: not null, WarmedD3DSCache: false }
+            && r.WarmedDriverId == s.Id && NvidiaMajor(r.WarmedDriverVersion) >= 621;
+        // the driver made that launch miss, not the game: no unreached verdict
+        if (lost) (r.WarmedDriverId, r.UnreachedWarm) = (LostD3DSCache, null);
+        return warmed | crashed | lost;
     }
+
+    const string LostD3DSCache = "d3dscache-deleted";
+
+    /// <summary>621 of "621.01", or of DXGI's "32.0.16.2101".</summary>
+    static int? NvidiaMajor(string? version) => version?.Split('.') switch
+    {
+        [var major, _] when int.TryParse(major, out var m) => m,
+        [_, _, { Length: > 0 } c, var d] when int.TryParse(c[^1..] + d, out var n) => n / 100,
+        _ => null,
+    };
 
     /// <summary>Skips an earlier build saved under the version string (StaleKey's first part), rewritten once to
     /// DriverId when that string is the current driver's, from one snapshot as <see cref="AdoptDriverId"/>.</summary>
@@ -2593,8 +2608,18 @@ public sealed partial class ScsKiller : IScsKiller
         var rec = Store.LoadGame(gameId);
         var parts = new List<CachePart>();
         if (AppCache != null && DriverKeys(s.Game, rec).Keys is { Count: > 0 } keys) parts.Add(Part(DriverPart, AppCache.FilesOf(keys)));
-        if (s.AntiCheat != AntiCheat.None) return parts;   // anti-cheat: nothing near the game, only the driver's cache
-        parts.Add(Part(WindowsPart, D3DSCache.FoldersOf(Path.Combine(LocalAppData, "D3DSCache"), s.Game).SelectMany(D3DSCache.CacheFiles)));
+        // the compile's runtime cache dbs waiting for the game's folder: ours, also for an anti-cheat game
+        var waiting = Path.Combine(Store.GameDir(gameId), D3DSCacheWaiting) is var w && Directory.Exists(w) && !IsLink(w)
+            ? new DirectoryInfo(w).EnumerateFiles("*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint }).ToList() : [];
+        if (s.AntiCheat != AntiCheat.None)   // anti-cheat: nothing near the game, only the driver's cache
+        {
+            parts.Add(Part(WindowsPart, waiting));
+            return parts.Where(p => p.Files.Count > 0).ToList();
+        }
+        if (OperatingSystem.IsWindows()) GameD3DSCache(s.Game);   // remembered before a clear empties it
+        // a folder that is a link may lead anywhere: its files aren't the runtime's cache
+        if (OperatingSystem.IsWindows()) parts.Add(Part(WindowsPart, D3DSCache.FoldersOf(Path.Combine(LocalAppData, "D3DSCache"), s.Game)
+            .Where(d => !new DirectoryInfo(d).Attributes.HasFlag(FileAttributes.ReparsePoint)).SelectMany(D3DSCache.CacheFiles).Concat(waiting)));
         if (!gamePrecache) return parts.Where(p => p.Files.Count > 0).ToList();
         // Unreal's user pipeline cache stays (UnrealUserCache.FilesOf): it lists what play created, and only playing refills it
         parts.Add(Part(PipelinePart, OwnPipelineCaches.FilesOf(s.Game, s.Engine, Documents, RoamingAppData).Select(f => new FileInfo(f))));
@@ -7013,7 +7038,7 @@ public sealed partial class ScsKiller : IScsKiller
                             warmKeys = warmKeys.Concat(WarmInputs.PlannedStages(rec.Plan!.FilePath, inputs, CrashInputs(CrashKeysNow(rec), rec.Plan.FilePath).Contains));
                         rec.WarmKeysFile = KeyFiles.Write(Store.GameDir(id), "warm", warmKeys.Distinct());
                         (rec.WarmedIndexHash, rec.WarmedExeStamp, rec.WarmedGameVersion, rec.WarmedIndexStamp) = (index.ContentHash, ExeStamp(game), game.Version, indexStamp);
-                        rec.CompileFailedBuild = null;
+                        (rec.CompileFailedBuild, rec.WarmedD3DSCache) = (null, true);
                         (rec.ResumeAt, rec.ResumeItems, rec.ResumeSeconds, rec.ResumeFailed) = (0, 0, 0, 0);
                         (rec.WarmedCareful, rec.FirstLaunch) = (carefulPasses > 0, null);   // judged again by the next launch
                         if (cold && items >= 1000 && seconds > 1 && carefulPasses == 0)   // a careful warm's rate mixes both schedules
@@ -7075,12 +7100,29 @@ public sealed partial class ScsKiller : IScsKiller
                 KeepLastLog(work, id);
                 try { if (Directory.Exists(work)) Directory.Delete(work, true); }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log?.Report($"could not delete {work}: {e.Message}"); }
-                // the runtime's DXBC conversions keyed to a staged exe's path: a new folder for every warm process, never read again
+                // a staged exe's own runtime cache folder, never read again: its dbs go to the game's folder, or wait for the
+                // game's first run to make one (MergeD3DSCache)
                 try
                 {
-                    foreach (var d in D3DSCache.Made(Path.Combine(LocalAppData, "D3DSCache"), work, started))
-                        try { Directory.Delete(d, true); }
-                        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log?.Report($"could not delete {d}: {e.Message}"); }
+                    if (OperatingSystem.IsWindows())
+                    {
+                        var root = Path.Combine(LocalAppData, "D3DSCache");
+                        var waiting = Path.Combine(Store.GameDir(id), D3DSCacheWaiting);
+                        MergeD3DSCache(game);   // an exit the app didn't see
+                        var timer = Stopwatch.StartNew();
+                        foreach (var d in D3DSCache.Made(root, work, started))
+                            try
+                            {
+                                DropOtherCompilers(waiting, d);
+                                if ((GameD3DSCache(game) ?? NewGameD3DSCache(game)) is { } to && D3DSCache.MergeInto(d, to.Dir, to.Exe))
+                                {
+                                    Directory.Delete(d, true);
+                                    Log?.Report($"{game.Name}: the compile's D3DSCache dbs went into {to.Dir} ({timer.ElapsedMilliseconds} ms)");
+                                }
+                                else if (!IsLink(waiting)) MoveFolder(d, Path.Combine(Directory.CreateDirectory(waiting).FullName, Path.GetFileName(d)));
+                            }
+                            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log?.Report($"{game.Name}: {d} kept: {e.Message}"); }
+                    }
                 }
                 catch (Exception e) { Log?.Report($"{game.Name}: D3DSCache not cleaned: {e.Message}"); }
             }
@@ -7096,6 +7138,121 @@ public sealed partial class ScsKiller : IScsKiller
                     catch (Exception e) { Log?.Report($"{game.Name}: reconciling the recorder failed: {e.Message}"); }
             }
         }
+    }
+
+    /// <summary>A game's folder of staged runtime cache folders a compile couldn't put in the game's own D3DSCache folder.</summary>
+    const string D3DSCacheWaiting = "d3dscache";
+
+    /// <summary>The compile's runtime cache dbs that waited for the game's own D3DSCache folder go in once the game made it. A
+    /// folder made before the game's first run goes into the game's own once that turned out another (a launcher starting the
+    /// exe under another casing of its path): the dbs stay on disk once.</summary>
+    void MergeD3DSCache(Game g)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var root = Path.Combine(LocalAppData, "D3DSCache");
+        if (Store.LoadGame(g.Id).D3DSCacheMade is { } made && IsFolderName(made) && D3DSCache.GameFolder(root, g) is { } real
+            && !string.Equals(Path.GetFileName(real.Dir), made, StringComparison.Ordinal) && Path.Combine(root, made) is var mine
+            && (!Directory.Exists(mine) || !IsLink(mine) && D3DSCache.IsGames(mine, g) == true && FilesOf(mine) is var was
+                && D3DSCache.MergeInto(mine, real.Dir, real.Exe) && FilesOf(mine) == was && !was.Split('|').Any(f => f.Length > 0 && Opened(Path.Combine(mine, f.Split(':')[0])))))
+        {
+            if (Directory.Exists(mine)) Directory.Delete(mine, true);   // nothing wrote or opened it during the merge
+            AppStore.Locked(Path.Combine(Store.GameDir(g.Id), "state.json"), () =>
+            {
+                var r = Store.LoadGame(g.Id);
+                r.D3DSCacheMade = null;
+                Store.SaveGame(g.Id, r);
+            });
+        }
+        var waiting = Path.Combine(Store.GameDir(g.Id), D3DSCacheWaiting);
+        if (!Directory.Exists(waiting) || IsLink(waiting) || (GameD3DSCache(g) ?? NewGameD3DSCache(g)) is not { } to) return;
+        DropOtherCompilers(waiting, to.Dir);
+        foreach (var d in Directory.GetDirectories(waiting))
+            if (!IsLink(d) && !d.EndsWith(Copying, StringComparison.Ordinal) && D3DSCache.MergeInto(d, to.Dir, to.Exe)) Directory.Delete(d, true);
+    }
+
+    /// <summary>The game's own D3DSCache folder and the exe path its dbs name, remembered: emptied by Clear cache, the
+    /// runtime opens the same folder again (its name comes from the exe path), so the compile's dbs go back there.</summary>
+    (string Dir, string Exe)? GameD3DSCache(Game g)
+    {
+        var root = Path.Combine(LocalAppData, "D3DSCache");
+        var rec = Store.LoadGame(g.Id);
+        if (D3DSCache.GameFolder(root, g) is { } found)
+        {
+            if (rec.D3DSCacheFolder != Path.GetFileName(found.Dir) || rec.D3DSCacheExe != found.Exe)
+                AppStore.Locked(Path.Combine(Store.GameDir(g.Id), "state.json"), () =>
+                {
+                    var r = Store.LoadGame(g.Id);
+                    (r.D3DSCacheFolder, r.D3DSCacheExe) = (Path.GetFileName(found.Dir), found.Exe);
+                    Store.SaveGame(g.Id, r);
+                });
+            return found;
+        }
+        // a folder holding any db isn't emptied: another exe's, or one in doubt
+        if (rec is { D3DSCacheFolder: { } name, D3DSCacheExe: { } exe } && IsFolderName(name)
+            && D3DSCache.IsGameExe(exe, g) && File.Exists(exe) && Path.Combine(root, name) is var dir
+            && (!Directory.Exists(dir) || !new DirectoryInfo(dir).Attributes.HasFlag(FileAttributes.ReparsePoint) && !Directory.EnumerateFiles(dir, "*.dxcache*").Any()))
+            return (Directory.CreateDirectory(dir).FullName, exe);
+        return null;
+    }
+
+    /// <summary>The folder the runtime will open for the game's exe, made empty before its first run so the compile's dbs are
+    /// there when it starts, and remembered: a launch under another casing of the path gets another folder, which
+    /// MergeD3DSCache folds this one into at the exit. Null when that folder exists already (another exe's, or in doubt).</summary>
+    (string Dir, string Exe)? NewGameD3DSCache(Game g)
+    {
+        // measured: Steam starts a game under its library folder's path as libraryfolders.vdf has it, which ExePath keeps
+        if ((g.Store == Core.Store.Xbox ? XboxSource.LaunchPath(g) : g.ExePath) is not { } exe || !File.Exists(exe)) return null;
+        var name = D3DSCache.FolderName(exe);
+        var dir = Path.Combine(LocalAppData, "D3DSCache", name);
+        if (Directory.Exists(dir) && (IsLink(dir) || Directory.EnumerateFileSystemEntries(dir).Any())) return null;
+        Directory.CreateDirectory(dir);
+        AppStore.Locked(Path.Combine(Store.GameDir(g.Id), "state.json"), () =>
+        {
+            var r = Store.LoadGame(g.Id);
+            r.D3DSCacheMade = name;
+            Store.SaveGame(g.Id, r);
+        });
+        return (dir, exe);
+    }
+
+    static string FilesOf(string dir) => string.Join('|', new DirectoryInfo(dir).GetFiles().OrderBy(f => f.Name, StringComparer.Ordinal)
+        .Select(f => $"{f.Name}:{f.Length}:{f.LastWriteTimeUtc.Ticks}"));
+
+    static bool Opened(string file)
+    {
+        try { using var _ = new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None); return false; }
+        catch (IOException) { return true; }
+    }
+
+    static bool IsFolderName(string name) => name.Length is > 0 and <= 16 && name.All(char.IsAsciiHexDigitLower);
+
+    /// <summary>Waiting dbs of another compiler than <paramref name="dir"/>'s (an earlier driver's): no driver reads them.</summary>
+    static void DropOtherCompilers(string waiting, string dir)
+    {
+        if (!Directory.Exists(waiting) || IsLink(waiting)) return;
+        foreach (var d in Directory.GetDirectories(waiting))
+            if (!IsLink(d) && !d.EndsWith(Copying, StringComparison.Ordinal) && D3DSCache.OtherCompiler(d, dir)) Directory.Delete(d, true);
+    }
+
+    static bool IsLink(string dir) => Directory.Exists(dir) && new DirectoryInfo(dir).Attributes.HasFlag(FileAttributes.ReparsePoint);
+
+    const string Copying = ".copying";
+
+    /// <summary>A staged folder into the waiting one, a copy then a delete across volumes (a data folder on another drive). An
+    /// earlier compile's under the same name stays beside it: an incremental compile leaves out what that one created.</summary>
+    static void MoveFolder(string from, string to)
+    {
+        var name = to;
+        for (var n = 2; Directory.Exists(to) || Directory.Exists(to + Copying); n++) to = $"{name}-{n}";
+        if (string.Equals(Path.GetPathRoot(Path.GetFullPath(from)), Path.GetPathRoot(Path.GetFullPath(to)), StringComparison.OrdinalIgnoreCase))
+        {
+            Directory.Move(from, to);
+            return;
+        }
+        var tmp = Directory.CreateDirectory(to + Copying).FullName;   // never merged until whole
+        foreach (var f in Directory.GetFiles(from)) File.Copy(f, Path.Combine(tmp, Path.GetFileName(f)));
+        Directory.Move(tmp, to);
+        Directory.Delete(from, true);
     }
 
     /// <summary>A compile of the game's listed build failed or was refused, a plan check's aside: Rate this compile opens without a
@@ -8432,6 +8589,11 @@ public sealed partial class ScsKiller : IScsKiller
                     : note is NeverSawNote or NeverSawDx11Note ? "the recorder never loaded, no scskiller.log written during the run" : $"no refusal for its exe, the page says: {note}"));
             }
             BeforeAfterExited(g);
+            _ = Task.Run(() =>
+            {
+                try { MergeD3DSCache(g); }
+                catch (Exception e) { Log?.Report($"{g.Name}: the compile's D3DSCache dbs not merged: {e.Message}"); }
+            });
             StartSharing([g]);   // also without a new recording: the command line's compile indexes a build but can't share
             if (ManageRecorders)   // a recorder change that waited for the game to exit (Reconcile)
                 try { ReconcileRecorders(g.Id); }
